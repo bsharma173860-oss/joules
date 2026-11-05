@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you report energy measured with joules in a paper, please cite it like this."
+title: "joules: like time, but for energy"
+type: software
+authors:
+  - family-names: Sharma
+    given-names: Bharat
+    affiliation: "PHENEX TECHNOLOGIES INC. (WattOps)"
+version: 0.8.2
+date-released: "2026-11-03"
+license: MIT
+url: "https://wattops.dev/joules"
+repository-artifact: "https://pypi.org/project/landauer-gap/"
+abstract: >-
+  joules measures the energy of any command, local model or phase of a program from the hardware's own
+  counters: NVML for NVIDIA GPUs, RAPL for Intel and AMD CPUs and DRAM, amdgpu and Intel GPU hwmon, and
+  powermetrics on Macs. It records clocks, throttling, temperature and power limits with every result, and
+  compares two ways of doing the same work with interleaved runs, medians and a Mann-Whitney test.
+keywords:
+  - energy measurement
+  - GPU
+  - RAPL
+  - NVML
+  - green AI
+  - benchmarking

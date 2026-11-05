@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "landauer-gap"
+version = "0.8.2"
+description = "Like `time`, but for energy: measure the GPU, CPU and DRAM energy, cost and carbon of any command or local model."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Bharat Sharma" }]
+keywords = ["energy", "gpu", "nvml", "rapl", "carbon", "llm", "benchmark", "landauer"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Environment :: Console",
+  "Topic :: System :: Monitoring",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://wattops.dev"
+Repository = "https://github.com/bsharma173860-oss/joules"
+Issues = "https://github.com/bsharma173860-oss/joules/issues"
+Leaderboard = "https://wattops.dev/#/board"
+Documentation = "https://pypi.org/project/landauer-gap/"
+Contact = "https://wattops.dev/#contact"
+
+[project.scripts]
+joules = "joules.cli:main"
+landauer-gap = "joules.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

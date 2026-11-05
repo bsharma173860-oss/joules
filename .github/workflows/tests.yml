@@ -1,0 +1,37 @@
+# joules unit tests on every push and pull request: Linux (oldest and newest Python, x86 and ARM), macOS (Apple
+# Silicon and Intel) and Windows. No GPU is needed: the meters are tested against stand-in drivers and files.
+name: tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: ${{ matrix.os }}, Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: ubuntu-24.04-arm, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+          - { os: macos-15-intel, python: "3.12" }
+          - { os: windows-latest, python: "3.13" }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
