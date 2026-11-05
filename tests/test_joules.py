@@ -115,6 +115,7 @@ class AmdGpu(unittest.TestCase):
                     self.assertEqual([m.name for m in meters.discover_amdgpu([])], ["GPU 1 AMD GPU"])
 
 
+@unittest.skipIf(os.name == "nt", "amdgpu is read from Linux sysfs")
 class AmdGpuNames(unittest.TestCase):
     """Cloud virtual functions (DigitalOcean's MI300X VF) have no product_name: name them by PCI IDs."""
 
