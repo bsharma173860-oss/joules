@@ -117,6 +117,27 @@ one side was throttled more, ran at a different clock or started hotter, and `--
 repeats the comparison at fixed GPU power limits so a gain cannot come from the card boosting differently. The
 full method is in [docs/BENCHMARKING.md](https://github.com/bsharma173860-oss/d3-research/blob/main/apps/landauer-gap/docs/BENCHMARKING.md).
 
+### Why it came out that way: `--explain`
+
+```bash
+joules compare --explain --facts facts.json --names new,old "./bench --runtime new" "./bench --runtime old"
+joules explain results.json                # a saved compare report (--out results.json)
+joules explain runs.csv --baseline old     # runs measured another way: name,energy_j,duration_s[,round,position,...]
+```
+
+Adds a short "Why" after the numbers, problems first:
+- whether the saving came from **finishing sooner or drawing less power** (energy = average power × time);
+- why the **total and above-idle** changes differ, and which one to quote;
+- whether the runs were **fair**: a fixed order, different starting temperatures or throttling;
+- arms **too noisy to quote**, and when there are **too few runs** for any difference to count as real;
+- with `--facts`, whether each command **did the work you asked for**. Only you know the workload, so you write
+  what was requested and what actually ran, and joules flags any number more than 10% off:
+
+```json
+{"arms": {"new": {"requested": {"changed_share": 0.05}, "actual": {"changed_share": 0.0},
+                  "hint": "the change window was full, so nothing moved"}}}
+```
+
 ## Phases of your own program
 
 Inside a Python program:

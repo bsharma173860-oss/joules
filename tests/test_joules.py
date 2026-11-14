@@ -3679,3 +3679,104 @@ class ServeMetricsCli(unittest.TestCase):
                 self.assertGreaterEqual(len(served), 2)
         code, _, err = run_cli(["agent", "--serve-metrics", "localhost:8000", "--track", "cluster", "--key", "lg_test"], {**SIM, "JOULES_PROC": tempfile.mkdtemp()})
         self.assertEqual(code, 2); self.assertIn("--serve-metrics", err)
+
+
+# ---------------------------------------------------------------- 0.9: explain
+
+
+class Explain(unittest.TestCase):
+    """joules explain: why a comparison came out the way it did."""
+
+    @staticmethod
+    def runs(spec):
+        """spec: {name: [(energy_j, duration_s), ...]}; runs rotate positions each round like a fair harness."""
+        names, out = list(spec), []
+        for rnd in range(len(next(iter(spec.values())))):
+            for pos, n in enumerate(names[rnd % len(names):] + names[:rnd % len(names)]):
+                e, t = spec[n][rnd]
+                out.append({"name": n, "energy_j": e, "duration_s": t, "avg_w": e / t, "round": rnd + 1, "position": pos + 1})
+        return out
+
+    def explain(self, spec, baseline=None, facts=None):
+        from joules import explain as ex
+        return ex.explain(ex.from_runs(self.runs(spec), baseline), facts)
+
+    def titles(self, ex_):
+        return [r["title"] for r in ex_["reasons"]]
+
+    def test_saving_split_into_time_and_power(self):
+        # new: same power, half the time -> all of the saving is finishing sooner
+        ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old")
+        r = next(r for r in ex_["reasons"] if r["title"].startswith("new used"))
+        self.assertAlmostEqual(r["numbers"]["energy_pct"], -50); self.assertAlmostEqual(r["numbers"]["time_share"], 1.0)
+        self.assertIn("finishing time", r["detail"])
+        self.assertTrue(ex_["summary"].startswith("new used 50% less energy than old."))
+        # same time, lower power -> the saving is power draw
+        ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(6.0, 1.0)] * 5}, "old")
+        self.assertIn("power draw", next(r for r in ex_["reasons"] if r["title"].startswith("new used"))["detail"])
+
+    def test_noisy_arm_and_too_few_runs(self):
+        ex_ = self.explain({"base": [(10.0, 1.0)] * 3, "jumpy": [(5.0, 1.0), (9.0, 1.0), (5.2, 1.0)]}, "base")
+        t = self.titles(ex_)
+        self.assertIn("jumpy is not stable yet", t)
+        self.assertIn("too few runs to call any difference real", t)
+        self.assertEqual(ex_["reasons"][0]["severity"], "problem")
+        self.assertIn("to fix before quoting it", ex_["summary"])
+
+    def test_steady_arms_with_enough_runs_raise_no_problem(self):
+        ex_ = self.explain({"base": [(10.0, 1.0), (10.1, 1.0), (9.9, 1.0), (10.0, 1.01), (10.05, 1.0)],
+                            "new": [(6.0, 0.8), (6.1, 0.8), (5.9, 0.8), (6.0, 0.81), (6.05, 0.8)]}, "base")
+        self.assertEqual([r for r in ex_["reasons"] if r["severity"] == "problem"], [])
+
+    def test_facts_catch_a_workload_that_did_not_run_as_asked(self):
+        facts = {"arms": {"new": {"requested": {"changed_share": 0.05, "mode": "drift"},
+                                  "actual": {"changed_share": 0.0, "mode": "drift"}, "hint": "Check the window size."}}}
+        ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", facts)
+        r = ex_["reasons"][0]
+        self.assertEqual(r["title"], "new: the workload was not what you asked for")
+        self.assertIn("changed_share: asked for 0.05, got 0.0 (none at all)", r["detail"]); self.assertIn("Check the window size.", r["detail"])
+        self.assertNotIn("mode", r["detail"])  # matching facts are not reported
+        ok = {"all": {"requested": {"changed_share": 0.05}, "actual": {"changed_share": 0.052}}}  # within 10%
+        self.assertNotIn("workload", " ".join(self.titles(self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", ok))))
+
+    def test_idle_explains_total_against_above_idle(self):
+        from joules import explain as ex
+        runs = self.runs({"old": [(10.0, 1.0)] * 5, "new": [(7.0, 1.0)] * 5})
+        for r in runs:
+            r["idle_w"] = 5.0; r["above_idle_j"] = r["energy_j"] - 5.0   # old 5 J above idle, new 2 J: -60% vs -30% total
+        out = ex.explain(ex.from_runs(runs, "old"))
+        r = next(r for r in out["reasons"] if r["title"] == "why the total and above-idle numbers differ")
+        self.assertIn("total -30%, above idle -60%", r["detail"]); self.assertIn("Idle is about 5 W", r["detail"])
+
+    def test_cli_csv_facts_and_errors(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["name,energy_j,duration_s,round,position"] + \
+               [f"{n},{e},{t},{k},{p}" for k in (1, 2, 3, 4, 5) for n, e, t, p in (("old", 10, 1, 1), ("new", 5, 0.5, 2))]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        code, out, err = run_cli(["explain", str(d / "runs.csv"), "--baseline", "old"])
+        self.assertEqual(code, 0, err); self.assertIn("new used 50% less energy than old.", out)
+        self.assertIn("always ran in the same order", out)  # old always first, new always second
+        (d / "facts.json").write_text(json.dumps({"all": {"requested": {"n": 4}, "actual": {"n": 0}}}), encoding="utf-8")
+        code, out, _ = run_cli(["explain", str(d / "runs.csv"), "--facts", str(d / "facts.json"), "--json"])
+        self.assertEqual(code, 0); self.assertEqual(json.loads(out)["reasons"][0]["severity"], "problem")
+        (d / "bad.csv").write_text("name,energy_j\nold,1\n", encoding="utf-8")
+        self.assertEqual(run_cli(["explain", str(d / "bad.csv")])[0], 2)
+        (d / "one.csv").write_text("name,energy_j,duration_s\nold,1,1\nold,1,1\n", encoding="utf-8")
+        self.assertEqual(run_cli(["explain", str(d / "one.csv")])[0], 2)
+        (d / "badfacts.json").write_text("[1]", encoding="utf-8")
+        self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--facts", str(d / "badfacts.json")])[0], 2)
+        self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--baseline", "zzz"])[0], 2)
+
+    def test_compare_explain_end_to_end(self):
+        sleep = '"{py}" -c "import time; time.sleep({s})"'
+        code, out, err = run_cli(["compare", "--names", "fast,slow", "--baseline", "slow", "--runs", "2", "--warmup", "0", "--quiet", "--no-cpu",
+                                  "--json", "--no-track", "--explain", sleep.format(py=sys.executable, s=0.1), sleep.format(py=sys.executable, s=0.6)],
+                                 {"JOULES_SIMULATE": "gpu:RTX 3070 Ti:200"})
+        self.assertEqual(code, 0, err)
+        ex_ = json.loads(out)["explain"]
+        self.assertTrue(ex_["summary"].startswith("fast used"))
+        fast = next(r for r in ex_["reasons"] if r["title"].startswith("fast used"))
+        self.assertIn("finishing time", fast["detail"])  # simulated GPU: same power, so the saving is all time
+        d = Path(tempfile.mkdtemp()); (d / "f.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(run_cli(["compare", "--facts", str(d / "f.json"), "--no-track", "a", "b"],
+                                 {"JOULES_SIMULATE": "gpu:X:100"})[0], 2)  # a bad facts file fails before any run

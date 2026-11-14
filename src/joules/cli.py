@@ -8,6 +8,7 @@
   joules run --track myproject -- python train.py   ...and chart it on your Tracking page
   joules ci --budget 10 -- pytest -q       energy check for a pull request (vs the base branch)
   joules compare "./bench --new" "./bench --old"   the same work two ways: interleaved runs, medians, p-values
+  joules explain compare.json --facts facts.json  why: time or power, idle, fairness, noise, the workload
   joules proxy --upstream http://localhost:11434   energy receipt on every AI response
   joules agent --track cluster             energy per job on a GPU server or cluster node (Slurm, Kubernetes)
   joules connect                           put this machine on Live, Tracking and the GPU leaderboard, under one name
@@ -749,6 +750,36 @@ def cmd_ci(a) -> int:
 
 
 # ---------------------------------------------------------------- joules compare
+def _read_facts(path: str | None) -> dict | None:
+    """The optional facts file: what each command was asked to do and what it really did, e.g.
+    {"arms": {"delta": {"requested": {"churn": 0.05}, "actual": {"churn": 0.0}, "hint": "..."}}}."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            facts = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"could not read --facts {path}: {e}")
+    if not isinstance(facts, dict) or not ({"arms", "all"} & facts.keys()):
+        raise ValueError(f'--facts {path} needs "arms" (per command) or "all": {{"arms": {{"NAME": {{"requested": {{...}}, "actual": {{...}}}}}}}}')
+    return facts
+
+
+def cmd_explain(a) -> int:
+    from . import explain as ex
+    try:
+        report = ex.load(a.file, a.baseline)
+        out = ex.explain(report, _read_facts(a.facts))
+    except (OSError, ValueError, KeyError) as e:
+        print(warn(f"joules explain: {e}"), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(out, indent=2))
+    else:
+        print(ex.render(out).lstrip("\n"))
+    return 0
+
+
 def cmd_compare(a) -> int:
     from . import compare as cmp
     cmds = [c for c in a.commands if c.strip()]
@@ -783,6 +814,11 @@ def cmd_compare(a) -> int:
         if lock is None:
             print("joules compare: --lock-clocks takes an SM clock in MHz, e.g. 1590, or base (the card's base clock)", file=sys.stderr)
             return 2
+    try:
+        _read_facts(a.facts)  # a broken facts file fails now, not after every run
+    except ValueError as e:
+        print(f"joules compare: {e}", file=sys.stderr)
+        return 2
     argvs = [c if a.shell else cmp.split_command(c) for c in cmds]
     if a.track:
         ensure_key(a)
@@ -860,7 +896,16 @@ def cmd_compare(a) -> int:
               "locked_mhz": locks, "gpu_clocks": "locked" if locks else "boost" if gpus else None,
               "idle_w": idle or None, "idle_w_end": idle_end or None, "simulated": d.simulated, "host": _host(), "devices": devices,
               "blocks": blocks, "results": results, "notes": notes}
-    _emit(a, report, cmp.render(report))
+    text = cmp.render(report)
+    if a.explain or a.facts:
+        from . import explain as ex
+        try:
+            report["explain"] = ex.explain(report, _read_facts(a.facts))
+        except ValueError as e:
+            print(warn(f"joules compare: {e}"), file=sys.stderr)
+            return 2
+        text += "\n" + ex.render(report["explain"])
+    _emit(a, report, text)
     if a.markdown:
         with open(a.markdown, "a", encoding="utf-8") as f:
             f.write(cmp.markdown(report))
@@ -1589,9 +1634,22 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--quiet", action="store_true", help="hide the commands' own output")
     cp.add_argument("--markdown", metavar="FILE", help="also append a Markdown table to FILE")
     cp.add_argument("--csv", metavar="FILE", help="also write one row per measured run to FILE")
+    cp.add_argument("--explain", action="store_true", help="also say why: time or power, idle, fairness, noise, and the workload facts")
+    cp.add_argument("--facts", metavar="FILE", help="JSON of what each command was asked to do and really did, checked by --explain")
     common(cp)
     sharing_args(cp)
     cp.set_defaults(fn=cmd_compare)
+
+    xp = sub.add_parser("explain", help="why a comparison came out the way it did",
+                        description="Explain a saved joules compare report (--out FILE.json), or a CSV of runs measured another way "
+                                    "(columns: name, energy_j, duration_s, and optionally round, position, temp_start_c, idle_w, "
+                                    "above_idle_j): where the saving came from, what idle power does to it, whether the runs were "
+                                    "fair and stable, and, with --facts, whether each command did the work you asked for.")
+    xp.add_argument("file", metavar="FILE", help="a compare report (.json) or runs (.csv)")
+    xp.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the report's, or the first)")
+    xp.add_argument("--facts", metavar="FILE", help='JSON: {"arms": {"NAME": {"requested": {...}, "actual": {...}}}}')
+    xp.add_argument("--json", action="store_true", help="print the explanation as JSON")
+    xp.set_defaults(fn=cmd_explain)
 
     px = sub.add_parser("proxy", help="energy receipt on every response of a model server",
                         description="Put this in front of Ollama, vLLM, llama.cpp, LM Studio or any HTTP model server. "

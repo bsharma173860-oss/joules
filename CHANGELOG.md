@@ -2,6 +2,15 @@
 
 joules is published on PyPI as [landauer-gap](https://pypi.org/project/landauer-gap/). Newest first.
 
+## Unreleased
+
+- **`joules compare --explain` and `joules explain`: why a comparison came out the way it did.** After the numbers,
+  joules says whether a saving came from finishing sooner or from drawing less power, why the total and above-idle
+  changes differ, whether the runs were fair (fixed order, starting temperature, throttling), which arms are too noisy
+  to quote, and when there are too few runs for any difference to be real. With `--facts FILE` it also checks that
+  each command did the work you asked for (requested vs actual workload numbers you supply). `joules explain` reads a
+  saved compare report or a CSV of runs measured another way.
+
 ## 0.8.2 (3 November 2026)
 
 - **AMD GPUs on Windows.** joules now reads AMD GPU power on Windows through ADLX, the library that ships with every
