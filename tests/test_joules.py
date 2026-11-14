@@ -3916,4 +3916,7 @@ class ExplainChecks(unittest.TestCase):
         self.assertEqual((r[0]["title"], r[0]["severity"]), ("no room to move", "problem"))
         self.assertTrue(any(x["title"].startswith("check ") and "boom" in x["detail"] for x in r))
         self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "nocheck.py")])[0], 2)
+        from joules import explain as ex  # extra CSV columns reach the checks as run["fields"]
+        (d / "x.csv").write_text("name,energy_j,duration_s,steps\nold,1,1,100\nnew,1,1,99\n", encoding="utf-8")
+        self.assertEqual(ex.read_csv(str(d / "x.csv"))[0]["fields"], {"steps": "100"})
         self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "missing.py")])[0], 2)

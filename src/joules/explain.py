@@ -61,6 +61,9 @@ def read_csv(path: str) -> list[dict]:
                     r[k] = int(float(row[k]))
             if r["duration_s"] <= 0:
                 raise ValueError(f"{path} line {i}: duration_s must be above 0")
+            extra = {k: v for k, v in row.items() if k not in (*num, "name", "arm", "round", "position") and v != ""}
+            if extra:
+                r["fields"] = extra  # the harness's own columns, kept as text for --checks to read
             r["avg_w"] = r["energy_j"] / r["duration_s"]
             if "above_idle_j" not in r and "idle_w" in r:
                 r["above_idle_j"] = max(0.0, r["energy_j"] - r["idle_w"] * r["duration_s"])
