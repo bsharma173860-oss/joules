@@ -366,10 +366,15 @@ def _ols(xs: list[float], ys: list[float]) -> tuple[float, float, float | None]:
     return a, b, (1 - ss_res / ss_tot) if ss_tot > 0 and len(set(xs)) > 2 else None
 
 
-def load_points(files: list[str], x_name: str) -> list[dict]:
-    """Runs with a workload value x: from VALUE=report.json (a whole compare at one workload) or CSVs with an x column."""
+def load_points(files: list[str], x_name: str | None) -> list[dict]:
+    """Runs with a workload value x: from VALUE=report.json (a whole compare at one workload) or CSVs with an x column.
+    With no x_name, every run gets x = 0 (one workload), and a plain report.json is accepted."""
     runs = []
     for f in files:
+        if x_name is None and "=" not in f:
+            rep = load(f)
+            runs += [{**r, "x": 0.0, "_baseline": rep.get("baseline")} for r in rep["results"]]
+            continue
         if "=" in f and f.split("=", 1)[1].lower().endswith(".json"):
             v, path = f.split("=", 1)
             try:
@@ -382,10 +387,10 @@ def load_points(files: list[str], x_name: str) -> list[dict]:
         elif f.lower().endswith(".csv"):
             with open(f, newline="", encoding="utf-8") as fh:
                 head = next(csv.reader(fh), [])
-            if x_name not in [h.strip() for h in head]:
+            if x_name is not None and x_name not in [h.strip() for h in head]:
                 raise ValueError(f"{f} has no {x_name} column")
             with open(f, newline="", encoding="utf-8") as fh:
-                xs = [float(row[x_name]) for row in csv.DictReader(fh)]
+                xs = [float(row[x_name]) if x_name else 0.0 for row in csv.DictReader(fh)]
             for r, x in zip(read_csv(f), xs):
                 runs.append({**r, "x": x})
         else:
@@ -504,5 +509,121 @@ def render_fit(f: dict) -> str:
             L.append(f"  {x} = {row['x']:g}:  {b} {_j(base)};  {parts}   [{tag}]")
         L.append("")
     for i, n in enumerate(f["notes"], 1):
+        L.append(f"! {n}")
+    return "\n".join(L).rstrip()
+
+
+# ---------------------------------------------------------------- cost model export: let a runtime pick by energy
+
+def export_model(f: dict, routers: tuple = ()) -> dict:
+    """A small, stable file a runtime can read to pick the strategy with the least energy at a given workload:
+    predicted energy = fixed_j + per_unit_j * x, valid inside measured range (extrapolate with care)."""
+    basis = "above_idle_j" if "above_idle_j" in f["fits"] else "energy_j"
+    lines = {n: ln for n, ln in f["fits"][basis].items() if n not in routers}
+    return {"schema": "joules-costmodel/1", "x": f["x"], "basis": basis, "measured_range": [f["measured"][0], f["measured"][-1]],
+            "strategies": {n: {"fixed_j": ln["fixed_j"], "per_unit_j": ln["per_unit_j"], "r2": ln["r2"], "runs": ln["runs"]}
+                           for n, ln in lines.items()},
+            "switch_points": switch_points(lines, f["measured"][0], f["measured"][-1])}
+
+
+def predict(model: dict, x: float) -> dict:
+    return {n: s["fixed_j"] + s["per_unit_j"] * x for n, s in model["strategies"].items()}
+
+
+def choose(model: dict, x: float) -> str:
+    """The strategy with the least predicted energy at workload x."""
+    p = predict(model, x)
+    return min(p, key=p.get)
+
+
+def switch_points(lines: dict, lo: float, hi: float) -> list[dict]:
+    """Where the cheapest strategy changes, scanning the lower envelope of the lines from lo to hi (and a little
+    beyond, marked)."""
+    cands = sorted({lo, hi} | {(b["fixed_j"] - a["fixed_j"]) / (a["per_unit_j"] - b["per_unit_j"])
+                               for a in lines.values() for b in lines.values()
+                               if abs(a["per_unit_j"] - b["per_unit_j"]) > 1e-12})
+    span = hi - lo or 1.0
+    cands = [c for c in cands if lo - span <= c <= hi + span]
+    best = lambda x: min(lines, key=lambda n: lines[n]["fixed_j"] + lines[n]["per_unit_j"] * x)
+    out, prev = [], None
+    pts = sorted(set(cands))
+    for i in range(len(pts) + 1):
+        x = pts[0] - 1e-9 if i == 0 else (pts[i - 1] + pts[i]) / 2 if i < len(pts) else pts[-1] + 1e-9
+        b = best(x)
+        if prev is not None and b != prev:
+            at = pts[i - 1]
+            out.append({"at": at, "from": prev, "to": b, "inside": lo <= at <= hi})
+        prev = b
+    return out
+
+
+# ---------------------------------------------------------------- router report card
+
+def router_card(runs: list[dict], router: str, against: list[str] | None = None, mix: dict | None = None,
+                basis: str = "energy_j") -> dict:
+    """How close a runtime's own strategy picker (the router) comes to the best fixed strategy at each workload,
+    and over a mix of workloads. Regret = router energy over the best fixed strategy's, at the same workload."""
+    names = list(dict.fromkeys(r["name"] for r in runs))
+    if router not in names:
+        raise ValueError(f"--router must be one of {', '.join(names)}")
+    against = against or [n for n in names if n != router]
+    missing = [n for n in against if n not in names]
+    if missing:
+        raise ValueError(f"--against names {', '.join(missing)}, not in the runs ({', '.join(names)})")
+    if basis == "above_idle_j" and not all("above_idle_j" in r for r in runs):
+        basis = "energy_j"
+
+    def med(vals):
+        v = sorted(vals)
+        return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
+
+    xs = sorted({r.get("x", 0.0) for r in runs if r["name"] == router})
+    rows, notes = [], []
+    for x in xs:
+        at = lambda n: [r[basis] for r in runs if r["name"] == n and r.get("x", 0.0) == x]
+        rv = at(router)
+        fixed = {n: med(at(n)) for n in against if at(n)}
+        if not fixed:
+            continue
+        best = min(fixed, key=fixed.get)
+        r_med = med(rv)
+        rng = (max(rv) - min(rv)) / r_med if r_med else 0.0
+        rows.append({"x": x, "router_j": r_med, "best": best, "best_j": fixed[best], "regret_pct": (r_med / fixed[best] - 1) * 100,
+                     "fixed": fixed, "router_range": rng, "runs": len(rv)})
+        if rng > UNSTABLE_RANGE:
+            notes.append(f"at {x:g} the router's runs ranged {rng * 100:.0f}% of their median ({_fmt_j(min(rv))} to {_fmt_j(max(rv))}): "
+                         "its choice may change from run to run. Find why before trusting its average.")
+    if not rows:
+        raise ValueError("no workload where both the router and a fixed strategy were measured")
+    w = mix or {row["x"]: 1.0 for row in rows}
+    known = [row for row in rows if row["x"] in w]
+    if not known:
+        raise ValueError("--mix names no workload that was measured")
+    tw = sum(w[row["x"]] for row in known)
+    total = lambda key: sum(w[row["x"]] * key(row) for row in known) / tw
+    perfect = total(lambda r: r["best_j"])
+    rtot = total(lambda r: r["router_j"])
+    always = {n: total(lambda r, n=n: r["fixed"].get(n, float("nan"))) for n in against
+              if all(n in r["fixed"] for r in known)}
+    return {"router": router, "against": against, "basis": basis, "rows": rows, "mix": {f"{k:g}": v for k, v in w.items()},
+            "router_j": rtot, "perfect_j": perfect, "regret_pct": (rtot / perfect - 1) * 100,
+            "always": {n: {"energy_j": v, "router_vs_pct": (rtot / v - 1) * 100} for n, v in always.items()}, "notes": notes}
+
+
+def render_router(c: dict, x_name: str = "x") -> str:
+    L = ["", f"Router report card: {c['router']}   (against {', '.join(c['against'])}; {'above idle' if c['basis'] != 'energy_j' else 'total energy'})", ""]
+    L.append(f"  {x_name:>10}   {'router':>10}   {'best fixed strategy':<28}   regret")
+    for r in c["rows"]:
+        L.append(f"  {r['x']:>10g}   {_fmt_j(r['router_j']):>10}   {(r['best'] + ' ' + _fmt_j(r['best_j'])):<28}   {r['regret_pct']:+.1f}%")
+    L.append("")
+    reg = c["regret_pct"]
+    verdict = ("matches the best choice" if abs(reg) < 0.5 else f"within {reg:.1f}% of perfect" if reg < 5 else
+               f"{reg:.0f}% above perfect: it often picks the wrong strategy" if reg >= 5 else "")
+    mix = ", ".join(f"{k}: {v:g}" for k, v in c["mix"].items())
+    L.append(f"Over the mix ({x_name} {mix}): router {_fmt_j(c['router_j'])} vs perfect choice {_fmt_j(c['perfect_j'])} "
+             f"→ {reg:+.1f}% ({verdict}).")
+    for n, a in c["always"].items():
+        L.append(f"  vs always {n}: {_fmt_j(a['energy_j'])} → the router uses {_less_more(a['router_vs_pct'])} energy")
+    for n in c["notes"]:
         L.append(f"! {n}")
     return "\n".join(L).rstrip()

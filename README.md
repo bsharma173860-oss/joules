@@ -160,6 +160,19 @@ joules fits energy = fixed + per-unit × workload for each command over every ru
 It warns when only two sizes were measured, when the break-even lies outside the measured range, and when the energy
 doesn't follow a straight line (R² < 0.9). It takes compare reports (`VALUE=report.json`) or CSVs with a workload column.
 
+### Let a runtime pick by energy, and grade its picker
+
+```bash
+joules fit --x churn_pct --export costs.json 1=a.json 25=b.json 50=c.json   # a cost model per strategy
+joules router --router auto --x churn_pct --mix 1:3,50:1 runs.csv          # how close "auto" comes to the best pick
+```
+
+`--export` writes each strategy's fixed cost and cost per unit (`joules-costmodel/1`) and where the cheapest one changes,
+so a runtime can pick the strategy with the least predicted energy (`joules.explain.choose(model, x)` in Python).
+`joules router` grades a strategy picker: at each workload, its energy against the best fixed strategy measured there
+(its regret); over a mix of workloads, against a perfect picker and against always using one strategy; and it flags a
+picker whose runs vary too much to trust.
+
 ## Phases of your own program
 
 Inside a Python program:

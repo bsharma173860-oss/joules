@@ -10,6 +10,7 @@
   joules compare "./bench --new" "./bench --old"   the same work two ways: interleaved runs, medians, p-values
   joules explain compare.json --facts facts.json  why: time or power, idle, fairness, noise, the workload
   joules fit --x churn_pct 25=a.json 50=b.json     the break-even: where one way starts to win, and why
+  joules router --router auto runs.csv --x churn  how close a strategy picker comes to the best choice
   joules proxy --upstream http://localhost:11434   energy receipt on every AI response
   joules agent --track cluster             energy per job on a GPU server or cluster node (Slurm, Kubernetes)
   joules connect                           put this machine on Live, Tracking and the GPU leaderboard, under one name
@@ -789,14 +790,48 @@ def cmd_fit(a) -> int:
         print("joules fit: --at takes numbers, e.g. --at 5,10", file=sys.stderr)
         return 2
     try:
-        out = ex.fit(ex.load_points(a.files, a.x), a.x, a.baseline, at)
+        runs = ex.load_points(a.files, a.x)
+        if a.router:
+            if a.router not in {r["name"] for r in runs}:
+                raise ValueError(f"--router {a.router} is not in the runs")
+            runs = [r for r in runs if r["name"] != a.router]  # the picker is not a strategy to fit
+        out = ex.fit(runs, a.x, a.baseline, at)
     except (OSError, ValueError, KeyError) as e:
         print(warn(f"joules fit: {e}"), file=sys.stderr)
         return 2
+    if a.export:
+        model = ex.export_model(out)
+        with open(a.export, "w", encoding="utf-8") as fh:
+            json.dump(model, fh, indent=2)
+        sw = "; ".join(f"{p['from']} → {p['to']} at {a.x} ≈ {p['at']:.3g}{'' if p['inside'] else ' (extrapolated)'}" for p in model["switch_points"])
+        print(dim(f"joules fit: cost model written to {a.export}" + (f" (cheapest switches: {sw})" if sw else "")), file=sys.stderr)
     if a.json:
         print(json.dumps(out, indent=2, default=str))
     else:
         print(ex.render_fit(out).lstrip("\n"))
+    return 0
+
+
+def cmd_router(a) -> int:
+    from . import explain as ex
+    mix = None
+    if a.mix:
+        try:
+            mix = {float(k): float(v) for k, v in (p.split(":") for p in a.mix.split(",") if p.strip())}
+        except ValueError:
+            print('joules router: --mix takes VALUE:WEIGHT pairs, e.g. --mix 1:3,50:1', file=sys.stderr)
+            return 2
+    try:
+        runs = ex.load_points(a.files, a.x)
+        card = ex.router_card(runs, a.router, [n.strip() for n in a.against.split(",")] if a.against else None, mix,
+                              "above_idle_j" if a.above_idle else "energy_j")
+    except (OSError, ValueError, KeyError) as e:
+        print(warn(f"joules router: {e}"), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(card, indent=2))
+    else:
+        print(ex.render_router(card, a.x or "workload").lstrip("\n"))
     return 0
 
 
@@ -1689,7 +1724,22 @@ def build_parser() -> argparse.ArgumentParser:
     ft.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the report's baseline, else the last)")
     ft.add_argument("--at", metavar="VALUES", help="also predict the energy at these workload values, e.g. 5,10")
     ft.add_argument("--json", action="store_true", help="print the fit as JSON")
+    ft.add_argument("--export", metavar="FILE.json", help="write a cost model a runtime can read to pick the strategy with the least energy")
+    ft.add_argument("--router", metavar="NAME", help="a command that picks a strategy itself: left out of the fit (judge it with joules router)")
     ft.set_defaults(fn=cmd_fit)
+
+    rt = sub.add_parser("router", help="how close a strategy picker comes to the best fixed choice",
+                        description="Router report card: at each workload, the router's energy against the best fixed strategy "
+                                    "measured there (its regret), and over a mix of workloads against a perfect picker and "
+                                    "against always using one strategy. Takes the same inputs as joules fit.")
+    rt.add_argument("files", nargs="+", metavar="FILE", help="VALUE=report.json, report.json (with no --x), or runs.csv")
+    rt.add_argument("--router", required=True, metavar="NAME", help="the command that picks a strategy itself")
+    rt.add_argument("--x", metavar="NAME", help="the workload value (CSV column), if measured at several workloads")
+    rt.add_argument("--against", metavar="NAMES", help="the fixed strategies to compare with, comma-separated (default: all others)")
+    rt.add_argument("--mix", metavar="PAIRS", help="how often each workload happens, VALUE:WEIGHT, e.g. 1:3,50:1 (default: equal)")
+    rt.add_argument("--above-idle", action="store_true", help="judge on energy above idle (when measured)")
+    rt.add_argument("--json", action="store_true", help="print the card as JSON")
+    rt.set_defaults(fn=cmd_router)
 
     px = sub.add_parser("proxy", help="energy receipt on every response of a model server",
                         description="Put this in front of Ollama, vLLM, llama.cpp, LM Studio or any HTTP model server. "

@@ -3920,3 +3920,56 @@ class ExplainChecks(unittest.TestCase):
         (d / "x.csv").write_text("name,energy_j,duration_s,steps\nold,1,1,100\nnew,1,1,99\n", encoding="utf-8")
         self.assertEqual(ex.read_csv(str(d / "x.csv"))[0]["fields"], {"steps": "100"})
         self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "missing.py")])[0], 2)
+
+
+class CostModelAndRouter(unittest.TestCase):
+    """joules fit --export (a cost model a runtime can pick from) and joules router (the report card)."""
+
+    @staticmethod
+    def runs(levels):
+        # new: 100 + 2x, old: 20 + 10x (break-even 10); auto picks right except at 15 where it picks old
+        out = []
+        for x in levels:
+            for k in range(5):
+                for n, e in (("new", 100 + 2 * x), ("old", 20 + 10 * x)):
+                    out.append({"name": n, "x": x, "energy_j": e + 0.1 * (k - 2), "duration_s": 1.0, "avg_w": 1.0})
+                pick = 20 + 10 * x if x == 15 else min(100 + 2 * x, 20 + 10 * x)
+                out.append({"name": "auto", "x": x, "energy_j": pick + 0.1 * (k - 2), "duration_s": 1.0, "avg_w": 1.0})
+        return out
+
+    def test_export_choose_and_switch_point(self):
+        from joules import explain as ex
+        f = ex.fit([r for r in self.runs([5, 15, 30]) if r["name"] != "auto"], "churn", "old")
+        m = ex.export_model(f)
+        self.assertEqual(m["schema"], "joules-costmodel/1"); self.assertEqual(set(m["strategies"]), {"new", "old"})
+        self.assertEqual((ex.choose(m, 4), ex.choose(m, 20)), ("old", "new"))
+        sp = m["switch_points"]; self.assertEqual(len(sp), 1)
+        self.assertAlmostEqual(sp[0]["at"], 10.0, places=6); self.assertEqual((sp[0]["from"], sp[0]["to"], sp[0]["inside"]), ("old", "new", True))
+
+    def test_router_card_regret_and_mix(self):
+        from joules import explain as ex
+        c = ex.router_card(self.runs([5, 15, 30]), "auto")
+        by = {r["x"]: r for r in c["rows"]}
+        self.assertAlmostEqual(by[5]["regret_pct"], 0, places=6); self.assertAlmostEqual(by[30]["regret_pct"], 0, places=6)
+        self.assertAlmostEqual(by[15]["regret_pct"], (170 / 130 - 1) * 100, places=6)   # picked old (170) where new (130) was best
+        self.assertGreater(c["regret_pct"], 0)
+        only_low = ex.router_card(self.runs([5, 15, 30]), "auto", mix={5: 1.0})
+        self.assertAlmostEqual(only_low["regret_pct"], 0, places=6)
+        self.assertLess(c["always"]["old"]["router_vs_pct"], 0)  # the router beats always-old over the mix
+        self.assertIn("Router report card: auto", ex.render_router(c, "churn"))
+        with self.assertRaises(ValueError):
+            ex.router_card(self.runs([5]), "nobody")
+        with self.assertRaises(ValueError):
+            ex.router_card(self.runs([5]), "auto", ["zzz"])
+
+    def test_cli_router_and_export(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["name,energy_j,duration_s,churn"] + [f"{r['name']},{r['energy_j']},1,{r['x']}" for r in self.runs([5, 15, 30])]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        code, out, err = run_cli(["router", "--router", "auto", "--x", "churn", "--mix", "5:2,15:1,30:1", str(d / "runs.csv")])
+        self.assertEqual(code, 0, err); self.assertIn("regret", out); self.assertIn("vs always old", out)
+        self.assertEqual(run_cli(["router", "--router", "auto", "--mix", "bad", str(d / "runs.csv")])[0], 2)
+        code, _, err = run_cli(["fit", "--x", "churn", "--router", "auto", "--baseline", "old", "--export", str(d / "m.json"), str(d / "runs.csv")])
+        self.assertEqual(code, 0, err)
+        m = json.loads((d / "m.json").read_text(encoding="utf-8"))
+        self.assertNotIn("auto", m["strategies"]); self.assertIn("cheapest switches: old → new", err)

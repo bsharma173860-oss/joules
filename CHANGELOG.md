@@ -12,6 +12,8 @@ joules is published on PyPI as [landauer-gap](https://pypi.org/project/landauer-
   saved compare report or a CSV of runs measured another way. `--strict` exits 3 when there is a problem to fix before
   quoting the result. Every power limit of a `--limits` run is explained.
 - The `compare` help and error examples now use `new`/`old` as names.
+- **Pick by energy.** `joules fit --export` writes a cost model a runtime can pick from, and `joules router` grades a
+  strategy picker against the best fixed choice at each workload and over a workload mix.
 - `--checks FILE.py` adds your own workload checks to `--explain` (a `check(report, facts)` function), shown first.
 - **`joules fit`: the break-even.** From comparisons at two or more workload sizes, it fits energy = fixed + per-unit x
   workload for each command and says where one starts to beat the other, why (fixed cost against cost per unit), and
