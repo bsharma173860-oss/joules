@@ -187,7 +187,7 @@ def explain(report: dict, facts: dict | None = None, checks: list | None = None)
     for block in report["blocks"]:
         prefix = f"at {block['limit_pct']}% power: " if multi and block.get("limit_pct") is not None else ""
         runs = [r for r in all_runs if r.get("limit_pct") == block.get("limit_pct")]
-        _explain_block(block, runs, names, baseline, facts if block is report["blocks"][0] else None, prefix, reasons)
+        _explain_block(block, runs, names, baseline, facts if block is report["blocks"][0] else None, prefix, reasons, report.get("order"))
 
     from_checks: list[dict] = []
     for path, fn in checks or []:
@@ -222,7 +222,7 @@ GOOD_NEWS = ("Clocks held at", "alike for every command")  # compare notes that 
 
 
 def _explain_block(block: dict, runs: list[dict], names: list[str], baseline: str, facts: dict | None, prefix: str,
-                   reasons: list[dict]) -> None:
+                   reasons: list[dict], report_order: str | None = None) -> None:
     rows = {r["name"]: r for r in block["rows"]}
     base = rows.get(baseline)
 
@@ -250,7 +250,7 @@ def _explain_block(block: dict, runs: list[dict], names: list[str], baseline: st
                 f"Find it, or run at least 5 more times, before quoting this arm.", arm=n, min_j=e["min"], max_j=e["max"], runs=row["runs"])
 
     # 3. fair conditions
-    if _fixed_order(runs, names):
+    if not report_order and len(names) >= 3 and _fixed_order(runs, names):  # joules compare's own orders are fair; 2 arms A B A B interleave
         add("problem", "the commands always ran in the same order",
             "every round ran them in one fixed order, so a later command always started on a warmer, busier GPU. "
             "Alternate the order (joules compare does this) and rest or cool between runs (--rest, --cool-to).")
@@ -285,7 +285,12 @@ def _explain_block(block: dict, runs: list[dict], names: list[str], baseline: st
         if not s:
             continue
         n = row["name"]
-        if s["time_pct"] < 0 and s["power_pct"] <= 0:
+        same = lambda v: abs(v) < 1
+        if same(s["power_pct"]):
+            how = f"it {'finished sooner' if s['time_pct'] < 0 else 'took longer'} (time {_pct(s['time_pct'])}) at about the same power"
+        elif same(s["time_pct"]):
+            how = f"it took about the same time and drew {'less' if s['power_pct'] < 0 else 'more'} power (average {_pct(s['power_pct'])})"
+        elif s["time_pct"] < 0 and s["power_pct"] <= 0:
             how = f"it finished sooner (time {_pct(s['time_pct'])}) and drew less power (average {_pct(s['power_pct'])})"
         elif s["time_pct"] < 0:
             how = f"it finished sooner (time {_pct(s['time_pct'])}) while drawing more power (average {_pct(s['power_pct'])})"

@@ -61,7 +61,9 @@ def mann_whitney(x: list[float], y: list[float]) -> float | None:
     if var <= 0:
         return 1.0
     z = max(0.0, abs(u - n * m / 2) - 0.5) / math.sqrt(var)
-    return min(1.0, math.erfc(z / math.sqrt(2)))
+    # the normal approximation can go below what any arrangement of n and m runs allows (e.g. 0.047 for 3 against 3
+    # identical-valued runs, where the exact floor is 0.1), so never report less than that floor
+    return min(1.0, max(math.erfc(z / math.sqrt(2)), 2 / math.comb(n + m, n)))
 
 
 # ---------------------------------------------------------------- running

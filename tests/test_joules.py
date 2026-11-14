@@ -3751,11 +3751,11 @@ class Explain(unittest.TestCase):
     def test_cli_csv_facts_and_errors(self):
         d = Path(tempfile.mkdtemp())
         rows = ["name,energy_j,duration_s,round,position"] + \
-               [f"{n},{e},{t},{k},{p}" for k in (1, 2, 3, 4, 5) for n, e, t, p in (("old", 10, 1, 1), ("new", 5, 0.5, 2))]
+               [f"{n},{e},{t},{k},{p}" for k in (1, 2, 3, 4, 5) for n, e, t, p in (("old", 10, 1, 1), ("new", 5, 0.5, 2), ("mid", 7, 0.7, 3))]
         (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
         code, out, err = run_cli(["explain", str(d / "runs.csv"), "--baseline", "old"])
         self.assertEqual(code, 0, err); self.assertIn("new used 50% less energy than old.", out)
-        self.assertIn("always ran in the same order", out)  # old always first, new always second
+        self.assertIn("always ran in the same order", out)  # three arms, always old, new, mid
         (d / "facts.json").write_text(json.dumps({"all": {"requested": {"n": 4}, "actual": {"n": 0}}}), encoding="utf-8")
         code, out, _ = run_cli(["explain", str(d / "runs.csv"), "--facts", str(d / "facts.json"), "--json"])
         self.assertEqual(code, 0); self.assertEqual(json.loads(out)["reasons"][0]["severity"], "problem")
@@ -3829,7 +3829,11 @@ class Explain(unittest.TestCase):
         (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
         code, out, err = run_cli(["explain", str(d / "runs.csv")])
         self.assertEqual(code, 0, err); self.assertIn("new used 50% less energy than old.", out)
-        self.assertEqual(run_cli(["explain", "--strict", str(d / "runs.csv")])[0], 3)  # 3 runs and a fixed order: problems
+        self.assertEqual(run_cli(["explain", "--strict", str(d / "runs.csv")])[0], 3)  # 3 runs: too few for any difference to count
+        from joules import explain as ex  # two arms in A B A B order are fair: no order problem
+        two = ex.explain(ex.from_runs([{"name": n, "energy_j": e, "duration_s": 1.0, "round": k, "position": p}
+                                       for k in range(1, 6) for n, e, p in (("old", 10.0, 1), ("new", 6.0, 2))], "old"))
+        self.assertNotIn("the commands always ran in the same order", [r["title"] for r in two["reasons"]])
 
 
 class Fit(unittest.TestCase):
@@ -3920,6 +3924,13 @@ class ExplainChecks(unittest.TestCase):
         (d / "x.csv").write_text("name,energy_j,duration_s,steps\nold,1,1,100\nnew,1,1,99\n", encoding="utf-8")
         self.assertEqual(ex.read_csv(str(d / "x.csv"))[0]["fields"], {"steps": "100"})
         self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "missing.py")])[0], 2)
+
+
+class MannWhitneyFloor(unittest.TestCase):
+    def test_tied_samples_never_beat_the_exact_floor(self):
+        from joules.compare import mann_whitney, min_p
+        self.assertAlmostEqual(mann_whitney([5, 5, 5], [10, 10, 10]), min_p(3, 3))  # was 0.047 from the approximation
+        self.assertLess(mann_whitney([5] * 7, [10] * 7), 0.01)                       # enough runs can still be significant
 
 
 class CostModelAndRouter(unittest.TestCase):

@@ -4,6 +4,9 @@ joules is published on PyPI as [landauer-gap](https://pypi.org/project/landauer-
 
 ## Unreleased
 
+- **Fix:** with tied run values, compare's p-value could fall below the smallest value its run counts allow (0.047
+  for 3 against 3, where the floor is 0.1), calling a difference significant too early. It is now floored there.
+
 - **`joules compare --explain` and `joules explain`: why a comparison came out the way it did.** After the numbers,
   joules says whether a saving came from finishing sooner or from drawing less power, why the total and above-idle
   changes differ, whether the runs were fair (fixed order, starting temperature, throttling), which arms are too noisy
