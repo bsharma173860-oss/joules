@@ -135,21 +135,21 @@ Adds a short "Why" after the numbers, problems first:
   what was requested and what actually ran, and joules flags any number more than 10% off:
 
 ```json
-{"arms": {"new": {"requested": {"changed_share": 0.05}, "actual": {"changed_share": 0.0},
-                  "hint": "the change window was full, so nothing moved"}}}
+{"arms": {"new": {"requested": {"batch_size": 64}, "actual": {"batch_size": 32},
+                  "hint": "the server capped the batch size"}}}
 ```
 
 Your own checks: `--checks my_checks.py` loads a Python file that defines `check(report, facts)` and returns a list of
 `{"severity": "problem" | "note", "title": ..., "detail": ...}`. They are shown first. Use them for knowledge only your
-harness has (its parameters, windows, counters), so it stays in your code, not in joules. The file runs on your
+harness has (its parameters and counters), so it stays in your code, not in joules. The file runs on your
 machine like any script, so only load files you trust.
 
 ### Where one way starts to win: `joules fit`
 
-Measure the comparison at two or more workload sizes (e.g. 1%, 10%, 25% and 50% of the data changing), then:
+Measure the comparison at two or more workload sizes (e.g. 1, 10, 25 and 50% of the full load), then:
 
 ```bash
-joules fit --x churn_pct --at 5 1=churn1.json 10=churn10.json 25=churn25.json 50=churn50.json
+joules fit --x load_pct --at 5 1=load1.json 10=load10.json 25=load25.json 50=load50.json
 ```
 
 joules fits energy = fixed + per-unit × workload for each command over every run, and prints:
@@ -163,8 +163,8 @@ doesn't follow a straight line (R² < 0.9). It takes compare reports (`VALUE=rep
 ### Let a runtime pick by energy, and grade its picker
 
 ```bash
-joules fit --x churn_pct --export costs.json 1=a.json 25=b.json 50=c.json   # a cost model per strategy
-joules router --router auto --x churn_pct --mix 1:3,50:1 runs.csv          # how close "auto" comes to the best pick
+joules fit --x load_pct --export costs.json 1=a.json 25=b.json 50=c.json   # a cost model per strategy
+joules router --router auto --x load_pct --mix 1:3,50:1 runs.csv          # how close "auto" comes to the best pick
 ```
 
 `--export` writes each strategy's fixed cost and cost per unit (`joules-costmodel/1`) and where the cheapest one changes,

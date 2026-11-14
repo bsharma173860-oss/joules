@@ -246,8 +246,8 @@ def _explain_block(block: dict, runs: list[dict], names: list[str], baseline: st
         if row["runs"] >= 2 and (rng > UNSTABLE_RANGE or e.get("spread_pct", 0) > UNSTABLE_IQR):
             add("problem", f"{n} is not stable yet",
                 f"its runs ranged from {_fmt_j(e['min'])} to {_fmt_j(e['max'])} ({rng * 100:.0f}% of its median) over "
-                f"{row['runs']} runs. Something changes between runs (warm-up, caching, clocks or the workload itself). "
-                f"Find it, or run at least 5 more times, before quoting this arm.", arm=n, min_j=e["min"], max_j=e["max"], runs=row["runs"])
+                f"{row['runs']} runs. Something changes between runs (warm-up, caching, clocks or the workload itself), so this "
+                f"arm's number isn't settled yet; more runs, or a look at what varies, would settle it.", arm=n, min_j=e["min"], max_j=e["max"], runs=row["runs"])
 
     # 3. fair conditions
     if not report_order and len(names) >= 3 and _fixed_order(runs, names):  # joules compare's own orders are fair; 2 arms A B A B interleave
@@ -280,6 +280,7 @@ def _explain_block(block: dict, runs: list[dict], names: list[str], baseline: st
                     if p is not None else f"energy {_pct(r['vs']['energy_pct'])}; too few runs for a p-value.", arm=r["name"], p=p)
 
     shown = [r for r in others if abs(r["vs"]["energy_pct"]) >= 5]
+    rest_rows = [r for r in others if r not in shown[:MAX_SPLITS]]
     for row in shown[:MAX_SPLITS]:
         s = _split(row, base)
         if not s:
@@ -306,9 +307,9 @@ def _explain_block(block: dict, runs: list[dict], names: list[str], baseline: st
         else:
             main_txt = f" About {max(share, 1 - share) * 100:.0f}% of the change came from {'finishing time' if share > 0.5 else 'power draw'}."
         add("note", f"{n} used {_less_more(s['energy_pct'])} energy than {baseline}", f"{how}.{main_txt}", arm=n, **s)
-    if len(shown) > MAX_SPLITS:
-        rest = ", ".join(f"{r['name']} {_pct(r['vs']['energy_pct'])}" for r in shown[MAX_SPLITS:])
-        add("note", "the other commands", f"{rest} (details with --json).")
+    if rest_rows:
+        rest = ", ".join(f"{r['name']} {_pct(r['vs']['energy_pct'])}" for r in rest_rows)
+        add("note", "the other commands", f"against {baseline}: {rest}.")
 
     idle_gap = [r for r in others if "above_idle_pct" in r["vs"] and abs(r["vs"]["above_idle_pct"] - r["vs"]["energy_pct"]) > IDLE_GAP_PTS]
     if idle_gap:
@@ -340,7 +341,7 @@ def _summary(rows: dict, baseline: str, problems: list) -> str:
         s += f" ({_less_more(vs['above_idle_pct'])} above idle)"
     s += "."
     if problems:
-        s += f" {len(problems)} thing{'s' if len(problems) > 1 else ''} to fix before quoting it, below."
+        s += f" {len(problems)} thing{'s' if len(problems) > 1 else ''} to check before quoting it, below."
     return s
 
 
@@ -498,18 +499,18 @@ def render_fit(f: dict) -> str:
             side = "above" if c["wins"] == "above" else "below"
             L.append(f"Break-even{lab}: {n} beats {b} {side} {x} ≈ {c['x']:.3g}")
             if c["wins"] == "above":
-                L.append(f"  why: {n} costs {_j(c['extra_fixed_j'])} more up front (fixed), but saves {_j(c['saved_per_unit_j'])} "
-                         f"for every 1 {x}, so it pays back after {c['x']:.3g}.")
+                L.append(f"  why: {n}'s fitted line starts {_j(c['extra_fixed_j'])} higher but rises {_j(c['saved_per_unit_j'])} less "
+                         f"per 1 {x}, so the two lines cross at {c['x']:.3g}.")
             else:
-                L.append(f"  why: {n} costs {_j(-c['extra_fixed_j'])} less up front, but {_j(-c['saved_per_unit_j'])} more per 1 {x}, "
-                         f"so it loses past {c['x']:.3g}.")
+                L.append(f"  why: {n}'s fitted line starts {_j(-c['extra_fixed_j'])} lower but rises {_j(-c['saved_per_unit_j'])} more "
+                         f"per 1 {x}, so the two lines cross at {c['x']:.3g}.")
         L.append("")
     if f["at"]:
-        L.append(f"At your workload:")
+        L.append(f"Predicted at {x} values you asked for (--at):")
         for row in f["at"]:
             e = row["energy_j"]
             base = e[b]
-            tag = "measured" if row["measured"] else "inside the measured range" if row["inside"] else "extrapolated"
+            tag = "measured" if row["measured"] else "inside the measured range" if row["inside"] else "outside the measured range: no data there"
             parts = ", ".join(f"{n} {_j(v)} ({(v - base) / base * 100:+.0f}%)" for n, v in e.items() if n != b)
             L.append(f"  {x} = {row['x']:g}:  {b} {_j(base)};  {parts}   [{tag}]")
         L.append("")
@@ -597,7 +598,7 @@ def router_card(runs: list[dict], router: str, against: list[str] | None = None,
                      "fixed": fixed, "router_range": rng, "runs": len(rv)})
         if rng > UNSTABLE_RANGE:
             notes.append(f"at {x:g} the router's runs ranged {rng * 100:.0f}% of their median ({_fmt_j(min(rv))} to {_fmt_j(max(rv))}): "
-                         "its choice may change from run to run. Find why before trusting its average.")
+                         "its choice may differ from run to run, so its average isn't settled yet.")
     if not rows:
         raise ValueError("no workload where both the router and a fixed strategy were measured")
     w = mix or {row["x"]: 1.0 for row in rows}

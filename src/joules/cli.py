@@ -9,8 +9,8 @@
   joules ci --budget 10 -- pytest -q       energy check for a pull request (vs the base branch)
   joules compare "./bench --new" "./bench --old"   the same work two ways: interleaved runs, medians, p-values
   joules explain compare.json --facts facts.json  why: time or power, idle, fairness, noise, the workload
-  joules fit --x churn_pct 25=a.json 50=b.json     the break-even: where one way starts to win, and why
-  joules router --router auto runs.csv --x churn  how close a strategy picker comes to the best choice
+  joules fit --x load_pct 25=a.json 50=b.json     the break-even: where one way starts to win, and why
+  joules router --router auto runs.csv --x load  how close a strategy picker comes to the best choice
   joules proxy --upstream http://localhost:11434   energy receipt on every AI response
   joules agent --track cluster             energy per job on a GPU server or cluster node (Slurm, Kubernetes)
   joules connect                           put this machine on Live, Tracking and the GPU leaderboard, under one name
@@ -754,7 +754,7 @@ def cmd_ci(a) -> int:
 # ---------------------------------------------------------------- joules compare
 def _read_facts(path: str | None) -> dict | None:
     """The optional facts file: what each command was asked to do and what it really did, e.g.
-    {"arms": {"delta": {"requested": {"churn": 0.05}, "actual": {"churn": 0.0}, "hint": "..."}}}."""
+    {"arms": {"new": {"requested": {"batch_size": 64}, "actual": {"batch_size": 32}, "hint": "..."}}}."""
     if not path:
         return None
     try:
@@ -1719,8 +1719,8 @@ def build_parser() -> argparse.ArgumentParser:
                                     "break-even), why (fixed cost against cost per unit), and what to expect at your workload. "
                                     "Give each joules compare report with its workload value (25=run25.json), or CSVs of runs "
                                     "with a column for the workload.")
-    ft.add_argument("files", nargs="+", metavar="FILE", help="VALUE=report.json (e.g. 25=churn25.json) or runs.csv")
-    ft.add_argument("--x", required=True, metavar="NAME", help="what the workload value is, e.g. churn_pct (the CSV column name)")
+    ft.add_argument("files", nargs="+", metavar="FILE", help="VALUE=report.json (e.g. 25=load25.json) or runs.csv")
+    ft.add_argument("--x", required=True, metavar="NAME", help="what the workload value is, e.g. load_pct (the CSV column name)")
     ft.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the report's baseline, else the last)")
     ft.add_argument("--at", metavar="VALUES", help="also predict the energy at these workload values, e.g. 5,10")
     ft.add_argument("--json", action="store_true", help="print the fit as JSON")

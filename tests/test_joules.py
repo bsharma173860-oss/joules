@@ -3721,7 +3721,7 @@ class Explain(unittest.TestCase):
         self.assertIn("jumpy is not stable yet", t)
         self.assertIn("too few runs to call any difference real", t)
         self.assertEqual(ex_["reasons"][0]["severity"], "problem")
-        self.assertIn("to fix before quoting it", ex_["summary"])
+        self.assertIn("to check before quoting it", ex_["summary"])
 
     def test_steady_arms_with_enough_runs_raise_no_problem(self):
         ex_ = self.explain({"base": [(10.0, 1.0), (10.1, 1.0), (9.9, 1.0), (10.0, 1.01), (10.05, 1.0)],
@@ -3729,14 +3729,14 @@ class Explain(unittest.TestCase):
         self.assertEqual([r for r in ex_["reasons"] if r["severity"] == "problem"], [])
 
     def test_facts_catch_a_workload_that_did_not_run_as_asked(self):
-        facts = {"arms": {"new": {"requested": {"changed_share": 0.05, "mode": "drift"},
-                                  "actual": {"changed_share": 0.0, "mode": "drift"}, "hint": "Check the window size."}}}
+        facts = {"arms": {"new": {"requested": {"batch_size": 64, "mode": "eager"},
+                                  "actual": {"batch_size": 0, "mode": "eager"}, "hint": "Check the server's batch limit."}}}
         ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", facts)
         r = ex_["reasons"][0]
         self.assertEqual(r["title"], "new: the workload was not what you asked for")
-        self.assertIn("changed_share: asked for 0.05, got 0.0 (none at all)", r["detail"]); self.assertIn("Check the window size.", r["detail"])
+        self.assertIn("batch_size: asked for 64, got 0 (none at all)", r["detail"]); self.assertIn("Check the server's batch limit.", r["detail"])
         self.assertNotIn("mode", r["detail"])  # matching facts are not reported
-        ok = {"all": {"requested": {"changed_share": 0.05}, "actual": {"changed_share": 0.052}}}  # within 10%
+        ok = {"all": {"requested": {"batch_size": 64}, "actual": {"batch_size": 62}}}  # within 10%
         self.assertNotIn("workload", " ".join(self.titles(self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", ok))))
 
     def test_idle_explains_total_against_above_idle(self):
@@ -3852,7 +3852,7 @@ class Fit(unittest.TestCase):
 
     def test_break_even_and_why(self):
         from joules import explain as ex
-        f = ex.fit(self.runs([5, 15, 30], noise=0.5), "churn", "old", [4, 30])
+        f = ex.fit(self.runs([5, 15, 30], noise=0.5), "load", "old", [4, 30])
         c = f["crossovers"]["energy_j"]["new"]
         self.assertAlmostEqual(c["x"], 10.0, places=6); self.assertEqual(c["wins"], "above"); self.assertTrue(c["inside"])
         self.assertAlmostEqual(c["extra_fixed_j"], 80); self.assertAlmostEqual(c["saved_per_unit_j"], 8)
@@ -3860,12 +3860,12 @@ class Fit(unittest.TestCase):
         self.assertEqual(f["notes"], [])  # three levels, a straight line, break-even inside the range
         at4 = f["at"][0]["energy_j"]; self.assertAlmostEqual(at4["new"], 108); self.assertAlmostEqual(at4["old"], 60)
         text = ex.render_fit(f)
-        self.assertIn("new beats old above churn ≈ 10", text); self.assertIn("costs 80 J more up front", text)
-        self.assertIn("churn = 4:  old 60 J;  new 108 J (+80%)   [extrapolated]", text)  # 4 is below the measured 5
+        self.assertIn("new beats old above load ≈ 10", text); self.assertIn("starts 80 J higher but rises 8 J less per 1 load", text)
+        self.assertIn("load = 4:  old 60 J;  new 108 J (+80%)   [outside the measured range: no data there]", text)  # 4 is below the measured 5
 
     def test_two_levels_and_extrapolation_are_flagged(self):
         from joules import explain as ex
-        f = ex.fit(self.runs([20, 40]), "churn", "old")
+        f = ex.fit(self.runs([20, 40]), "load", "old")
         self.assertIsNone(f["fits"]["energy_j"]["new"]["r2"])
         self.assertTrue(any("Only two values" in n for n in f["notes"]))
         self.assertTrue(any("outside the measured range" in n for n in f["notes"]))
@@ -3873,26 +3873,26 @@ class Fit(unittest.TestCase):
     def test_errors(self):
         from joules import explain as ex
         with self.assertRaises(ValueError):
-            ex.fit(self.runs([20]), "churn", "old")
+            ex.fit(self.runs([20]), "load", "old")
         with self.assertRaises(ValueError):
-            ex.fit(self.runs([20, 40]), "churn", "zzz")
+            ex.fit(self.runs([20, 40]), "load", "zzz")
         with self.assertRaises(ValueError):
-            ex.load_points(["x.txt"], "churn")
+            ex.load_points(["x.txt"], "load")
 
     def test_cli_with_csv_and_reports(self):
         d = Path(tempfile.mkdtemp())
-        rows = ["name,energy_j,duration_s,churn"] + [f"{r['name']},{r['energy_j']},1,{r['x']}" for r in self.runs([5, 15, 30])]
+        rows = ["name,energy_j,duration_s,load"] + [f"{r['name']},{r['energy_j']},1,{r['x']}" for r in self.runs([5, 15, 30])]
         (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
-        code, out, err = run_cli(["fit", "--x", "churn", "--baseline", "old", "--at", "8", str(d / "runs.csv")])
-        self.assertEqual(code, 0, err); self.assertIn("new beats old above churn ≈ 10", out)
+        code, out, err = run_cli(["fit", "--x", "load", "--baseline", "old", "--at", "8", str(d / "runs.csv")])
+        self.assertEqual(code, 0, err); self.assertIn("new beats old above load ≈ 10", out)
         from joules import explain as ex
         for x in (10, 40):  # whole compare reports, one per workload value
             rep = ex.from_runs([dict(r) for r in self.runs([x]) if True], "old")
             (d / f"r{x}.json").write_text(json.dumps(rep), encoding="utf-8")
-        code, out, err = run_cli(["fit", "--x", "churn", "--json", f"10={d / 'r10.json'}", f"40={d / 'r40.json'}"])
+        code, out, err = run_cli(["fit", "--x", "load", "--json", f"10={d / 'r10.json'}", f"40={d / 'r40.json'}"])
         self.assertEqual(code, 0, err); f = json.loads(out)
         self.assertEqual(f["baseline"], "old"); self.assertAlmostEqual(f["crossovers"]["energy_j"]["new"]["x"], 10.0, places=6)
-        self.assertEqual(run_cli(["fit", "--x", "churn", "--at", "abc", str(d / "runs.csv")])[0], 2)
+        self.assertEqual(run_cli(["fit", "--x", "load", "--at", "abc", str(d / "runs.csv")])[0], 2)
         self.assertEqual(run_cli(["fit", "--x", "nope", str(d / "runs.csv")])[0], 2)
 
 
@@ -3903,8 +3903,8 @@ class ExplainChecks(unittest.TestCase):
         d = Path(tempfile.mkdtemp())
         (d / "c.py").write_text(textwrap.dedent('''
             def check(report, facts):
-                if facts.get("all", {}).get("window") == facts.get("all", {}).get("changed"):
-                    return [{"severity": "problem", "title": "no room to move", "detail": "window = changed set"}]
+                if facts.get("all", {}).get("workers") == 0:
+                    return [{"severity": "problem", "title": "no workers ran", "detail": "workers = 0"}]
                 return []
         '''), encoding="utf-8")
         (d / "bad.py").write_text("def check(report, facts):\n    raise RuntimeError('boom')\n", encoding="utf-8")
@@ -3912,12 +3912,12 @@ class ExplainChecks(unittest.TestCase):
         rows = ["name,energy_j,duration_s,round,position"] + [f"{n},{e},1,{k},{p}" for k in (1, 2, 3, 4, 5)
                                                              for n, e, p in ((("old", 10, 1), ("new", 5, 2)) if k % 2 else (("new", 5, 1), ("old", 10, 2)))]
         (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
-        (d / "f.json").write_text(json.dumps({"all": {"window": 4000, "changed": 4000}}), encoding="utf-8")
+        (d / "f.json").write_text(json.dumps({"all": {"workers": 0}}), encoding="utf-8")
         code, out, err = run_cli(["explain", str(d / "runs.csv"), "--baseline", "old", "--facts", str(d / "f.json"),
                                   "--checks", str(d / "c.py"), "--checks", str(d / "bad.py"), "--json"])
         self.assertEqual(code, 0, err)
         r = json.loads(out)["reasons"]
-        self.assertEqual((r[0]["title"], r[0]["severity"]), ("no room to move", "problem"))
+        self.assertEqual((r[0]["title"], r[0]["severity"]), ("no workers ran", "problem"))
         self.assertTrue(any(x["title"].startswith("check ") and "boom" in x["detail"] for x in r))
         self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "nocheck.py")])[0], 2)
         from joules import explain as ex  # extra CSV columns reach the checks as run["fields"]
@@ -3950,7 +3950,7 @@ class CostModelAndRouter(unittest.TestCase):
 
     def test_export_choose_and_switch_point(self):
         from joules import explain as ex
-        f = ex.fit([r for r in self.runs([5, 15, 30]) if r["name"] != "auto"], "churn", "old")
+        f = ex.fit([r for r in self.runs([5, 15, 30]) if r["name"] != "auto"], "load", "old")
         m = ex.export_model(f)
         self.assertEqual(m["schema"], "joules-costmodel/1"); self.assertEqual(set(m["strategies"]), {"new", "old"})
         self.assertEqual((ex.choose(m, 4), ex.choose(m, 20)), ("old", "new"))
@@ -3967,7 +3967,7 @@ class CostModelAndRouter(unittest.TestCase):
         only_low = ex.router_card(self.runs([5, 15, 30]), "auto", mix={5: 1.0})
         self.assertAlmostEqual(only_low["regret_pct"], 0, places=6)
         self.assertLess(c["always"]["old"]["router_vs_pct"], 0)  # the router beats always-old over the mix
-        self.assertIn("Router report card: auto", ex.render_router(c, "churn"))
+        self.assertIn("Router report card: auto", ex.render_router(c, "load"))
         with self.assertRaises(ValueError):
             ex.router_card(self.runs([5]), "nobody")
         with self.assertRaises(ValueError):
@@ -3975,12 +3975,12 @@ class CostModelAndRouter(unittest.TestCase):
 
     def test_cli_router_and_export(self):
         d = Path(tempfile.mkdtemp())
-        rows = ["name,energy_j,duration_s,churn"] + [f"{r['name']},{r['energy_j']},1,{r['x']}" for r in self.runs([5, 15, 30])]
+        rows = ["name,energy_j,duration_s,load"] + [f"{r['name']},{r['energy_j']},1,{r['x']}" for r in self.runs([5, 15, 30])]
         (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
-        code, out, err = run_cli(["router", "--router", "auto", "--x", "churn", "--mix", "5:2,15:1,30:1", str(d / "runs.csv")])
+        code, out, err = run_cli(["router", "--router", "auto", "--x", "load", "--mix", "5:2,15:1,30:1", str(d / "runs.csv")])
         self.assertEqual(code, 0, err); self.assertIn("regret", out); self.assertIn("vs always old", out)
         self.assertEqual(run_cli(["router", "--router", "auto", "--mix", "bad", str(d / "runs.csv")])[0], 2)
-        code, _, err = run_cli(["fit", "--x", "churn", "--router", "auto", "--baseline", "old", "--export", str(d / "m.json"), str(d / "runs.csv")])
+        code, _, err = run_cli(["fit", "--x", "load", "--router", "auto", "--baseline", "old", "--export", str(d / "m.json"), str(d / "runs.csv")])
         self.assertEqual(code, 0, err)
         m = json.loads((d / "m.json").read_text(encoding="utf-8"))
         self.assertNotIn("auto", m["strategies"]); self.assertIn("cheapest switches: old → new", err)
