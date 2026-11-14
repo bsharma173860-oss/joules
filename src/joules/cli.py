@@ -777,18 +777,18 @@ def cmd_explain(a) -> int:
         print(json.dumps(out, indent=2))
     else:
         print(ex.render(out).lstrip("\n"))
-    return 0
+    return 3 if a.strict and any(r["severity"] == "problem" for r in out["reasons"]) else 0
 
 
 def cmd_compare(a) -> int:
     from . import compare as cmp
     cmds = [c for c in a.commands if c.strip()]
     if len(cmds) < 2:
-        print('joules compare: give two or more commands in quotes, e.g. joules compare "./bench --runtime hst" "./bench --runtime baseline"', file=sys.stderr)
+        print('joules compare: give two or more commands in quotes, e.g. joules compare "./bench --runtime new" "./bench --runtime old"', file=sys.stderr)
         return 2
     names = [n.strip() for n in a.names.split(",")] if a.names else None
     if names and (len(names) != len(cmds) or len(set(names)) != len(names) or not all(names)):
-        print(f"joules compare: --names needs {len(cmds)} different names, one per command, e.g. --names hst,baseline", file=sys.stderr)
+        print(f"joules compare: --names needs {len(cmds)} different names, one per command, e.g. --names new,old", file=sys.stderr)
         return 2
     if not names:
         short = [short_cmd(cmp.split_command(c) if not a.shell else [c], 40) for c in cmds]
@@ -897,7 +897,7 @@ def cmd_compare(a) -> int:
               "idle_w": idle or None, "idle_w_end": idle_end or None, "simulated": d.simulated, "host": _host(), "devices": devices,
               "blocks": blocks, "results": results, "notes": notes}
     text = cmp.render(report)
-    if a.explain or a.facts:
+    if a.explain or a.facts or a.strict:
         from . import explain as ex
         try:
             report["explain"] = ex.explain(report, _read_facts(a.facts))
@@ -906,6 +906,7 @@ def cmd_compare(a) -> int:
             return 2
         text += "\n" + ex.render(report["explain"])
     _emit(a, report, text)
+    strict_fail = bool(a.strict and report.get("explain") and any(r["severity"] == "problem" for r in report["explain"]["reasons"]))
     if a.markdown:
         with open(a.markdown, "a", encoding="utf-8") as f:
             f.write(cmp.markdown(report))
@@ -934,7 +935,7 @@ def cmd_compare(a) -> int:
                 at.append(f"{cmp.lock_text(r['locked_mhz'])} locked")
             reports.append((rep_, r["name"] + (f" @ {', '.join(at)}" if at else "")))
         _track_many(a, reports)  # reported, never changes the exit code: the comparison itself succeeded
-    return 0
+    return 3 if strict_fail else 0
 
 
 def _track_many(a, reports: list) -> int:
@@ -1617,8 +1618,8 @@ def build_parser() -> argparse.ArgumentParser:
                                     "limits (--limits, needs sudo). Reports the median energy, time, average power and energy x time of "
                                     "each, what the GPU was doing, the change against the baseline with a Mann-Whitney p-value, and "
                                     "a warning when the GPU did not run under the same conditions for each command.")
-    cp.add_argument("commands", nargs="+", metavar="COMMAND", help='each command in quotes, e.g. "./bench --runtime hst"')
-    cp.add_argument("--names", help="a short name per command, comma-separated (e.g. hst,baseline)")
+    cp.add_argument("commands", nargs="+", metavar="COMMAND", help='each command in quotes, e.g. "./bench --runtime new"')
+    cp.add_argument("--names", help="a short name per command, comma-separated (e.g. new,old)")
     cp.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the first)")
     cp.add_argument("--runs", type=int, default=5, help="measured runs per command (default 5)")
     cp.add_argument("--warmup", type=int, default=1, help="unmeasured rounds first (default 1)")
@@ -1636,6 +1637,7 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--csv", metavar="FILE", help="also write one row per measured run to FILE")
     cp.add_argument("--explain", action="store_true", help="also say why: time or power, idle, fairness, noise, and the workload facts")
     cp.add_argument("--facts", metavar="FILE", help="JSON of what each command was asked to do and really did, checked by --explain")
+    cp.add_argument("--strict", action="store_true", help="with --explain: exit 3 when it finds a problem to fix before quoting the result")
     common(cp)
     sharing_args(cp)
     cp.set_defaults(fn=cmd_compare)
@@ -1649,6 +1651,7 @@ def build_parser() -> argparse.ArgumentParser:
     xp.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the report's, or the first)")
     xp.add_argument("--facts", metavar="FILE", help='JSON: {"arms": {"NAME": {"requested": {...}, "actual": {...}}}}')
     xp.add_argument("--json", action="store_true", help="print the explanation as JSON")
+    xp.add_argument("--strict", action="store_true", help="exit 3 when it finds a problem to fix before quoting the result (for CI)")
     xp.set_defaults(fn=cmd_explain)
 
     px = sub.add_parser("proxy", help="energy receipt on every response of a model server",

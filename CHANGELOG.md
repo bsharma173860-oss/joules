@@ -9,7 +9,9 @@ joules is published on PyPI as [landauer-gap](https://pypi.org/project/landauer-
   changes differ, whether the runs were fair (fixed order, starting temperature, throttling), which arms are too noisy
   to quote, and when there are too few runs for any difference to be real. With `--facts FILE` it also checks that
   each command did the work you asked for (requested vs actual workload numbers you supply). `joules explain` reads a
-  saved compare report or a CSV of runs measured another way.
+  saved compare report or a CSV of runs measured another way. `--strict` exits 3 when there is a problem to fix before
+  quoting the result. Every power limit of a `--limits` run is explained.
+- The `compare` help and error examples now use `new`/`old` as names.
 
 ## 0.8.2 (3 November 2026)
 

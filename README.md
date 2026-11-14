@@ -122,7 +122,8 @@ full method is in [docs/BENCHMARKING.md](https://github.com/bsharma173860-oss/d3
 ```bash
 joules compare --explain --facts facts.json --names new,old "./bench --runtime new" "./bench --runtime old"
 joules explain results.json                # a saved compare report (--out results.json)
-joules explain runs.csv --baseline old     # runs measured another way: name,energy_j,duration_s[,round,position,...]
+joules explain runs.csv --baseline old     # runs measured another way: name (or arm),energy_j,duration_s[,round,position,...]
+joules explain results.json --strict       # exit 3 if there is a problem to fix first (for CI)
 ```
 
 Adds a short "Why" after the numbers, problems first:

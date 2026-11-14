@@ -3780,3 +3780,53 @@ class Explain(unittest.TestCase):
         d = Path(tempfile.mkdtemp()); (d / "f.json").write_text("{}", encoding="utf-8")
         self.assertEqual(run_cli(["compare", "--facts", str(d / "f.json"), "--no-track", "a", "b"],
                                  {"JOULES_SIMULATE": "gpu:X:100"})[0], 2)  # a bad facts file fails before any run
+
+    # ---- review fixes
+
+    def test_split_matches_the_headline_even_when_power_varies(self):
+        # per-run power varies, so median(t) x median(P) != median(E); the split must still equal the quoted change
+        ex_ = self.explain({"old": [(10.0, 1.0), (12.0, 1.1), (11.0, 1.05), (9.0, 0.95), (10.5, 1.0)],
+                            "new": [(6.0, 0.7), (7.5, 0.8), (6.2, 0.9), (6.9, 0.75), (6.4, 0.72)]}, "old")
+        r = next(r for r in ex_["reasons"] if r["title"].startswith("new used"))
+        self.assertAlmostEqual(r["numbers"]["energy_pct"], (6.4 - 10.5) / 10.5 * 100, places=6)
+        self.assertAlmostEqual(r["numbers"]["time_j"] + r["numbers"]["power_j"], 6.4 - 10.5, places=6)  # symmetric split, no leftover
+        self.assertIn(f"{abs(r['numbers']['energy_pct']):.0f}% less", ex_["summary"])
+
+    def test_good_news_notes_are_not_problems_and_every_power_limit_is_explained(self):
+        from joules import explain as ex
+        runs = []
+        for lim, (eo, en) in ((100, (10.0, 6.0)), (70, (8.0, 7.0))):
+            for k in range(5):
+                for pos, (n, e) in enumerate((("old", eo), ("new", en)) if k % 2 == 0 else (("new", en), ("old", eo))):
+                    runs.append({"name": n, "energy_j": e, "duration_s": 1.0, "avg_w": e, "round": k + 1, "position": pos + 1, "limit_pct": lim})
+        rep = ex.from_runs(runs, "old")
+        rep["blocks"][0]["notes"] = ["Clocks held at 1590 MHz under every command (the GPU never dropped below the lock), so the difference is the work."]
+        out = ex.explain(rep)
+        self.assertEqual([r for r in out["reasons"] if r["severity"] == "problem"], [])
+        self.assertTrue(any(r["title"].startswith("at 70% power: new used") for r in out["reasons"]))
+        self.assertTrue(any(r["title"].startswith("at 100% power: new used") for r in out["reasons"]))
+
+    def test_facts_for_an_unknown_arm_or_a_missing_actual(self):
+        with self.assertRaises(ValueError):
+            self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", {"arms": {"nwe": {"requested": {"x": 1}, "actual": {"x": 1}}}})
+        ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", {"arms": {"new": {"requested": {"x": 1}, "actual": {}}}})
+        self.assertIn("x: asked for 1, but the facts give no actual value", ex_["reasons"][0]["detail"])
+
+    def test_power_only_meters_and_unknown_order_are_said(self):
+        from joules import explain as ex
+        rep = {"kind": "compare", "names": ["old", "new"], "baseline": "old", "blocks": None,
+               "results": [{"name": n, "energy_j": e, "duration_s": 1.0, "avg_w": e, "round": k, "position": 1 if n == "old" else 2}
+                           for k in (1, 2, 3, 4, 5) for n, e in (("old", 10.0), ("new", 6.0))]}
+        from joules.compare import summarize
+        rep["blocks"] = summarize(rep["results"], rep["names"], "old")
+        self.assertIn("power only", [r["title"] for r in ex.explain(rep)["reasons"]])
+        rows = [{"name": n, "energy_j": e, "duration_s": 1.0} for n, e in (("old", 10.0), ("new", 6.0))] * 5
+        self.assertIn("run order unknown", [r["title"] for r in ex.explain(ex.from_runs([dict(r) for r in rows], "old"))["reasons"]])
+
+    def test_strict_and_the_arm_column(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["arm,energy_j,duration_s,round,position"] + [f"{n},{e},1,{k},{p}" for k in (1, 2, 3) for n, e, p in (("old", 10, 1), ("new", 5, 2))]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        code, out, err = run_cli(["explain", str(d / "runs.csv")])
+        self.assertEqual(code, 0, err); self.assertIn("new used 50% less energy than old.", out)
+        self.assertEqual(run_cli(["explain", "--strict", str(d / "runs.csv")])[0], 3)  # 3 runs and a fixed order: problems

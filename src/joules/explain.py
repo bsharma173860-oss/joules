@@ -48,6 +48,8 @@ def read_csv(path: str) -> list[dict]:
     with open(path, newline="", encoding="utf-8") as f:
         for i, row in enumerate(csv.DictReader(f), start=2):
             row = {k.strip(): (v or "").strip() for k, v in row.items() if k}
+            if not row.get("name") and row.get("arm"):
+                row["name"] = row["arm"]
             if not row.get("name") or not row.get("energy_j") or not row.get("duration_s"):
                 raise ValueError(f"{path} line {i}: every row needs name, energy_j and duration_s")
             r = {"name": row["name"]}
@@ -75,6 +77,9 @@ def from_runs(runs: list[dict], baseline: str | None = None) -> dict:
     baseline = baseline or names[0]
     if baseline not in names:
         raise ValueError(f"--baseline must be one of {', '.join(names)}")
+    for r in runs:
+        if "avg_w" not in r:
+            r["avg_w"] = r["energy_j"] / r["duration_s"] if r.get("duration_s") else 0.0
     if not any("above_idle_j" in r for r in runs) or not all("above_idle_j" in r for r in runs):
         for r in runs:
             r.pop("above_idle_j", None)
@@ -104,17 +109,21 @@ def _fixed_order(runs: list[dict], names: list[str]) -> bool:
 
 
 def _split(row: dict, base: dict) -> dict | None:
-    """Energy = average power x time. How much of the change came from each."""
+    """Energy = average power x time. How much of the change came from each. Power here is median energy over
+    median time, so the split adds up to exactly the energy change quoted in the headline."""
     t0, t1 = base["duration_s"]["median"], row["duration_s"]["median"]
-    p0, p1 = base["avg_w"]["median"], row["avg_w"]["median"]
-    if min(t0, t1, p0, p1) <= 0:
+    e0, e1 = base["energy_j"]["median"], row["energy_j"]["median"]
+    if min(t0, t1, e0, e1) <= 0:
         return None
-    tr, pr = t1 / t0, p1 / p0
-    er = tr * pr
+    tr, er = t1 / t0, e1 / e0
+    pr = er / tr
     if abs(math.log(er)) < 1e-9:
         return None
     share_t = math.log(tr) / math.log(er)
-    return {"time_pct": (tr - 1) * 100, "power_pct": (pr - 1) * 100, "energy_pct": (er - 1) * 100, "time_share": share_t}
+    p0, p1 = e0 / t0, e1 / t1   # the joules each part accounts for, split symmetrically (no leftover term)
+    time_j, power_j = (t1 - t0) * (p0 + p1) / 2, (p1 - p0) * (t0 + t1) / 2
+    return {"time_pct": (tr - 1) * 100, "power_pct": (pr - 1) * 100, "energy_pct": (er - 1) * 100, "time_share": share_t,
+            "time_j": time_j, "power_j": power_j}
 
 
 def _fact_mismatches(facts: dict, name: str) -> list[str]:
@@ -123,6 +132,7 @@ def _fact_mismatches(facts: dict, name: str) -> list[str]:
     out = []
     for k, want in req.items():
         if k not in act:
+            out.append(f"{k}: asked for {want}, but the facts give no actual value")
             continue
         got = act[k]
         try:
@@ -141,14 +151,46 @@ def _fact_mismatches(facts: dict, name: str) -> list[str]:
 
 def explain(report: dict, facts: dict | None = None) -> dict:
     """The reasons behind a comparison, most important first: problems to fix before quoting a number, then notes."""
-    names, baseline, runs = report["names"], report["baseline"], report["results"]
-    block = report["blocks"][0]
+    names, baseline, all_runs = report["names"], report["baseline"], report["results"]
+    reasons: list[dict] = []
+    if facts:
+        unknown = sorted(set(facts.get("arms") or {}) - set(names))
+        if unknown:
+            raise ValueError(f"--facts names {', '.join(unknown)}, which {'is' if len(unknown) == 1 else 'are'} not in this comparison "
+                             f"({', '.join(names)})")
+    multi = len(report["blocks"]) > 1
+    for block in report["blocks"]:
+        prefix = f"at {block['limit_pct']}% power: " if multi and block.get("limit_pct") is not None else ""
+        runs = [r for r in all_runs if r.get("limit_pct") == block.get("limit_pct")]
+        _explain_block(block, runs, names, baseline, facts if block is report["blocks"][0] else None, prefix, reasons)
+
+    if report.get("imported"):
+        reasons.append({"severity": "note", "title": "imported runs", "numbers": {},
+                        "detail": "these runs were measured outside joules compare; joules can only check what the CSV says."})
+        if any(r.get("position") is None for r in all_runs):
+            reasons.append({"severity": "note", "title": "run order unknown", "numbers": {},
+                            "detail": "the CSV has no round and position columns, so joules cannot check whether the order was fair."})
+    if not any(r.get("gpu") for r in all_runs) and not report.get("imported"):
+        reasons.append({"severity": "note", "title": "power only", "numbers": {},
+                        "detail": "this meter reports power only, not the GPU's clocks, temperature or throttling, so heat and "
+                                  "throttling could not be checked. Rest or cool between runs to be safe (--rest, --cool-to)."})
+
+    problems = [r for r in reasons if r["severity"] == "problem"]
+    reasons = problems + [r for r in reasons if r["severity"] != "problem"]
+    first = report["blocks"][0]
+    return {"baseline": baseline, "summary": _summary({r["name"]: r for r in first["rows"]}, baseline, problems), "reasons": reasons}
+
+
+GOOD_NEWS = ("Clocks held at", "alike for every command")  # compare notes that report fairness, not a problem
+
+
+def _explain_block(block: dict, runs: list[dict], names: list[str], baseline: str, facts: dict | None, prefix: str,
+                   reasons: list[dict]) -> None:
     rows = {r["name"]: r for r in block["rows"]}
     base = rows.get(baseline)
-    reasons: list[dict] = []
 
     def add(severity: str, title: str, detail: str, **numbers):
-        reasons.append({"severity": severity, "title": title, "detail": detail, "numbers": numbers})
+        reasons.append({"severity": severity, "title": prefix + title, "detail": detail, "numbers": numbers})
 
     # 1. was the work the work you asked for?
     if facts:
@@ -178,7 +220,10 @@ def explain(report: dict, facts: dict | None = None) -> dict:
     for note in block.get("notes") or []:
         if "p cannot go below" in note:  # said once below, with what to do
             continue
-        add("problem", "the commands did not run under the same conditions", note)
+        if any(g in note for g in GOOD_NEWS):
+            add("note", "conditions", note)
+        else:
+            add("problem", "the commands did not run under the same conditions", note)
 
     # 4. per arm against the baseline: is it real, where did it come from, what does idle do to it
     others = sorted((r for n, r in rows.items() if r.get("vs") and base is not None), key=lambda r: r["vs"]["energy_pct"])
@@ -240,13 +285,6 @@ def explain(report: dict, facts: dict | None = None) -> dict:
                 f"memory busy {g['mem_util_pct']:.0f}% of the time vs {gb['mem_util_pct']:.0f}% for {baseline}. When the work is limited "
                 "by memory traffic, moving less data is where the saving comes from, so expect it to shrink as the share of data "
                 "that must move grows.", arm=row["name"])
-
-    if report.get("imported"):
-        add("note", "imported runs", "these runs were measured outside joules compare; joules can only check what the CSV says.")
-
-    problems = [r for r in reasons if r["severity"] == "problem"]
-    reasons = problems + [r for r in reasons if r["severity"] != "problem"]
-    return {"baseline": baseline, "summary": _summary(rows, baseline, problems), "reasons": reasons}
 
 
 def _summary(rows: dict, baseline: str, problems: list) -> str:
