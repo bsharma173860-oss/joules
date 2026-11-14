@@ -770,7 +770,7 @@ def cmd_explain(a) -> int:
     from . import explain as ex
     try:
         report = ex.load(a.file, a.baseline)
-        out = ex.explain(report, _read_facts(a.facts))
+        out = ex.explain(report, _read_facts(a.facts), ex.load_checks(a.checks))
     except (OSError, ValueError, KeyError) as e:
         print(warn(f"joules explain: {e}"), file=sys.stderr)
         return 2
@@ -835,7 +835,9 @@ def cmd_compare(a) -> int:
             print("joules compare: --lock-clocks takes an SM clock in MHz, e.g. 1590, or base (the card's base clock)", file=sys.stderr)
             return 2
     try:
-        _read_facts(a.facts)  # a broken facts file fails now, not after every run
+        _read_facts(a.facts)  # a broken facts or checks file fails now, not after every run
+        from . import explain as _ex
+        _ex.load_checks(a.checks)
     except ValueError as e:
         print(f"joules compare: {e}", file=sys.stderr)
         return 2
@@ -917,10 +919,10 @@ def cmd_compare(a) -> int:
               "idle_w": idle or None, "idle_w_end": idle_end or None, "simulated": d.simulated, "host": _host(), "devices": devices,
               "blocks": blocks, "results": results, "notes": notes}
     text = cmp.render(report)
-    if a.explain or a.facts or a.strict:
+    if a.explain or a.facts or a.strict or a.checks:
         from . import explain as ex
         try:
-            report["explain"] = ex.explain(report, _read_facts(a.facts))
+            report["explain"] = ex.explain(report, _read_facts(a.facts), ex.load_checks(a.checks))
         except ValueError as e:
             print(warn(f"joules compare: {e}"), file=sys.stderr)
             return 2
@@ -1658,6 +1660,7 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--explain", action="store_true", help="also say why: time or power, idle, fairness, noise, and the workload facts")
     cp.add_argument("--facts", metavar="FILE", help="JSON of what each command was asked to do and really did, checked by --explain")
     cp.add_argument("--strict", action="store_true", help="with --explain: exit 3 when it finds a problem to fix before quoting the result")
+    cp.add_argument("--checks", action="append", metavar="FILE.py", help="with --explain: your own checks, a Python file defining check(report, facts) (repeatable; runs your code)")
     common(cp)
     sharing_args(cp)
     cp.set_defaults(fn=cmd_compare)
@@ -1672,6 +1675,7 @@ def build_parser() -> argparse.ArgumentParser:
     xp.add_argument("--facts", metavar="FILE", help='JSON: {"arms": {"NAME": {"requested": {...}, "actual": {...}}}}')
     xp.add_argument("--json", action="store_true", help="print the explanation as JSON")
     xp.add_argument("--strict", action="store_true", help="exit 3 when it finds a problem to fix before quoting the result (for CI)")
+    xp.add_argument("--checks", action="append", metavar="FILE.py", help="your own checks: a Python file defining check(report, facts) (repeatable; runs your code)")
     xp.set_defaults(fn=cmd_explain)
 
     ft = sub.add_parser("fit", help="where one way starts to beat another, as the workload changes",

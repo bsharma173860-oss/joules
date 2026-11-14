@@ -139,6 +139,11 @@ Adds a short "Why" after the numbers, problems first:
                   "hint": "the change window was full, so nothing moved"}}}
 ```
 
+Your own checks: `--checks my_checks.py` loads a Python file that defines `check(report, facts)` and returns a list of
+`{"severity": "problem" | "note", "title": ..., "detail": ...}`. They are shown first. Use them for knowledge only your
+harness has (its parameters, windows, counters), so it stays in your code, not in joules. The file runs on your
+machine like any script, so only load files you trust.
+
 ### Where one way starts to win: `joules fit`
 
 Measure the comparison at two or more workload sizes (e.g. 1%, 10%, 25% and 50% of the data changing), then:

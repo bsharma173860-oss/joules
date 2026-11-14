@@ -149,7 +149,29 @@ def _fact_mismatches(facts: dict, name: str) -> list[str]:
     return out
 
 
-def explain(report: dict, facts: dict | None = None) -> dict:
+def load_checks(paths: list[str] | None) -> list:
+    """Your own checks: Python files that define check(report, facts) and return a list of
+    {"severity": "problem" | "note", "title": ..., "detail": ...}. They run on your machine, like any script you run,
+    so only load files you trust. This is how workload knowledge that joules can't know (your harness, your
+    parameters) becomes part of the explanation, without putting it in joules."""
+    import importlib.util
+    out = []
+    for path in paths or []:
+        spec = importlib.util.spec_from_file_location(f"joules_checks_{len(out)}", path)
+        if spec is None or spec.loader is None:
+            raise ValueError(f"--checks {path}: not a Python file")
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except OSError as e:
+            raise ValueError(f"--checks {path}: {e}")
+        if not callable(getattr(mod, "check", None)):
+            raise ValueError(f"--checks {path} must define check(report, facts)")
+        out.append((path, mod.check))
+    return out
+
+
+def explain(report: dict, facts: dict | None = None, checks: list | None = None) -> dict:
     """The reasons behind a comparison, most important first: problems to fix before quoting a number, then notes."""
     names, baseline, all_runs = report["names"], report["baseline"], report["results"]
     reasons: list[dict] = []
@@ -163,6 +185,18 @@ def explain(report: dict, facts: dict | None = None) -> dict:
         prefix = f"at {block['limit_pct']}% power: " if multi and block.get("limit_pct") is not None else ""
         runs = [r for r in all_runs if r.get("limit_pct") == block.get("limit_pct")]
         _explain_block(block, runs, names, baseline, facts if block is report["blocks"][0] else None, prefix, reasons)
+
+    from_checks: list[dict] = []
+    for path, fn in checks or []:
+        try:
+            got = fn(report, facts or {}) or []
+        except Exception as e:  # a broken check must not hide the rest of the explanation
+            got = [{"severity": "note", "title": f"check {path} failed", "detail": f"{type(e).__name__}: {e}"}]
+        for r in got:
+            sev = r.get("severity") if r.get("severity") in ("problem", "note") else "note"
+            from_checks.append({"severity": sev, "title": str(r.get("title", "check")), "detail": str(r.get("detail", "")),
+                                "numbers": r.get("numbers") or {}, "source": path})
+    reasons[:0] = from_checks  # your own workload checks come first: a wrong workload makes every other number moot
 
     if report.get("imported"):
         reasons.append({"severity": "note", "title": "imported runs", "numbers": {},

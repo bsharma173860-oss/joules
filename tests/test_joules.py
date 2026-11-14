@@ -3890,3 +3890,30 @@ class Fit(unittest.TestCase):
         self.assertEqual(f["baseline"], "old"); self.assertAlmostEqual(f["crossovers"]["energy_j"]["new"]["x"], 10.0, places=6)
         self.assertEqual(run_cli(["fit", "--x", "churn", "--at", "abc", str(d / "runs.csv")])[0], 2)
         self.assertEqual(run_cli(["fit", "--x", "nope", str(d / "runs.csv")])[0], 2)
+
+
+class ExplainChecks(unittest.TestCase):
+    """joules explain --checks: the user's own workload checks."""
+
+    def test_checks_run_first_and_a_broken_check_is_reported(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "c.py").write_text(textwrap.dedent('''
+            def check(report, facts):
+                if facts.get("all", {}).get("window") == facts.get("all", {}).get("changed"):
+                    return [{"severity": "problem", "title": "no room to move", "detail": "window = changed set"}]
+                return []
+        '''), encoding="utf-8")
+        (d / "bad.py").write_text("def check(report, facts):\n    raise RuntimeError('boom')\n", encoding="utf-8")
+        (d / "nocheck.py").write_text("x = 1\n", encoding="utf-8")
+        rows = ["name,energy_j,duration_s,round,position"] + [f"{n},{e},1,{k},{p}" for k in (1, 2, 3, 4, 5)
+                                                             for n, e, p in ((("old", 10, 1), ("new", 5, 2)) if k % 2 else (("new", 5, 1), ("old", 10, 2)))]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        (d / "f.json").write_text(json.dumps({"all": {"window": 4000, "changed": 4000}}), encoding="utf-8")
+        code, out, err = run_cli(["explain", str(d / "runs.csv"), "--baseline", "old", "--facts", str(d / "f.json"),
+                                  "--checks", str(d / "c.py"), "--checks", str(d / "bad.py"), "--json"])
+        self.assertEqual(code, 0, err)
+        r = json.loads(out)["reasons"]
+        self.assertEqual((r[0]["title"], r[0]["severity"]), ("no room to move", "problem"))
+        self.assertTrue(any(x["title"].startswith("check ") and "boom" in x["detail"] for x in r))
+        self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "nocheck.py")])[0], 2)
+        self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "missing.py")])[0], 2)
