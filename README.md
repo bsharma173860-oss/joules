@@ -139,6 +139,22 @@ Adds a short "Why" after the numbers, problems first:
                   "hint": "the change window was full, so nothing moved"}}}
 ```
 
+### Where one way starts to win: `joules fit`
+
+Measure the comparison at two or more workload sizes (e.g. 1%, 10%, 25% and 50% of the data changing), then:
+
+```bash
+joules fit --x churn_pct --at 5 1=churn1.json 10=churn10.json 25=churn25.json 50=churn50.json
+```
+
+joules fits energy = fixed + per-unit × workload for each command over every run, and prints:
+- each command's **fixed cost** and **cost per unit**;
+- the **break-even**: where one starts to beat the other, and why (it costs more up front but less per unit);
+- the expected energy **at your workload** (`--at`), marked measured, inside the measured range, or extrapolated.
+
+It warns when only two sizes were measured, when the break-even lies outside the measured range, and when the energy
+doesn't follow a straight line (R² < 0.9). It takes compare reports (`VALUE=report.json`) or CSVs with a workload column.
+
 ## Phases of your own program
 
 Inside a Python program:

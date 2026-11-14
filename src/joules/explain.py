@@ -313,3 +313,159 @@ def render(ex: dict) -> str:
         lines.append(f"{i}. {mark} {r['title']}")
         lines.append(f"   {r['detail']}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- fit: where does one way start to win?
+
+def _ols(xs: list[float], ys: list[float]) -> tuple[float, float, float | None]:
+    """Least squares y = a + b x. Returns a, b and R² (None when the line goes exactly through every point)."""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    a = my - b * mx
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    ss_res = sum((y - a - b * x) ** 2 for x, y in zip(xs, ys))
+    return a, b, (1 - ss_res / ss_tot) if ss_tot > 0 and len(set(xs)) > 2 else None
+
+
+def load_points(files: list[str], x_name: str) -> list[dict]:
+    """Runs with a workload value x: from VALUE=report.json (a whole compare at one workload) or CSVs with an x column."""
+    runs = []
+    for f in files:
+        if "=" in f and f.split("=", 1)[1].lower().endswith(".json"):
+            v, path = f.split("=", 1)
+            try:
+                x = float(v)
+            except ValueError:
+                raise ValueError(f"{f}: write the workload value before '=', e.g. 25={path}")
+            rep = load(path)
+            for r in rep["results"]:
+                runs.append({**r, "x": x, "_baseline": rep["baseline"]})
+        elif f.lower().endswith(".csv"):
+            with open(f, newline="", encoding="utf-8") as fh:
+                head = next(csv.reader(fh), [])
+            if x_name not in [h.strip() for h in head]:
+                raise ValueError(f"{f} has no {x_name} column")
+            with open(f, newline="", encoding="utf-8") as fh:
+                xs = [float(row[x_name]) for row in csv.DictReader(fh)]
+            for r, x in zip(read_csv(f), xs):
+                runs.append({**r, "x": x})
+        else:
+            raise ValueError(f"{f}: give VALUE=report.json (a joules compare report) or a .csv with a {x_name} column")
+    if not runs:
+        raise ValueError("no runs to fit")
+    return runs
+
+
+def fit(runs: list[dict], x_name: str, baseline: str | None = None, at: list[float] | None = None) -> dict:
+    """Fit energy = fixed + per_unit * x for each command over every run, and find where each one starts to beat
+    the baseline. Uses energy above idle as well when every run has it."""
+    names = list(dict.fromkeys(r["name"] for r in runs))
+    if len(names) < 2:
+        raise ValueError("fit needs runs of at least two commands")
+    baseline = baseline or next((r["_baseline"] for r in runs if r.get("_baseline")), None) or names[-1]
+    if baseline not in names:
+        raise ValueError(f"--baseline must be one of {', '.join(names)}")
+    xs_all = sorted({r["x"] for r in runs})
+    if len(xs_all) < 2:
+        raise ValueError(f"fit needs runs at two or more values of {x_name} (got only {xs_all[0]:g})")
+    bases = ["energy_j"] + (["above_idle_j"] if all("above_idle_j" in r for r in runs) else [])
+    out = {"x": x_name, "baseline": baseline, "measured": xs_all, "fits": {}, "crossovers": {}, "at": [], "notes": []}
+    for basis in bases:
+        lines = {}
+        for n in names:
+            rs = [r for r in runs if r["name"] == n]
+            xs = [r["x"] for r in rs]
+            if len(set(xs)) < 2:
+                raise ValueError(f"{n} was measured at only one value of {x_name}")
+            a, b, r2 = _ols(xs, [r[basis] for r in rs])
+            meds = {}
+            for x in sorted(set(xs)):
+                v = sorted(r[basis] for r in rs if r["x"] == x)
+                meds[x] = v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
+            lines[n] = {"fixed_j": a, "per_unit_j": b, "r2": r2, "runs": len(rs), "medians": meds}
+        out["fits"][basis] = lines
+        cb = lines[baseline]
+        out["crossovers"][basis] = {}
+        for n, ln in lines.items():
+            if n == baseline:
+                continue
+            db = cb["per_unit_j"] - ln["per_unit_j"]
+            da = ln["fixed_j"] - cb["fixed_j"]
+            if abs(db) < 1e-12:
+                c = {"x": None, "why": "same cost per unit: one is always cheaper by its fixed cost"}
+            else:
+                xc = da / db
+                wins_above = db > 0
+                c = {"x": xc, "wins": "above" if wins_above else "below", "extra_fixed_j": da, "saved_per_unit_j": db,
+                     "inside": xs_all[0] <= xc <= xs_all[-1]}
+            out["crossovers"][basis][n] = c
+    for x in (at or []):
+        row = {"x": x, "measured": x in xs_all, "inside": xs_all[0] <= x <= xs_all[-1], "energy_j": {}}
+        for n, ln in out["fits"]["energy_j"].items():
+            row["energy_j"][n] = ln["fixed_j"] + ln["per_unit_j"] * x
+        out["at"].append(row)
+    if len(xs_all) == 2:
+        out["notes"].append(f"Only two values of {x_name} were measured, so each line goes exactly through them and "
+                            "there is no check that the cost really grows in a straight line. Measure a third value, "
+                            "ideally near the break-even, before quoting it.")
+    for basis, cs in out["crossovers"].items():
+        for n, c in cs.items():
+            if c.get("x") is not None and not c["inside"]:
+                out["notes"].append(f"The break-even for {n} ({x_name} ≈ {c['x']:.3g}{' above idle' if basis != 'energy_j' else ''}) "
+                                    f"is outside the measured range ({xs_all[0]:g}–{xs_all[-1]:g}): it is extrapolated. "
+                                    f"Measure near it to confirm.")
+    for basis, lines in out["fits"].items():
+        for n, ln in lines.items():
+            if ln["r2"] is not None and ln["r2"] < 0.9:
+                out["notes"].append(f"{n}'s energy does not follow a straight line in {x_name} well (R² = {ln['r2']:.2f}); "
+                                    "treat the break-even as rough.")
+    return out
+
+
+def _j(v: float) -> str:
+    return f"{v:,.0f} J" if abs(v) >= 100 else f"{v:.3g} J"
+
+
+def render_fit(f: dict) -> str:
+    x = f["x"]
+    meas = ", ".join(f"{v:g}" for v in f["measured"])
+    L = ["", f"Energy model:  energy = fixed + per-unit × {x}      (fitted on every run; measured at {x} = {meas})", ""]
+    for basis, lines in f["fits"].items():
+        title = "Total GPU energy" if basis == "energy_j" else "Energy above idle"
+        L.append(f"  {title}")
+        w = max(len(n) for n in lines)
+        L.append(f"    {'':<{w}}   {'fixed':>10}   {'per 1 ' + x:>16}   fit")
+        for n, ln in lines.items():
+            fit_txt = "exact (2 points)" if ln["r2"] is None else f"R² {ln['r2']:.3f}"
+            L.append(f"    {n:<{w}}   {_j(ln['fixed_j']):>10}   {_j(ln['per_unit_j']):>16}   {fit_txt}")
+        L.append("")
+    b = f["baseline"]
+    for basis, cs in f["crossovers"].items():
+        lab = "" if basis == "energy_j" else " (above idle)"
+        for n, c in cs.items():
+            if c.get("x") is None:
+                L.append(f"Break-even{lab}: none. {c['why']}.")
+                continue
+            side = "above" if c["wins"] == "above" else "below"
+            L.append(f"Break-even{lab}: {n} beats {b} {side} {x} ≈ {c['x']:.3g}")
+            if c["wins"] == "above":
+                L.append(f"  why: {n} costs {_j(c['extra_fixed_j'])} more up front (fixed), but saves {_j(c['saved_per_unit_j'])} "
+                         f"for every 1 {x}, so it pays back after {c['x']:.3g}.")
+            else:
+                L.append(f"  why: {n} costs {_j(-c['extra_fixed_j'])} less up front, but {_j(-c['saved_per_unit_j'])} more per 1 {x}, "
+                         f"so it loses past {c['x']:.3g}.")
+        L.append("")
+    if f["at"]:
+        L.append(f"At your workload:")
+        for row in f["at"]:
+            e = row["energy_j"]
+            base = e[b]
+            tag = "measured" if row["measured"] else "inside the measured range" if row["inside"] else "extrapolated"
+            parts = ", ".join(f"{n} {_j(v)} ({(v - base) / base * 100:+.0f}%)" for n, v in e.items() if n != b)
+            L.append(f"  {x} = {row['x']:g}:  {b} {_j(base)};  {parts}   [{tag}]")
+        L.append("")
+    for i, n in enumerate(f["notes"], 1):
+        L.append(f"! {n}")
+    return "\n".join(L).rstrip()

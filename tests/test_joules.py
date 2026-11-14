@@ -3830,3 +3830,63 @@ class Explain(unittest.TestCase):
         code, out, err = run_cli(["explain", str(d / "runs.csv")])
         self.assertEqual(code, 0, err); self.assertIn("new used 50% less energy than old.", out)
         self.assertEqual(run_cli(["explain", "--strict", str(d / "runs.csv")])[0], 3)  # 3 runs and a fixed order: problems
+
+
+class Fit(unittest.TestCase):
+    """joules fit: energy = fixed + per-unit x workload, the break-even and predictions."""
+
+    @staticmethod
+    def runs(levels, noise=0.0):
+        # new: 100 J fixed + 2 J per unit; old: 20 J fixed + 10 J per unit -> break-even at x = 10
+        out = []
+        for x in levels:
+            for k in range(5):
+                d = noise * (k - 2)
+                out.append({"name": "new", "x": x, "energy_j": 100 + 2 * x + d, "duration_s": 1.0, "avg_w": 1.0})
+                out.append({"name": "old", "x": x, "energy_j": 20 + 10 * x - d, "duration_s": 1.0, "avg_w": 1.0})
+        return out
+
+    def test_break_even_and_why(self):
+        from joules import explain as ex
+        f = ex.fit(self.runs([5, 15, 30], noise=0.5), "churn", "old", [4, 30])
+        c = f["crossovers"]["energy_j"]["new"]
+        self.assertAlmostEqual(c["x"], 10.0, places=6); self.assertEqual(c["wins"], "above"); self.assertTrue(c["inside"])
+        self.assertAlmostEqual(c["extra_fixed_j"], 80); self.assertAlmostEqual(c["saved_per_unit_j"], 8)
+        self.assertGreater(f["fits"]["energy_j"]["new"]["r2"], 0.99)
+        self.assertEqual(f["notes"], [])  # three levels, a straight line, break-even inside the range
+        at4 = f["at"][0]["energy_j"]; self.assertAlmostEqual(at4["new"], 108); self.assertAlmostEqual(at4["old"], 60)
+        text = ex.render_fit(f)
+        self.assertIn("new beats old above churn ≈ 10", text); self.assertIn("costs 80 J more up front", text)
+        self.assertIn("churn = 4:  old 60 J;  new 108 J (+80%)   [extrapolated]", text)  # 4 is below the measured 5
+
+    def test_two_levels_and_extrapolation_are_flagged(self):
+        from joules import explain as ex
+        f = ex.fit(self.runs([20, 40]), "churn", "old")
+        self.assertIsNone(f["fits"]["energy_j"]["new"]["r2"])
+        self.assertTrue(any("Only two values" in n for n in f["notes"]))
+        self.assertTrue(any("outside the measured range" in n for n in f["notes"]))
+
+    def test_errors(self):
+        from joules import explain as ex
+        with self.assertRaises(ValueError):
+            ex.fit(self.runs([20]), "churn", "old")
+        with self.assertRaises(ValueError):
+            ex.fit(self.runs([20, 40]), "churn", "zzz")
+        with self.assertRaises(ValueError):
+            ex.load_points(["x.txt"], "churn")
+
+    def test_cli_with_csv_and_reports(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["name,energy_j,duration_s,churn"] + [f"{r['name']},{r['energy_j']},1,{r['x']}" for r in self.runs([5, 15, 30])]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        code, out, err = run_cli(["fit", "--x", "churn", "--baseline", "old", "--at", "8", str(d / "runs.csv")])
+        self.assertEqual(code, 0, err); self.assertIn("new beats old above churn ≈ 10", out)
+        from joules import explain as ex
+        for x in (10, 40):  # whole compare reports, one per workload value
+            rep = ex.from_runs([dict(r) for r in self.runs([x]) if True], "old")
+            (d / f"r{x}.json").write_text(json.dumps(rep), encoding="utf-8")
+        code, out, err = run_cli(["fit", "--x", "churn", "--json", f"10={d / 'r10.json'}", f"40={d / 'r40.json'}"])
+        self.assertEqual(code, 0, err); f = json.loads(out)
+        self.assertEqual(f["baseline"], "old"); self.assertAlmostEqual(f["crossovers"]["energy_j"]["new"]["x"], 10.0, places=6)
+        self.assertEqual(run_cli(["fit", "--x", "churn", "--at", "abc", str(d / "runs.csv")])[0], 2)
+        self.assertEqual(run_cli(["fit", "--x", "nope", str(d / "runs.csv")])[0], 2)

@@ -9,6 +9,7 @@
   joules ci --budget 10 -- pytest -q       energy check for a pull request (vs the base branch)
   joules compare "./bench --new" "./bench --old"   the same work two ways: interleaved runs, medians, p-values
   joules explain compare.json --facts facts.json  why: time or power, idle, fairness, noise, the workload
+  joules fit --x churn_pct 25=a.json 50=b.json     the break-even: where one way starts to win, and why
   joules proxy --upstream http://localhost:11434   energy receipt on every AI response
   joules agent --track cluster             energy per job on a GPU server or cluster node (Slurm, Kubernetes)
   joules connect                           put this machine on Live, Tracking and the GPU leaderboard, under one name
@@ -778,6 +779,25 @@ def cmd_explain(a) -> int:
     else:
         print(ex.render(out).lstrip("\n"))
     return 3 if a.strict and any(r["severity"] == "problem" for r in out["reasons"]) else 0
+
+
+def cmd_fit(a) -> int:
+    from . import explain as ex
+    try:
+        at = [float(v) for v in a.at.split(",") if v.strip()] if a.at else []
+    except ValueError:
+        print("joules fit: --at takes numbers, e.g. --at 5,10", file=sys.stderr)
+        return 2
+    try:
+        out = ex.fit(ex.load_points(a.files, a.x), a.x, a.baseline, at)
+    except (OSError, ValueError, KeyError) as e:
+        print(warn(f"joules fit: {e}"), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        print(ex.render_fit(out).lstrip("\n"))
+    return 0
 
 
 def cmd_compare(a) -> int:
@@ -1653,6 +1673,19 @@ def build_parser() -> argparse.ArgumentParser:
     xp.add_argument("--json", action="store_true", help="print the explanation as JSON")
     xp.add_argument("--strict", action="store_true", help="exit 3 when it finds a problem to fix before quoting the result (for CI)")
     xp.set_defaults(fn=cmd_explain)
+
+    ft = sub.add_parser("fit", help="where one way starts to beat another, as the workload changes",
+                        description="Fit energy = fixed + per-unit x workload for each command, from comparisons measured at "
+                                    "two or more workload sizes, and say where each one starts to beat the baseline (the "
+                                    "break-even), why (fixed cost against cost per unit), and what to expect at your workload. "
+                                    "Give each joules compare report with its workload value (25=run25.json), or CSVs of runs "
+                                    "with a column for the workload.")
+    ft.add_argument("files", nargs="+", metavar="FILE", help="VALUE=report.json (e.g. 25=churn25.json) or runs.csv")
+    ft.add_argument("--x", required=True, metavar="NAME", help="what the workload value is, e.g. churn_pct (the CSV column name)")
+    ft.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the report's baseline, else the last)")
+    ft.add_argument("--at", metavar="VALUES", help="also predict the energy at these workload values, e.g. 5,10")
+    ft.add_argument("--json", action="store_true", help="print the fit as JSON")
+    ft.set_defaults(fn=cmd_fit)
 
     px = sub.add_parser("proxy", help="energy receipt on every response of a model server",
                         description="Put this in front of Ollama, vLLM, llama.cpp, LM Studio or any HTTP model server. "
