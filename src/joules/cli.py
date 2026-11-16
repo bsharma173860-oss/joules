@@ -8,6 +8,9 @@
   joules run --track myproject -- python train.py   ...and chart it on your Tracking page
   joules ci --budget 10 -- pytest -q       energy check for a pull request (vs the base branch)
   joules compare "./bench --new" "./bench --old"   the same work two ways: interleaved runs, medians, p-values
+  joules explain compare.json --facts facts.json  why: time or power, idle, fairness, noise, the workload
+  joules fit --x load_pct 25=a.json 50=b.json     the break-even: where one way starts to win, and why
+  joules router --router auto runs.csv --x load  how close a strategy picker comes to the best choice
   joules proxy --upstream http://localhost:11434   energy receipt on every AI response
   joules agent --track cluster             energy per job on a GPU server or cluster node (Slurm, Kubernetes)
   joules connect                           put this machine on Live, Tracking and the GPU leaderboard, under one name
@@ -22,8 +25,10 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import csv
 import datetime as dt
 import json
+import math
 import os
 import platform
 import shlex
@@ -162,6 +167,11 @@ def ensure_key(a) -> str | None:
     return None
 
 
+def _exit_status(code: int) -> int:
+    """A command killed by a signal (Python's -9) exits as the shell reports it, 128 + 9 = 137, not as 247."""
+    return 128 - code if code < 0 else code
+
+
 def _not_found(cmd: list[str], windows: bool = os.name == "nt") -> int:
     if windows:
         hint = " On Windows Python is `python` or `py`." if cmd[0] in ("python3", "pip3") else ""
@@ -179,11 +189,15 @@ def _start(cmd: list[str]):
     except PermissionError:
         print(warn(f"joules: {cmd[0]} is not executable."), file=sys.stderr)
         return False
+    except OSError as e:  # a script with no #! line (Exec format error), a .py file on Windows (not a valid Win32 application)
+        print(warn(f"joules: cannot run {cmd[0]} ({e.strerror or e}); put the program that runs it first, e.g. bash or python."), file=sys.stderr)
+        return False
 
 
 # Plain stand-ins for the symbols joules prints, for a console or a pipe that cannot show them: never "?" boxes.
 PLAIN = {"·": "-", "─": "-", "→": "->", "…": "...", "µ": "u", "×": "x", "₂": "2", "✓": "OK", "✗": "X", "⚡": "",
-         "≈": "~", "−": "-", "–": "-", "—": "-", "²": "2", "°": " deg", "€": "EUR", "£": "GBP", "₹": "Rs", "≥": ">=", "≤": "<="}
+         "≈": "~", "−": "-", "–": "-", "—": "-", "²": "2", "°": "deg", "€": "EUR", "£": "GBP", "₹": "Rs", "≥": ">=", "≤": "<=",
+         "✅": "OK", "❌": "X", "🔺": "^"}  # the last three: joules ci's verdict, printed as well as written
 
 
 def _plain(err):
@@ -297,10 +311,10 @@ def _host() -> dict:
 
 def _emit(a, report: dict, text: str) -> None:
     if a.out:
-        with open(a.out, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
+        with _open_out(a.out) as f:
+            json.dump(report, f, indent=2, default=str)
     if a.json:
-        print(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2, default=str))
     else:
         print(text, file=sys.stderr)
 
@@ -347,7 +361,7 @@ def cmd_run(a) -> int:
             return 126 if proc is False else _not_found(cmd)
         while True:
             try:
-                return proc.wait()
+                return _exit_status(proc.wait())
             except KeyboardInterrupt:
                 continue
     started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -407,7 +421,7 @@ def cmd_run(a) -> int:
     if a.track:
         _track(a, report)  # a tracking problem is reported but never changes the command's exit code
     _website_hint(a, cmd)
-    return code
+    return _exit_status(code)
 
 
 def render_run(r: dict) -> str:
@@ -712,7 +726,10 @@ def cmd_ci(a) -> int:
                     if cwd is None:
                         continue
                     print(dim(f"joules ci: {side}, run {i + 1 - a.warmup if i >= a.warmup else 'warm-up'}…"), file=sys.stderr)
-                    r = ci.measure(d, cmd, cwd, a.interval)
+                    try:
+                        r = ci.measure(d, cmd, cwd, a.interval)
+                    except OSError as e:  # not found, not executable: said plainly, and the base checkout is still removed
+                        raise RuntimeError(f"the command could not start on {side} ({e.strerror or e}): {short_cmd(cmd)}") from None
                     if r["exit_code"] != 0:
                         raise RuntimeError(f"the command failed on {side} (exit {r['exit_code']}): {short_cmd(cmd)}")
                     if i >= a.warmup:
@@ -729,8 +746,12 @@ def cmd_ci(a) -> int:
                      devices=[m.name if m.kind == "est" else f"{m.name} ({m.method})" for m in d.meters], estimated=estimated,
                      command=short_cmd(cmd, 200), track_link=link)
     print(md)
+    written = set()
     for path in filter(None, (a.markdown, os.environ.get("GITHUB_STEP_SUMMARY"))):
-        with open(path, "a", encoding="utf-8") as f:  # the summary has "⚡"; Windows would default to cp1252
+        if os.path.realpath(path) in written:  # --markdown "$GITHUB_STEP_SUMMARY": the summary once, not twice
+            continue
+        written.add(os.path.realpath(path))
+        with _open_out(path, "a") as f:  # the summary has "⚡"; Windows would default to cp1252
             f.write(md)
     ci.write_outputs(summary)
     if a.comment:
@@ -749,18 +770,152 @@ def cmd_ci(a) -> int:
 
 
 # ---------------------------------------------------------------- joules compare
+def _read_facts(path: str | None) -> dict | None:
+    """The optional facts file: what each command was asked to do and what it really did, e.g.
+    {"arms": {"new": {"requested": {"batch_size": 64}, "actual": {"batch_size": 32}, "hint": "..."}}}."""
+    if not path:
+        return None
+    from .explain import read_json
+    try:
+        with open(path, "rb") as f:
+            facts = read_json(f.read())
+    except (OSError, ValueError) as e:  # ValueError: bad JSON, or text that is not UTF-8/16/32 (said with the file's name)
+        raise ValueError(f"could not read --facts {path}: {e}")
+    except RecursionError:  # nested thousands deep
+        raise ValueError(f"could not read --facts {path}: it is nested too deeply") from None
+    if not isinstance(facts, dict) or not ({"arms", "all"} & facts.keys()):
+        raise ValueError(f'--facts {path} needs "arms" (per command) or "all": {{"arms": {{"NAME": {{"requested": {{...}}, "actual": {{...}}}}}}}}')
+    return facts
+
+
+def _unwritable(path: str) -> str | None:
+    """Why FILE cannot be written, checked before a long measurement rather than after it; None when it can."""
+    full = os.path.abspath(path)
+    if os.path.isdir(full) or path.endswith(("/", os.sep)):  # "out/" names a folder even before it exists
+        return f"{path} is a folder"
+    parent = os.path.dirname(full)
+    while not os.path.isdir(parent):  # a missing folder is made when the file is written: the command may make it first
+        if os.path.lexists(parent):  # a file, or a link to a folder that is not there: no folder can be made in its place
+            return f"{parent} is a file, not a folder" if os.path.exists(parent) else f"{parent} is a link to a folder that does not exist"
+        if os.path.dirname(parent) == parent:  # e.g. a drive that is not there
+            return f"the folder {parent} does not exist"
+        parent = os.path.dirname(parent)
+    if not os.access(parent if not os.path.exists(full) else full, os.W_OK):
+        return f"{path} cannot be written (no permission)"
+    return None
+
+
+def _open_out(path: str, mode: str = "w", **kw):
+    """An output file opened for writing, its folder made first if it is not there yet (UTF-8: Windows defaults to cp1252)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    return open(path, mode, encoding="utf-8", **kw)
+
+
+def cmd_explain(a) -> int:
+    from . import explain as ex
+    try:
+        report = ex.load(a.file, a.baseline)
+        out = ex.explain(report, _read_facts(a.facts), ex.load_checks(a.checks))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, ArithmeticError) as e:
+        print(warn(f"joules explain: {e}"), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        print(ex.render(out).lstrip("\n"))
+    return 3 if a.strict and any(r["severity"] == "problem" for r in out["reasons"]) else 0
+
+
+def cmd_fit(a) -> int:
+    from . import explain as ex
+    try:
+        at = [float(v) for v in a.at.split(",") if v.strip()] if a.at else []
+    except ValueError:
+        print("joules fit: --at takes numbers, e.g. --at 5,10", file=sys.stderr)
+        return 2
+    if a.export and os.path.realpath(a.export) in {os.path.realpath(p) for f in a.files for p in (f, ex._value_path(f) if "=" in f else f)}:
+        print(warn(f"joules fit: --export {a.export} is one of the inputs: writing the cost model there would replace its runs"),
+              file=sys.stderr)
+        return 2
+    try:
+        runs = ex.load_points(a.files, a.x)
+        if a.router:
+            if a.router not in {r["name"] for r in runs}:
+                raise ValueError(f"--router {a.router} is not in the runs")
+            runs = [r for r in runs if r["name"] != a.router]  # the picker is not a strategy to fit
+        out = ex.fit(runs, a.x, a.baseline, at)
+    except (OSError, ValueError, KeyError, csv.Error) as e:  # csv.Error: e.g. a field over the 128 KiB limit
+        print(warn(f"joules fit: {e}"), file=sys.stderr)
+        return 2
+    if a.export:
+        model = ex.export_model(out)
+        try:
+            with open(a.export, "w", encoding="utf-8") as fh:
+                json.dump(model, fh, indent=2)
+        except OSError as e:
+            print(warn(f"joules fit: could not write --export {a.export}: {e.strerror or e}"), file=sys.stderr)
+            return 2
+        sw = "; ".join(f"{p['from']} → {p['to']} at {a.x} ≈ {ex._xv(p['at'])}{'' if p['inside'] else ' (extrapolated)'}" for p in model["switch_points"])
+        print(dim(f"joules fit: cost model written to {a.export} (basis: {'total energy' if model['basis'] == 'energy_j' else 'energy above idle'})"
+                  + (f"; cheapest switches: {sw}" if sw else "")), file=sys.stderr)
+    if a.json:
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        print(ex.render_fit(out).lstrip("\n"))
+    return 0
+
+
+def cmd_router(a) -> int:
+    from . import explain as ex
+    mix = None
+    if a.mix:
+        try:
+            pairs = [(float(k), float(v)) for k, v in (p.split(":") for p in a.mix.split(",") if p.strip())]
+            mix = dict(pairs)
+            if len(mix) != len(pairs):
+                raise ValueError("duplicate workload")
+            if not all(math.isfinite(k) for k in mix):
+                raise ValueError("workload not a finite number")
+        except ValueError:
+            print('joules router: --mix takes VALUE:WEIGHT pairs, e.g. --mix 1:3,50:1', file=sys.stderr)
+            return 2
+    # without --x and VALUE=report.json inputs the runs carry no workload value (load_points makes it 0)
+    valued = a.x is not None or any(ex._valued(f) for f in a.files)
+    if mix is not None and not valued:
+        print("joules router: --mix weighs workloads, but these runs have no workload value: give --x NAME "
+              "(the CSV column) or VALUE=report.json inputs", file=sys.stderr)
+        return 2
+    try:
+        runs = ex.load_points(a.files, a.x)
+        card = ex.router_card(runs, a.router, [n.strip() for n in a.against.split(",")] if a.against else None, mix,
+                              "above_idle_j" if a.above_idle else "energy_j", valued)
+    except (OSError, ValueError, KeyError, csv.Error) as e:  # csv.Error: e.g. a field over the 128 KiB limit
+        print(warn(f"joules router: {e}"), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(card, indent=2))
+    else:
+        print(ex.render_router(card, (a.x or "workload") if valued else None).lstrip("\n"))
+    return 0
+
+
 def cmd_compare(a) -> int:
     from . import compare as cmp
     cmds = [c for c in a.commands if c.strip()]
     if len(cmds) < 2:
-        print('joules compare: give two or more commands in quotes, e.g. joules compare "./bench --runtime hst" "./bench --runtime baseline"', file=sys.stderr)
+        print('joules compare: give two or more commands in quotes, e.g. joules compare "./bench --runtime new" "./bench --runtime old"', file=sys.stderr)
         return 2
     names = [n.strip() for n in a.names.split(",")] if a.names else None
     if names and (len(names) != len(cmds) or len(set(names)) != len(names) or not all(names)):
-        print(f"joules compare: --names needs {len(cmds)} different names, one per command, e.g. --names hst,baseline", file=sys.stderr)
+        print(f"joules compare: --names needs {len(cmds)} different names, one per command, e.g. --names new,old", file=sys.stderr)
+        return 2
+    try:
+        argvs = [c if a.shell else cmp.split_command(c) for c in cmds]
+    except ValueError as e:  # e.g. an unclosed quote: said now, as a usage error, not as a traceback
+        print(f"joules compare: cannot split a command into arguments ({e}); check its quotes, or use --shell", file=sys.stderr)
         return 2
     if not names:
-        short = [short_cmd(cmp.split_command(c) if not a.shell else [c], 40) for c in cmds]
+        short = [short_cmd(argv if not a.shell else [argv], 40) for argv in argvs]
         names = short if len(set(short)) == len(short) else [chr(65 + i) for i in range(len(cmds))]
     baseline = a.baseline or names[0]
     if baseline not in names:
@@ -783,10 +938,33 @@ def cmd_compare(a) -> int:
         if lock is None:
             print("joules compare: --lock-clocks takes an SM clock in MHz, e.g. 1590, or base (the card's base clock)", file=sys.stderr)
             return 2
-    argvs = [c if a.shell else cmp.split_command(c) for c in cmds]
+    try:
+        from . import explain as _ex
+        facts = _read_facts(a.facts)  # a broken facts or checks file fails now, not after every run
+        if facts:
+            _ex.check_facts(facts, names)
+        loaded_checks = _ex.load_checks(a.checks)
+    except ValueError as e:
+        print(f"joules compare: {e}", file=sys.stderr)
+        return 2
+    seen: dict[str, str] = {}
+    for opt, path in (("--out", a.out), ("--csv", a.csv), ("--markdown", a.markdown)):
+        why = path and _unwritable(path)
+        if why:  # said now, not after every run has been measured and the results are lost
+            print(f"joules compare: cannot write {opt} {path}: {why}", file=sys.stderr)
+            return 2
+        if path and os.path.realpath(path) in seen:  # one would overwrite or append to the other
+            print(f"joules compare: {seen[os.path.realpath(path)]} and {opt} are the same file ({path}); give each its own", file=sys.stderr)
+            return 2
+        if path:
+            seen[os.path.realpath(path)] = opt
     if a.track:
         ensure_key(a)
-    d, idle = _setup(a)
+    try:
+        d, idle = _setup(a)
+    except KeyboardInterrupt:  # Ctrl-C during the first idle reading: nothing has been changed yet
+        print(warn("joules compare: stopped."), file=sys.stderr)
+        return 130
     if not d.meters:
         for n in d.notes:
             print(warn("joules: " + n), file=sys.stderr)
@@ -800,6 +978,16 @@ def cmd_compare(a) -> int:
     total = len(limits) * (a.warmup + a.runs) * len(cmds)
     k = 0
     t_first, idle_end = time.monotonic(), {}
+    import signal
+    term: list[int] = []
+    def on_term(signum, _frame):  # kill, timeout, a batch job's time limit: stop as for Ctrl-C, so clocks and limits go back
+        if not term:  # once: a second signal must not cut the putting back short
+            term.append(signum)
+            raise KeyboardInterrupt
+    try:
+        old_term, installed = signal.signal(signal.SIGTERM, on_term), True
+    except (ValueError, OSError):  # not the main thread
+        old_term, installed = None, False
     try:
         with contextlib.ExitStack() as stack:
             if lock is not None:  # first, so the clocks are back to normal last, after the power limits
@@ -822,7 +1010,10 @@ def cmd_compare(a) -> int:
                         t0 = cmp.wait_cool(gpus, a.cool_to, a.cool_timeout, cmp.log) if (a.cool_to is not None and gpus) else cmp.hottest(gpus)
                         cmp.log(f"{names[i]}, {'warm-up' if warm else f'run {rnd - a.warmup + 1} of {a.runs}'} ({k}/{total})")
                         started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-                        r = cmp.measure(d, argvs[i], a.shell, a.interval, a.quiet)
+                        try:  # with --json, stdout is the report: the commands' own output goes to stderr instead
+                            r = cmp.measure(d, argvs[i], a.shell, a.interval, a.quiet, to_stderr=a.json)
+                        except OSError as e:  # not found, not executable: no traceback, and the clocks and limits go back
+                            raise RuntimeError(f"{names[i]} could not start ({e.strerror or e}): {cmds[i]}") from None
                         if r["exit_code"] != 0:
                             raise RuntimeError(f"{names[i]} failed (exit {r['exit_code']}): {cmds[i]}")
                         if warm:
@@ -835,10 +1026,11 @@ def cmd_compare(a) -> int:
                         if idle:
                             r["_mid"] = time.monotonic() - r["duration_s"] / 2
                         results.append(r)
-            if idle and results:  # idle again at the end: a machine that settles (or wakes up) moves the baseline
-                cmp.log(f"measuring idle power again for {a.subtract_idle:g} s…")
-                idle_end = idle_baseline(d.meters, a.subtract_idle, a.interval)
-                notes += cmp.idle_above(results, sum(idle.values()), sum(idle_end.values()), t_first, time.monotonic())
+        if idle and results:  # idle again at the end: a machine that settles (or wakes up) moves the baseline
+            # after the clocks and power limits are back, as they were for the first idle: a locked clock keeps an idle card's draw up
+            cmp.log(f"measuring idle power again for {a.subtract_idle:g} s…")
+            idle_end = idle_baseline(d.meters, a.subtract_idle, a.interval)
+            notes += cmp.idle_above(results, sum(idle.values()), sum(idle_end.values()), t_first, time.monotonic())
     except RuntimeError as e:
         print(warn(f"joules compare: {e}"), file=sys.stderr)
         d.close()
@@ -846,7 +1038,10 @@ def cmd_compare(a) -> int:
     except KeyboardInterrupt:
         d.close()
         print(warn("joules compare: stopped."), file=sys.stderr)
-        return 130
+        return 128 + term[0] if term else 130
+    finally:
+        if installed:  # None: the earlier handler was not set from Python
+            signal.signal(signal.SIGTERM, signal.SIG_DFL if old_term is None else old_term)
     blocks = cmp.summarize(results, names, baseline, a.cool_to, locks)
     for b in blocks:
         if b["limit_pct"] is not None:
@@ -860,13 +1055,24 @@ def cmd_compare(a) -> int:
               "locked_mhz": locks, "gpu_clocks": "locked" if locks else "boost" if gpus else None,
               "idle_w": idle or None, "idle_w_end": idle_end or None, "simulated": d.simulated, "host": _host(), "devices": devices,
               "blocks": blocks, "results": results, "notes": notes}
-    _emit(a, report, cmp.render(report))
+    text = cmp.render(report)
+    explain_failed = False
+    if a.explain or a.facts or a.strict or a.checks:
+        from . import explain as ex
+        try:
+            report["explain"] = ex.explain(report, _read_facts(a.facts), loaded_checks)
+            text += "\n" + ex.render(report["explain"])
+        except (Exception, SystemExit) as e:  # never lose the measurements to a problem in the explanation
+            print(warn(f"joules compare: --explain failed ({type(e).__name__}: {e}); the results are still saved"), file=sys.stderr)
+            explain_failed = True
+    _emit(a, report, text)
+    strict_fail = bool(a.strict and report.get("explain") and any(r["severity"] == "problem" for r in report["explain"]["reasons"]))
     if a.markdown:
-        with open(a.markdown, "a", encoding="utf-8") as f:
+        with _open_out(a.markdown, "a") as f:
             f.write(cmp.markdown(report))
     if a.csv:
         import csv
-        with open(a.csv, "w", newline="", encoding="utf-8") as f:
+        with _open_out(a.csv, newline="") as f:
             csv.writer(f).writerows(cmp.csv_rows(report))
     if a.track:
         reports = []
@@ -889,7 +1095,7 @@ def cmd_compare(a) -> int:
                 at.append(f"{cmp.lock_text(r['locked_mhz'])} locked")
             reports.append((rep_, r["name"] + (f" @ {', '.join(at)}" if at else "")))
         _track_many(a, reports)  # reported, never changes the exit code: the comparison itself succeeded
-    return 0
+    return 2 if explain_failed else 3 if strict_fail else 0
 
 
 def _track_many(a, reports: list) -> int:
@@ -1307,7 +1513,7 @@ def cmd_calibrate(a) -> int:
         if wall_j is not None:
             _wall(report, wall_j)
     _emit(a, report, render_calibrate(report))
-    return code
+    return _exit_status(code)
 
 
 def _wall(report: dict, wall_j: float, how: dict | None = None) -> None:
@@ -1363,6 +1569,7 @@ def cmd_tune(a) -> int:
     """Benchmark a model at several GPU power limits and say which one gives the cheapest token without slowing
     it down by more than --max-slowdown. Needs NVIDIA GPUs and permission to set the limit (root). The original
     limit is put back whatever happens."""
+    from . import compare as cmp
     try:
         target = parse_target(a.target, a.url)
         limits = sorted({int(x) for x in a.limits.split(",") if x.strip()}, reverse=True)
@@ -1382,7 +1589,7 @@ def cmd_tune(a) -> int:
         return 1
     ranges, original = [], []
     for m in gpus:
-        rng, cur = m.nvml.power_limit_range_mw(m.h), m.nvml.power_limit_mw(m.h)
+        rng, cur = m.nvml.power_limit_range_mw(m.h), cmp.restore_limit_mw(m)
         if not rng or not cur:
             print(warn(f"joules tune: {m.name}: the driver does not report its power limits."), file=sys.stderr)
             d.close()
@@ -1398,6 +1605,16 @@ def cmd_tune(a) -> int:
         return 1
     started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     rows, code = [], 0
+    import signal
+    term: list[int] = []
+    def on_term(signum, _frame):  # kill, timeout, a batch job's time limit: stop as for Ctrl-C, so the limit goes back
+        if not term:  # once: a second signal must not cut the putting back short
+            term.append(signum)
+            raise KeyboardInterrupt
+    try:
+        old_term, installed = signal.signal(signal.SIGTERM, on_term), True
+    except (ValueError, OSError):  # not the main thread
+        old_term, installed = None, False
     try:
         for pct in limits:
             watts = []
@@ -1425,6 +1642,9 @@ def cmd_tune(a) -> int:
     except RuntimeError as e:
         print(f"joules tune: {e}", file=sys.stderr)
         code = 1
+    except KeyboardInterrupt:
+        print(warn("joules tune: stopped."), file=sys.stderr)
+        code = 128 + term[0] if term else 130
     finally:
         for m, mw in zip(gpus, original):  # the card is left as it was found
             try:
@@ -1432,6 +1652,8 @@ def cmd_tune(a) -> int:
             except Exception:
                 pass
         d.close()
+        if installed:  # None: the earlier handler was not set from Python
+            signal.signal(signal.SIGTERM, signal.SIG_DFL if old_term is None else old_term)
     if code or not rows:
         return code or 1
     report = {"schema": "joules/1", "tool": f"joules {__version__}", "kind": "tune", "target": f"{target.kind}:{target.model}",
@@ -1448,11 +1670,14 @@ def render_tune(r: dict) -> str:
     for x in r["rows"]:
         lines.append(f"  {x['limit_pct']:>5}%  {sum(x['limit_w']):>6.0f}  {x['tokens_per_s']:>7.1f}  {x['j_per_token']:>8.3g}  {x['gpu_avg_w']:>9.0f}")
     p = r["pick"]
+    from .compare import gpu_index
+    idx = [gpu_index(argparse.Namespace(name=n)) for n in r["gpus"]]  # nvidia-smi numbers: -pl alone sets every GPU here
+    sel = f"-i {','.join(map(str, idx))} " if idx and None not in idx else ""
     if p and p["limit_pct"] < p["base_limit_pct"]:
         lines.append(f"  {good('best')}: {p['limit_pct']}% of the limit uses {accent('%.0f%%' % p['energy_saved_pct'])} less energy per token "
                      f"and is {p['slowdown_pct']:.0f}% slower (within --max-slowdown {r['max_slowdown_pct']:g}%)")
-        lines.append(dim(f"  set it with: sudo nvidia-smi -pl {sum(next(x['limit_w'] for x in r['rows'] if x['limit_pct'] == p['limit_pct'])) / max(1, len(r['gpus'])):.0f}"
-                         f"   (per GPU; nvidia-smi -pl {r['original_limit_w'][0]:.0f} puts it back)"))
+        lines.append(dim(f"  set it with: sudo nvidia-smi {sel}-pl {sum(next(x['limit_w'] for x in r['rows'] if x['limit_pct'] == p['limit_pct'])) / max(1, len(r['gpus'])):.0f}"
+                         f"   (per GPU; nvidia-smi {sel}-pl {r['original_limit_w'][0]:.0f} puts it back)"))
     elif p:
         lines.append("  the full limit is the best within --max-slowdown: lowering it costs more speed than it saves")
     lines.append(dim("  the limit was put back to what it was"))
@@ -1475,7 +1700,7 @@ def cmd_doctor(a) -> int:
     text = doctor.render(r, color=sys.stdout.isatty() and not os.environ.get("NO_COLOR"), ascii_only=ascii_only)
     print(json.dumps(data, indent=2) if a.json else text)
     if a.out:
-        with open(a.out, "w", encoding="utf-8") as f:
+        with _open_out(a.out) as f:
             f.write(json.dumps(data, indent=2) if a.out.endswith(".json") else doctor.render(r, color=False, ascii_only=False) + "\n")
         print(dim(f"joules doctor: report saved to {a.out}"), file=sys.stderr)
     return 1 if r.counts()[doctor.FAIL] else 0
@@ -1572,8 +1797,8 @@ def build_parser() -> argparse.ArgumentParser:
                                     "limits (--limits, needs sudo). Reports the median energy, time, average power and energy x time of "
                                     "each, what the GPU was doing, the change against the baseline with a Mann-Whitney p-value, and "
                                     "a warning when the GPU did not run under the same conditions for each command.")
-    cp.add_argument("commands", nargs="+", metavar="COMMAND", help='each command in quotes, e.g. "./bench --runtime hst"')
-    cp.add_argument("--names", help="a short name per command, comma-separated (e.g. hst,baseline)")
+    cp.add_argument("commands", nargs="+", metavar="COMMAND", help='each command in quotes, e.g. "./bench --runtime new"')
+    cp.add_argument("--names", help="a short name per command, comma-separated (e.g. new,old)")
     cp.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the first)")
     cp.add_argument("--runs", type=int, default=5, help="measured runs per command (default 5)")
     cp.add_argument("--warmup", type=int, default=1, help="unmeasured rounds first (default 1)")
@@ -1589,9 +1814,54 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--quiet", action="store_true", help="hide the commands' own output")
     cp.add_argument("--markdown", metavar="FILE", help="also append a Markdown table to FILE")
     cp.add_argument("--csv", metavar="FILE", help="also write one row per measured run to FILE")
+    cp.add_argument("--explain", action="store_true", help="also say why: time or power, idle, fairness, noise, and the workload facts")
+    cp.add_argument("--facts", metavar="FILE", help="JSON of what each command was asked to do and really did, checked by --explain")
+    cp.add_argument("--strict", action="store_true", help="with --explain: exit 3 when it finds a problem to fix before quoting the result")
+    cp.add_argument("--checks", action="append", metavar="FILE.py", help="with --explain: your own checks, a Python file defining check(report, facts) (repeatable; runs your code)")
     common(cp)
     sharing_args(cp)
     cp.set_defaults(fn=cmd_compare)
+
+    xp = sub.add_parser("explain", help="why a comparison came out the way it did",
+                        description="Explain a saved joules compare report (--out FILE.json), or a CSV of runs measured another way "
+                                    "(columns: name, energy_j, duration_s, and optionally round, position, limit_pct, temp_start_c, idle_w, "
+                                    "above_idle_j): where the saving came from, what idle power does to it, whether the runs were "
+                                    "fair and stable, and, with --facts, whether each command did the work you asked for.")
+    xp.add_argument("file", metavar="FILE", help="a compare report (.json) or runs (.csv)")
+    xp.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the report's, or the first)")
+    xp.add_argument("--facts", metavar="FILE", help='JSON: {"arms": {"NAME": {"requested": {...}, "actual": {...}}}}')
+    xp.add_argument("--json", action="store_true", help="print the explanation as JSON")
+    xp.add_argument("--strict", action="store_true", help="exit 3 when it finds a problem to fix before quoting the result (for CI)")
+    xp.add_argument("--checks", action="append", metavar="FILE.py", help="your own checks: a Python file defining check(report, facts) (repeatable; runs your code)")
+    xp.set_defaults(fn=cmd_explain)
+
+    ft = sub.add_parser("fit", help="where one way starts to beat another, as the workload changes",
+                        description="Fit energy = fixed + per-unit x workload for each command, from comparisons measured at "
+                                    "two or more workload sizes, and say where each one starts to beat the baseline (the "
+                                    "break-even), why (fixed cost against cost per unit), and what to expect at your workload. "
+                                    "Give each joules compare report with its workload value (25=run25.json), or CSVs of runs "
+                                    "with a column for the workload.")
+    ft.add_argument("files", nargs="+", metavar="FILE", help="VALUE=report.json (e.g. 25=load25.json) or runs.csv")
+    ft.add_argument("--x", required=True, metavar="NAME", help="what the workload value is, e.g. load_pct (the CSV column name)")
+    ft.add_argument("--baseline", metavar="NAME", help="the command the others are compared with (default: the report's baseline, else the last)")
+    ft.add_argument("--at", metavar="VALUES", help="also predict the energy at these workload values, e.g. 5,10")
+    ft.add_argument("--json", action="store_true", help="print the fit as JSON")
+    ft.add_argument("--export", metavar="FILE.json", help="write a cost model a runtime can read to pick the strategy with the least energy")
+    ft.add_argument("--router", metavar="NAME", help="a command that picks a strategy itself: left out of the fit (judge it with joules router)")
+    ft.set_defaults(fn=cmd_fit)
+
+    rt = sub.add_parser("router", help="how close a strategy picker comes to the best fixed choice",
+                        description="Router report card: at each workload, the router's energy against the best fixed strategy "
+                                    "measured there (its regret), and over a mix of workloads against a perfect picker and "
+                                    "against always using one strategy. Takes the same inputs as joules fit.")
+    rt.add_argument("files", nargs="+", metavar="FILE", help="VALUE=report.json, report.json (with no --x), or runs.csv")
+    rt.add_argument("--router", required=True, metavar="NAME", help="the command that picks a strategy itself")
+    rt.add_argument("--x", metavar="NAME", help="the workload value (CSV column), if measured at several workloads")
+    rt.add_argument("--against", metavar="NAMES", help="the fixed strategies to compare with, comma-separated (default: all others)")
+    rt.add_argument("--mix", metavar="PAIRS", help="how often each workload happens, VALUE:WEIGHT, e.g. 1:3,50:1 (default: equal)")
+    rt.add_argument("--above-idle", action="store_true", help="judge on energy above idle (when measured)")
+    rt.add_argument("--json", action="store_true", help="print the card as JSON")
+    rt.set_defaults(fn=cmd_router)
 
     px = sub.add_parser("proxy", help="energy receipt on every response of a model server",
                         description="Put this in front of Ollama, vLLM, llama.cpp, LM Studio or any HTTP model server. "
@@ -1740,6 +2010,20 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd in ("run", "ci", "calibrate") and a.command and a.command[0] != "--" and a.command[0].startswith("-"):
         p.error("put the command after --, e.g. joules run -- python train.py")
     a.argv = argv
+    for opt in ("out", "markdown", "csv"):  # --out=~/r.json: no shell expands that ~, and a folder named ~ would be made here
+        if (getattr(a, opt, None) or "").startswith("~"):
+            setattr(a, opt, os.path.expanduser(getattr(a, opt)))
+    for opt in ("out", "markdown"):  # every command that writes one: checked before measuring, not after a long run
+        path = getattr(a, opt, None)
+        why = path and _unwritable(path)
+        if why:
+            print(f"joules {a.cmd}: cannot write --{opt} {path}: {why}", file=sys.stderr)
+            return 2
+    try:  # --gpus all (as docker spells it) or a stray comma: a usage error, not a traceback from the command
+        _gpu_list(getattr(a, "gpus", None))
+    except ValueError:
+        print(f"joules {a.cmd}: --gpus takes GPU numbers, e.g. --gpus 0,1 (leave it out for every GPU)", file=sys.stderr)
+        return 2
     counted = a.cmd not in ("telemetry",)
     if counted:
         try:

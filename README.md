@@ -117,6 +117,62 @@ one side was throttled more, ran at a different clock or started hotter, and `--
 repeats the comparison at fixed GPU power limits so a gain cannot come from the card boosting differently. The
 full method is in [docs/BENCHMARKING.md](https://github.com/bsharma173860-oss/d3-research/blob/main/apps/landauer-gap/docs/BENCHMARKING.md).
 
+### Why it came out that way: `--explain`
+
+```bash
+joules compare --explain --facts facts.json --names new,old "./bench --runtime new" "./bench --runtime old"
+joules explain results.json                # a saved compare report (--out results.json)
+joules explain runs.csv --baseline old     # runs measured another way: name (or arm),energy_j,duration_s[,round,position,...]
+joules explain results.json --strict       # exit 3 if there is a problem to fix first (for CI)
+```
+
+Adds a short "Why" after the numbers, problems first:
+- whether the saving came from **finishing sooner or drawing less power** (energy = average power × time);
+- why the **total and above-idle** changes differ, and which one to quote;
+- whether the runs were **fair**: a fixed order, different starting temperatures or throttling;
+- arms **too noisy to quote**, and when there are **too few runs** for any difference to count as real;
+- with `--facts`, whether each command **did the work you asked for**. Only you know the workload, so you write
+  what was requested and what actually ran, and joules flags any number more than 10% off:
+
+```json
+{"arms": {"new": {"requested": {"batch_size": 64}, "actual": {"batch_size": 32},
+                  "hint": "the server capped the batch size"}}}
+```
+
+Your own checks: `--checks my_checks.py` loads a Python file that defines `check(report, facts)` and returns a list of
+`{"severity": "problem" | "note", "title": ..., "detail": ...}`. Problems they report are listed before joules' own. Use them for knowledge only your
+harness has (its parameters and counters), so it stays in your code, not in joules. The file runs on your
+machine like any script, so only load files you trust.
+
+### Where one way starts to win: `joules fit`
+
+Measure the comparison at two or more workload sizes (e.g. 1, 10, 25 and 50% of the full load), then:
+
+```bash
+joules fit --x load_pct --at 5 1=load1.json 10=load10.json 25=load25.json 50=load50.json
+```
+
+joules fits energy = fixed + per-unit × workload for each command over every run, and prints:
+- each command's **fixed cost** and **cost per unit**;
+- the **break-even**: where one starts to beat the other, and why (it costs more up front but less per unit);
+- the expected energy **at your workload** (`--at`), marked measured, inside the measured range, or extrapolated.
+
+It warns when only two sizes were measured, when the break-even lies outside the measured range, and when the energy
+doesn't follow a straight line (a measured median more than 5% off the line with R² < 0.9, or more than 20% off). It takes compare reports (`VALUE=report.json`) or CSVs with a workload column.
+
+### Let a runtime pick by energy, and grade its picker
+
+```bash
+joules fit --x load_pct --export costs.json 1=a.json 25=b.json 50=c.json   # a cost model per strategy
+joules router --router auto --x load_pct --mix 1:3,50:1 runs.csv          # how close "auto" comes to the best pick
+```
+
+`--export` writes each strategy's fixed cost and cost per unit (`joules-costmodel/1`) and where the cheapest one changes,
+so a runtime can pick the strategy with the least predicted energy (`joules.explain.choose(model, x)` in Python).
+`joules router` grades a strategy picker: at each workload, its energy against the best fixed strategy measured there
+(its regret); over a mix of workloads, against a perfect picker and against always using one strategy; and it flags a
+picker whose runs vary too much to trust.
+
 ## Phases of your own program
 
 Inside a Python program:

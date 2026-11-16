@@ -37,7 +37,10 @@ def measure(d: Discovery, cmd: list[str], cwd: str, interval: float) -> dict:
 
 
 def git(*args: str, cwd: str | None = None) -> str:
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    except OSError as e:  # git not installed (a slim container, a checkout made without it)
+        raise RuntimeError(f"git {' '.join(args)}: git could not run ({e.strerror or e})") from None
     if p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {(p.stderr or p.stdout).strip()[:300]}")
     return p.stdout.strip()
@@ -48,7 +51,11 @@ def worktree(ref: str):
     """A clean checkout of ref next to this one, removed afterwards."""
     tmp = tempfile.mkdtemp(prefix="joules-base-")
     path = os.path.join(tmp, "base")
-    git("-c", "advice.detachedHead=false", "worktree", "add", "--detach", path, ref)
+    try:
+        git("-c", "advice.detachedHead=false", "worktree", "add", "--detach", path, ref)
+    except RuntimeError:  # a ref that is not there (a typo, a shallow clone): the folder made for it goes too
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     try:
         yield path
     finally:

@@ -685,6 +685,12 @@ class NVML:
         v = self._uint("nvmlDeviceGetEnforcedPowerLimit", h)
         return v if v is not None else self._uint("nvmlDeviceGetPowerManagementLimit", h)
 
+    def management_limit_mw(self, h):
+        """The limit nvidia-smi -pl sets (or the default): what a changed limit is put back to. The enforced limit
+        can be lower than this, under a cap set from outside, such as the server's BMC."""
+        v = self._uint("nvmlDeviceGetPowerManagementLimit", h)
+        return v if v is not None else self.power_limit_mw(h)
+
     def power_limit_range_mw(self, h):
         f = getattr(self.lib, "nvmlDeviceGetPowerManagementLimitConstraints", None)
         if f is None:
@@ -777,7 +783,9 @@ class GpuHealth:
         nv, h, s = self.nvml, self.h, self._hs
         if not hasattr(nv, "clock_mhz"):
             return
-        sm, mc, t, r = nv.clock_mhz(h, 1), nv.clock_mhz(h, 2), nv.temperature_c(h), nv.throttle_reasons(h)
+        if hasattr(nv, "power_limit_mw"):  # read again: nvidia-smi -pl or an outside cap changes it while the agent runs
+            self._h_limit = nv.power_limit_mw(h) or self._h_limit
+        sm, mc, t, r =nv.clock_mhz(h, 1), nv.clock_mhz(h, 2), nv.temperature_c(h), nv.throttle_reasons(h)
         u, mu = nv.utilization_pair(h), nv.memory_used_pct(h)
         last = {"sm_clock_mhz": sm, "mem_clock_mhz": mc, "temp_c": t, "reasons": r, "gpu_util_pct": None, "mem_util_pct": None}
         if sm is not None:
@@ -885,7 +893,10 @@ class NvmlCounterMeter(GpuHealth, CounterMeter):
         self.nvml, self.h = nvml, h
 
     def read_j(self) -> float:
-        return self.nvml.energy_mj(self.h) / 1000.0
+        mj = self.nvml.energy_mj(self.h)
+        if mj is None:  # the driver did not answer this time: a missed reading (as for RAPL), not a crash of the run or agent
+            raise OSError(f"{self.name}: NVML gave no energy reading")
+        return mj / 1000.0
 
     def start(self, now: float) -> None:
         super().start(now)

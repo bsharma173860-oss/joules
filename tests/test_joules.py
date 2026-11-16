@@ -234,7 +234,7 @@ class Powermetrics(unittest.TestCase):
 
     def test_each_sample_is_added_once_with_the_gpu_power_sampler(self):
         # macOS prints, per sample of `--samplers cpu_power,gpu_power`, the CPU/GPU/ANE lines, the Combined line,
-        # then the GPU section with a second "GPU Power" line. Found by HorneSci: five samples became nine
+        # then the GPU section with a second "GPU Power" line. Found on a user's Mac: five samples became nine
         # additions, the extra GPU line added as a sample of its own at the start of the next one.
         sample = ("*** Sampled system activity (Fri Oct 23 10:00:00 2026 -0700) (200.11ms elapsed) ***\n",
                   "**** Processor usage ****\n", "CPU Power: 2000 mW\n", "GPU Power: 400 mW\n", "ANE Power: 100 mW\n",
@@ -300,6 +300,28 @@ class Nvml(unittest.TestCase):
         self.assertAlmostEqual(t4.energy_j, 700.0)
         self.assertEqual(model.gpu_from_name(found[0].name), "h100")
         self.assertEqual(model.gpu_from_name("NVIDIA A100-SXM4-40GB"), "a100")
+
+    def test_energy_counter_without_an_answer_is_a_missed_reading(self):
+        from joules import agent as ag
+        from joules.sampler import Sampler
+        devs = [{"name": "NVIDIA H100 80GB HBM3", "energy_mj": 1_000_000, "power_mw": 650_000}]
+        with mock.patch.object(meters, "NVML_FACTORY", lambda: FakeNVML(devs)), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            (m,), _ = meters.discover_nvml([], None)
+        a = ag.Agent([m], interval=1)
+        a.start(0.0, wall=0)
+        devs[0]["energy_mj"] = None  # the driver gives no reading for a moment (a reset, a busy driver)
+        a.tick(1.0, 1.0, wall=1)     # the agent keeps running
+        devs[0]["energy_mj"] = 1_650_000
+        a.tick(2.0, 1.0, wall=2)
+        self.assertAlmostEqual(a.acc.device_j[m.name], 650.0)
+        with Sampler([m], 0.02):     # the card stops answering for good before the run ends: the run still reports
+            devs[0]["energy_mj"] = 1_700_000
+            end = time.monotonic() + 5
+            while m.energy_j < 50 and time.monotonic() < end:  # until the sampler has read it
+                time.sleep(0.01)
+            devs[0]["energy_mj"] = None
+        self.assertAlmostEqual(m.energy_j, 50.0)
 
     def test_uuids_mig_slices_and_ordering(self):
         devs = [{"name": "NVIDIA H100 80GB HBM3", "energy_mj": 1, "uuid": "GPU-aaaa1111-0000", "migs": ["MIG-1234"]},
@@ -2038,6 +2060,126 @@ def H_get(base, url):
         return r.read()
 
 
+class ExplainRegressions3(unittest.TestCase):
+    """Round 2 of the explain review: each bug pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def file(self, name, text):
+        p = self.d / name
+        p.write_text(text, encoding="utf-8")
+        return str(p)
+
+    def r_csv(self):
+        return self.file("r.csv", "name,energy_j,duration_s\na,10,1\na,11,1\nb,5,1\nb,6,1\n")
+
+    def test_a_check_calling_sys_exit_loses_nothing(self):
+        exits = self.file("exit.py", "import sys\ndef check(report, facts):\n    sys.exit(0)\n")
+        code, out, err = run_cli(["explain", self.r_csv(), "--strict", "--checks", exits])
+        self.assertEqual(code, 3, err); self.assertIn("SystemExit", out)          # not a silent exit 0 that passes CI
+        at_import = self.file("exit2.py", "import sys\nsys.exit(0)\ndef check(report, facts):\n    return []\n")
+        self.assertEqual(run_cli(["explain", self.r_csv(), "--checks", at_import])[0], 2)
+        rep = self.d / "rep.json"
+        sleep = f'"{sys.executable}" -c "pass"'
+        code, _, err = run_cli(["compare", "--runs", "2", "--warmup", "0", "--quiet", "--no-track", "--no-cpu", "--out", str(rep),
+                                "--checks", exits, sleep, sleep], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 0, err)
+        saved = json.loads(rep.read_text(encoding="utf-8"))
+        self.assertEqual(len(saved["results"]), 4); self.assertTrue(saved["explain"]["reasons"][0]["title"].startswith("check "))
+
+    def test_a_check_cannot_change_the_saved_measurements(self):
+        clear = self.file("clear.py", "def check(report, facts):\n    report['results'].clear(); report['blocks'].clear()\n    return []\n")
+        rep = self.d / "rep.json"
+        sleep = f'"{sys.executable}" -c "pass"'
+        code, _, err = run_cli(["compare", "--runs", "2", "--warmup", "0", "--quiet", "--no-track", "--no-cpu", "--out", str(rep),
+                                "--explain", "--checks", clear, sleep, sleep], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(json.loads(rep.read_text(encoding="utf-8"))["results"]), 4)
+
+    def test_check_plugins_with_dataclasses_and_non_json_numbers(self):
+        dc = self.file("dc.py", "from __future__ import annotations\nfrom dataclasses import dataclass\n"
+                                "@dataclass\nclass F:\n    t: str\n"
+                                "def check(report, facts):\n    return [{'title': F(facts['all']['label']).t, 'numbers': {'x': float('nan')}}]\n")
+        f = self.file("f.json", json.dumps({"all": {"label": "A1"}}))   # extra keys for a plugin are fine in the facts
+        code, out, err = run_cli(["explain", self.r_csv(), "--json", "--facts", f, "--checks", dc])
+        self.assertEqual(code, 0, err)
+        ex_ = json.loads(out, parse_constant=lambda c: self.fail(f"not strict JSON: {c}"))
+        r = next(r for r in ex_["reasons"] if r.get("source") == dc)
+        self.assertEqual((r["title"], r["numbers"]), ("A1", {"x": "nan"}))
+
+    def test_csv_power_limits_are_separate_blocks(self):
+        rows = ["name,limit_pct,round,position,energy_j,duration_s"]
+        for lim, (eo, en) in ((100, (100, 60)), (50, (40, 38))):
+            for k in range(1, 6):
+                for p, (n, e) in enumerate((("old", eo), ("new", en)) if k % 2 else (("new", en), ("old", eo)), 1):
+                    rows.append(f"{n},{lim},{k},{p},{e + k * 0.1},1")
+        from joules import explain as ex
+        rep = ex.load(self.file("lim.csv", "\n".join(rows) + "\n"))
+        self.assertEqual([b["limit_pct"] for b in rep["blocks"]], [100, 50])
+        out = ex.explain(rep)
+        self.assertTrue(out["summary"].startswith("At 100% power, new used 40% less energy than old."))
+        self.assertFalse(any("not stable" in r["title"] for r in out["reasons"]))   # the two limits were pooled before
+
+    def test_joules_compare_fixed_order_with_three_commands_is_a_problem(self):
+        from joules import explain as ex
+        from joules.compare import order, summarize
+        names, runs = ["a", "b", "c"], []
+        for rnd, idx in enumerate(order(names, 5, "alternate"), 1):   # joules compare's default: A B C, A B C, ...
+            for pos, i in enumerate(idx, 1):
+                runs.append({"name": names[i], "energy_j": 10.0 + i + rnd * 0.01, "duration_s": 1.0, "avg_w": 10.0 + i,
+                             "round": rnd, "position": pos, "limit_pct": None})
+        rep = {"kind": "compare", "names": names, "baseline": "a", "order": "alternating", "results": runs,
+               "blocks": summarize(runs, names, "a")}
+        self.assertIn("the commands always ran in the same order", [r["title"] for r in ex.explain(rep)["reasons"]])
+
+    def test_fixed_order_is_not_also_called_alternating(self):
+        rows = ["name,energy_j,duration_s,round,position,temp_start_c"]
+        for k in range(1, 6):
+            for p, (n, e) in enumerate((("old", 10), ("new", 6), ("mid", 8)), 1):
+                rows.append(f"{n},{e + k * 0.01},1,{k},{p},{40 + (k % 2) * 15 + p}")
+        code, out, err = run_cli(["explain", self.file("t.csv", "\n".join(rows) + "\n")])
+        self.assertEqual(code, 0, err)
+        self.assertIn("always ran in the same order", out); self.assertNotIn("since they alternate", out)
+
+    def test_facts_text_is_compared_as_text(self):
+        f = self.file("v.json", json.dumps({"all": {"requested": {"cuda": "12.1", "n": "nan", "on": True, "bs": 64},
+                                                    "actual": {"cuda": "12.4", "n": "nan", "on": "true", "bs": "62"}}}))
+        code, out, err = run_cli(["explain", self.r_csv(), "--facts", f, "--json"])
+        self.assertEqual(code, 0, err)
+        bad = [r for r in json.loads(out)["reasons"] if "workload" in r["title"]]
+        self.assertEqual(len(bad), 2)
+        self.assertEqual(bad[0]["numbers"]["mismatches"], ["cuda: asked for 12.1, got 12.4"])   # nan = nan, true = "true", 64 ~ "62"
+        self.assertFalse(any(r["title"].startswith("at ") for r in bad))
+
+    def test_malformed_and_extreme_inputs_are_clean_errors(self):
+        for name, text in (("inf.csv", "name,energy_j,duration_s,round\na,10,1,inf\nb,5,1,1\n"),
+                           ("frac.csv", "name,energy_j,duration_s,position\na,10,1,1.5\nb,5,1,1\n"),
+                           ("big.csv", "name,energy_j,duration_s\na,1e308,1\na,1e308,1\nb,1,1\nb,1,1\n"),
+                           ("dup.csv", "name,energy_j,duration_s,energy_j\na,10,1,100\nb,5,1,1\n"),
+                           ("dup2.csv", "name,energy_j,duration_s, energy_j \na,10,1,\nb,5,1,\n"),
+                           ("empty.json", json.dumps({"kind": "compare", "names": ["a", "b"], "baseline": "a", "results": [], "blocks": []}))):
+            code, _, err = run_cli(["explain", self.file(name, text)])
+            self.assertEqual(code, 2, name); self.assertNotIn("Traceback", err)
+        code, out, err = run_cli(["explain", self.file("tiny.csv", "name,energy_j,duration_s\na,1e300,1\na,1e300,1\nb,1e-300,1\nb,1e-300,1\n")])
+        self.assertEqual(code, 0, err)
+
+    def test_zero_energy_is_said_not_dropped(self):
+        code, out, _ = run_cli(["explain", self.file("z.csv", "name,energy_j,duration_s\na,0,1\na,0,1\nb,5,1\nb,6,1\n")])
+        self.assertIn("a used no energy (median 0 J)", out); self.assertNotIn("Nothing to compare", out)
+        code, out, _ = run_cli(["explain", self.file("z2.csv", "name,energy_j,duration_s\na,10,1\na,10,1\nb,0,1\nb,0,1\n")])
+        self.assertIn("against a: b -100%", out)
+
+    def test_memory_note_only_for_a_saving(self):
+        from joules import explain as ex
+        from joules.compare import summarize
+        runs = [{"name": n, "energy_j": e + k * 0.01, "duration_s": 1.0, "avg_w": e, "round": k + 1, "position": p, "limit_pct": None,
+                 "gpu": {"G": {"mem_util_pct": mu, "clock_pct": 90}}}
+                for k in range(5) for p, (n, e, mu) in enumerate((("old", 10.0, 80), ("new", 13.0, 40)), 1)]
+        rep = {"kind": "compare", "names": ["old", "new"], "baseline": "old", "order": "alternating", "results": runs,
+               "blocks": summarize(runs, ["old", "new"], "old")}
+        self.assertFalse(any("memory" in r["title"] for r in ex.explain(rep)["reasons"]))   # new used 30% more: no saving to explain
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -2169,6 +2311,18 @@ class GpuHealth(unittest.TestCase):
         self.assertEqual((now["sm_clock_mhz"], now["throttled"], now["throttle_reason"], now["gpu_util_pct"], now["power_limit_w"]), (1980, True, "power cap", 71, 700))
         self.assertIsNone(l40.health_now()["throttle_reason"] or None)
 
+    def test_power_limit_follows_a_change_made_while_measuring(self):
+        nv = FakeNVMLHealth([self.H100])
+        with mock.patch.object(meters, "NVML_FACTORY", lambda: nv), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            (m,), _ = meters.discover_nvml([], None)
+        m.start(0.0); m.poll(0.6)
+        self.assertEqual(m.health_now()["power_limit_w"], 700)
+        nv.limits[0] = 490_000  # sudo nvidia-smi -pl 490 while the agent keeps running
+        m.poll(1.2)
+        self.assertEqual(m.health_now()["power_limit_w"], 490)
+        self.assertEqual(m.health()["power_limit_w"], 490)
+
     def test_plain_fake_without_health_calls_still_measures(self):
         nv = FakeNVML([{"name": "NVIDIA H100 80GB HBM3", "energy_mj": 1_000_000, "power_mw": 650_000}])
         with mock.patch.object(meters, "NVML_FACTORY", lambda: nv), mock.patch.dict(os.environ, {}, clear=False):
@@ -2241,7 +2395,7 @@ class GpuHealth(unittest.TestCase):
         self.assertEqual(nv.limits[0], 700_000)
         self.assertEqual(r["rows"][1]["gpu"][0]["throttle_reasons"], {"power cap": 100})
         text = cli.render_tune(r)
-        self.assertIn("best: 70% of the limit uses", text); self.assertIn("nvidia-smi -pl 490", text)
+        self.assertIn("best: 70% of the limit uses", text); self.assertIn("nvidia-smi -i 0 -pl 490", text)
 
     def test_tune_without_permission_says_sudo_and_touches_nothing(self):
         nv = FakeNVMLHealth([{"name": "NVIDIA H100 80GB HBM3", "power_mw": 650_000}]); nv.no_root = True
@@ -2255,6 +2409,30 @@ class GpuHealth(unittest.TestCase):
             srv.close()
         self.assertEqual(code, 1); self.assertIn("sudo", err); self.assertEqual(nv.sets, [])
         self.assertEqual(run_cli(["tune", "ollama:x", "--limits", "150"], SIM)[0], 2)
+
+    def test_tune_puts_the_limit_back_when_terminated(self):
+        # kill, timeout or a batch job's time limit sends SIGTERM: the card must not stay capped
+        nv = FakeNVMLHealth([{"name": "NVIDIA H100 80GB HBM3", "power_mw": 650_000}])
+        def gen(*a, **k):
+            if nv.limits[0] < 700_000:  # at the lowered limit
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(1)  # the handler runs here
+                self.fail("SIGTERM did not stop joules tune")
+            return {"output_tokens": 10, "prompt_tokens": 5, "gen_s": 0.01}
+        def outer(*_): raise SystemExit("SIGTERM was not handled by joules tune")  # never the default: it would end the tests
+        before = signal.signal(signal.SIGTERM, outer)
+        try:
+            with tempfile.TemporaryDirectory() as t, mock.patch.object(meters, "NVML_FACTORY", lambda: nv), \
+                    mock.patch.object(cli, "generate", gen), mock.patch.object(cli, "ensure_model", lambda *a: None), \
+                    mock.patch.dict(os.environ, {"JOULES_SYSFS": t, "CUDA_VISIBLE_DEVICES": "0"}):
+                os.environ.pop("JOULES_SIMULATE", None)
+                code, out, err = run_cli(["tune", "ollama:x", "--limits", "100,70", "--runs", "1", "--warmup", "0", "--no-cpu"])
+            self.assertIs(signal.getsignal(signal.SIGTERM), outer)  # put back afterwards
+        finally:
+            signal.signal(signal.SIGTERM, before)
+        self.assertEqual(code, 128 + signal.SIGTERM, err); self.assertIn("stopped", err)
+        self.assertEqual(nv.sets, [(0, 700_000), (0, 490_000), (0, 700_000)])
+        self.assertEqual(nv.limits[0], 700_000)
         self.assertEqual(run_cli(["tune", "ollama:x", "--runs", "1"], SIM)[0], 1)  # simulated meters have no power limit
 
 
@@ -2571,7 +2749,7 @@ class LibraryApi(unittest.TestCase):
             env = {"JOULES_SIMULATE": "gpu:RTX 3070 Ti:200,cpu:package 0:50", "LANDAUER_API_KEY": key, "LANDAUER_API_URL": srv.url}
             err = io.StringIO()
             with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(err):
-                with joules.Session(interval=0.02, track="hst-study", name="incremental vs full", price=0.2, grid="eu") as s:
+                with joules.Session(interval=0.02, track="study", name="a vs b", price=0.2, grid="eu") as s:
                     for _ in range(3):
                         with s.phase("incremental update"):
                             time.sleep(0.03)
@@ -2581,14 +2759,14 @@ class LibraryApi(unittest.TestCase):
                 self.assertEqual(s.saved["id"], 77)
             path, auth, r = H.calls[0]
             self.assertEqual((path, auth), ("/api/v1/track", f"Bearer {key}"))
-            self.assertEqual((r["project"], r["label"], r["kind"], r["simulated"], r["g_per_kwh"], r["price_per_kwh"]), ("hst-study", "incremental vs full", "run", True, 250, 0.2))
+            self.assertEqual((r["project"], r["label"], r["kind"], r["simulated"], r["g_per_kwh"], r["price_per_kwh"]), ("study", "a vs b", "run", True, 250, 0.2))
             self.assertGreaterEqual(r["energy_j"], whole["energy_j"]); self.assertAlmostEqual(r["co2_g"], r["energy_j"] / 3.6e6 * 250, delta=1e-9)
             names = [p["name"] for p in r["phases"]]
             self.assertEqual(names, ["full recompute", "incremental update"])  # the biggest energy first
             inc = r["phases"][1]
             self.assertEqual(inc["count"], 3); self.assertAlmostEqual(inc["avg_w"], 250, delta=1e-6)
             self.assertEqual(set(inc), {"name", "count", "energy_j", "duration_s", "median_j", "median_s", "avg_w", "spread_pct"})
-            self.assertIn("session saved to project hst-study", err.getvalue()); self.assertIn("#/track?run=77", err.getvalue())
+            self.assertIn("session saved to project study", err.getvalue()); self.assertIn("#/track?run=77", err.getvalue())
             self.assertEqual(len(H.calls), 1, "saved once")
             # no key, or the server down: the program carries on and is told why
             err = io.StringIO()
@@ -2651,16 +2829,16 @@ class CompareStats(unittest.TestCase):
             return {"name": name, "energy_j": e, "duration_s": e / 100, "avg_w": 100.0, "limit_pct": None, "temp_start_c": t0,
                     "devices": {"GPU 0": e}, "gpu": {"GPU 0": {"clock_pct": clock, "throttled_pct": thr, "temp_c_max": 70,
                                                                  "throttle_reasons": {"power cap": thr} if thr else {}}}}
-        runs = [run("hst", 800 + i, 0) for i in range(5)] + [run("baseline", 1400 + i, 60, t0=65) for i in range(5)]
-        b = summarize(runs, ["hst", "baseline"], "baseline")[0]
-        hst = next(r for r in b["rows"] if r["name"] == "hst")
-        self.assertAlmostEqual(hst["vs"]["energy_pct"], (802 - 1402) / 1402 * 100)
-        self.assertAlmostEqual(hst["vs"]["energy_p"], 2 / 252)
-        self.assertEqual(hst["gpu"]["throttled_pct"], 0)
+        runs = [run("new", 800 + i, 0) for i in range(5)] + [run("baseline", 1400 + i, 60, t0=65) for i in range(5)]
+        b = summarize(runs, ["new", "baseline"], "baseline")[0]
+        new = next(r for r in b["rows"] if r["name"] == "new")
+        self.assertAlmostEqual(new["vs"]["energy_pct"], (802 - 1402) / 1402 * 100)
+        self.assertAlmostEqual(new["vs"]["energy_p"], 2 / 252)
+        self.assertEqual(new["gpu"]["throttled_pct"], 0)
         self.assertEqual(next(r for r in b["rows"] if r["name"] == "baseline")["gpu"]["reason"], "power cap")
-        self.assertTrue(any("throttled 60% of the time under baseline but 0% under hst" in n for n in b["notes"]))
+        self.assertTrue(any("throttled 60% of the time under baseline but 0% under new" in n for n in b["notes"]))
         self.assertTrue(any("--cool-to" in n for n in b["notes"]))
-        self.assertTrue(any("baseline's runs started at 65 °C (median) but hst's at 50 °C" in n for n in b["notes"]))
+        self.assertTrue(any("baseline's runs started at 65 °C (median) but new's at 50 °C" in n for n in b["notes"]))
         fair = summarize([run("a", 100 + i, 0) for i in range(3)] + [run("b", 200 + i, 0) for i in range(3)], ["a", "b"], "a")[0]
         self.assertEqual(len(fair["notes"]), 1); self.assertIn("--runs 5", fair["notes"][0])
 
@@ -2699,14 +2877,14 @@ class CompareIdle(unittest.TestCase):
         self.assertAlmostEqual(steady[0]["above_idle_j"], 100 - 81)
 
     def test_the_verdict_names_power_and_energy_above_idle(self):
-        # HST on an M1 Max drew more power but finished sooner: the verdict has to show both, or a reader sees watts go up.
+        # A command can draw more power and still finish sooner: the verdict has to show both, or a reader sees watts go up.
         from joules.compare import summarize, verdict_line
         def run(name, e, d, ai):
             return {"name": name, "energy_j": e, "duration_s": d, "avg_w": e / d, "above_idle_j": ai, "limit_pct": None, "devices": {}}
-        runs = [run("hst", 143 + i, 11.9, 49 + i) for i in range(5)] + [run("baseline", 215 + i, 18.9, 70 + i) for i in range(5)]
-        hst = next(r for r in summarize(runs, ["hst", "baseline"], "baseline")[0]["rows"] if r["name"] == "hst")
-        self.assertGreater(hst["vs"]["power_pct"], 0); self.assertLess(hst["vs"]["above_idle_pct"], -25)
-        line = verdict_line(hst)
+        runs = [run("new", 150 + i, 12.0, 50 + i) for i in range(5)] + [run("old", 220 + i, 19.0, 72 + i) for i in range(5)]
+        new = next(r for r in summarize(runs, ["new", "old"], "old")[0]["rows"] if r["name"] == "new")
+        self.assertGreater(new["vs"]["power_pct"], 0); self.assertLess(new["vs"]["above_idle_pct"], -25)
+        line = verdict_line(new)
         self.assertIn("average power +", line); self.assertIn("above idle -", line)
 
 
@@ -2765,6 +2943,13 @@ class CompareCli(unittest.TestCase):
         self.assertTrue(r["idle_w"]); self.assertTrue(r["idle_w_end"])
         self.assertTrue(all("idle_w" in x and "above_idle_j" in x and "_mid" not in x for x in r["results"]))
 
+    def test_ctrl_c_during_the_first_idle_reading(self):
+        def interrupted(*a, **k): raise KeyboardInterrupt
+        with mock.patch.object(cli, "idle_baseline", interrupted):
+            code, out, err = run_cli(["compare", "--runs", "1", "--warmup", "0", "--no-track", "--json", "--subtract-idle", "5",
+                                      self.cmd(0), self.cmd(0.01)], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual((code, out), (130, "")); self.assertIn("joules compare: stopped.", err)
+
     def test_power_limit_sweep_cool_down_and_tracking(self):
         nv = FakeNVMLHealth([{"name": "NVIDIA GeForce RTX 3070 Ti", "power_mw": 250_000, "util": (96, 30), "temp": 55}])
         H = board_handler(201, {"id": 1}); srv = _Server(H)
@@ -2772,8 +2957,8 @@ class CompareCli(unittest.TestCase):
             with tempfile.TemporaryDirectory() as t, mock.patch.object(meters, "NVML_FACTORY", lambda: nv), \
                     mock.patch.dict(os.environ, {"JOULES_SYSFS": t, "CUDA_VISIBLE_DEVICES": "0"}):
                 os.environ.pop("JOULES_SIMULATE", None)
-                code, out, err = run_cli(["compare", "--names", "hst,baseline", "--runs", "1", "--warmup", "0", "--limits", "100,50",
-                                          "--cool-to", "60", "--no-cpu", "--quiet", "--json", "--track", "hst-study", "--key", Track.KEY,
+                code, out, err = run_cli(["compare", "--names", "new,baseline", "--runs", "1", "--warmup", "0", "--limits", "100,50",
+                                          "--cool-to", "60", "--no-cpu", "--quiet", "--json", "--track", "study", "--key", Track.KEY,
                                           "--api-url", srv.url, self.cmd(0.6), self.cmd(0.6)])
         finally:
             srv.close()
@@ -2788,8 +2973,8 @@ class CompareCli(unittest.TestCase):
         self.assertAlmostEqual(capped["avg_w"]["median"], 250, delta=5)
         self.assertEqual(r["results"][0]["temp_start_c"], 55)
         sent = [c[2] for c in H.calls]
-        self.assertEqual([s["label"] for s in sent], ["hst @ 100% power", "baseline @ 100% power", "hst @ 50% power", "baseline @ 50% power"])
-        self.assertEqual({s["project"] for s in sent}, {"hst-study"})
+        self.assertEqual([s["label"] for s in sent], ["new @ 100% power", "baseline @ 100% power", "new @ 50% power", "baseline @ 50% power"])
+        self.assertEqual({s["project"] for s in sent}, {"study"})
         self.assertEqual(sent[2]["gpu"]["reason"], "power cap")
         self.assertNotIn("time.sleep", json.dumps(sent))  # commands' arguments never leave the machine
         from joules import compare
@@ -3223,6 +3408,38 @@ class LockClocks(unittest.TestCase):
         self.assertEqual(self.changes(), [["-i", "0", "-lgc", "1590,1590"], ["-i", "0", "-rgc"]])
         self.assertIs(compare.measure, real)
 
+    def test_clocks_and_limits_put_back_when_terminated(self):
+        # kill, timeout or a batch job's time limit sends SIGTERM: the card must not stay locked or capped
+        def terminated(*a, **k):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)  # the handler runs here
+            self.fail("SIGTERM did not stop the comparison")
+        def outer(*_): raise SystemExit("SIGTERM was not handled by joules compare")  # never the default: it would end the tests
+        from joules import compare
+        before = signal.signal(signal.SIGTERM, outer)
+        try:
+            with mock.patch.object(compare, "measure", terminated):
+                (code, _, err), nv = self.compare("--lock-clocks", "1590", "--gpus", "0", "--limits", "50")
+            self.assertIs(signal.getsignal(signal.SIGTERM), outer)  # put back afterwards
+        finally:
+            signal.signal(signal.SIGTERM, before)
+        self.assertEqual(code, 128 + signal.SIGTERM, err); self.assertIn("stopped", err)
+        self.assertEqual(self.changes(), [["-i", "0", "-lgc", "1590,1590"], ["-i", "0", "-rgc"]])
+        self.assertEqual(nv.limits[0], 700_000)
+
+    def test_idle_measured_under_the_same_clocks_before_and_after(self):
+        locked = []  # for each idle reading: were the clocks locked while it was taken
+        real_idle = cli.idle_baseline
+        def idle(ms, secs, iv):
+            ch = self.changes()
+            locked.append(bool(ch) and "-lgc" in ch[-1])
+            return real_idle(ms, secs, iv)
+        with mock.patch.object(cli, "idle_baseline", idle):
+            (code, out, err), _ = self.compare("--lock-clocks", "1590", "--gpus", "0", "--subtract-idle", "0.2")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(locked), 2)
+        self.assertEqual(locked[0], locked[1])
+
     def test_with_power_limits_and_cool_to(self):
         # clocks locked first, then the limits stepped; at 50% the card cannot hold 1590 MHz and the note says so
         (code, out, err), nv = self.compare("--lock-clocks", "1590", "--gpus", "0", "--limits", "100,50", "--cool-to", "60")
@@ -3262,7 +3479,7 @@ class LockClocks(unittest.TestCase):
         self.assertFalse(any("throttled 92% of the time under fp32 but" in n for n in dropped["notes"]))  # the unlocked wording is replaced
         held = summarize([run("fp16", 300 + i, 1588, 0) for i in range(5)] + [run("fp32", 2000 + i, 1590, 0) for i in range(5)],
                          ["fp16", "fp32"], "fp32", locks=lock)[0]
-        self.assertEqual(held["notes"], ["Clocks held at 1590 MHz under every command (the GPU never dropped below the lock), so the "
+        self.assertEqual(held["notes"], ["Clocks held at 1590 MHz under every command (an average SM clock within 3% of the lock), so the "
                                          "difference is the work, not boost or throttling."])
         unlocked = summarize([run("fp16", 300 + i, 1585, 0) for i in range(5)] + [run("fp32", 2000 + i, 1200, 92) for i in range(5)],
                              ["fp16", "fp32"], "fp32")[0]
@@ -3679,3 +3896,1601 @@ class ServeMetricsCli(unittest.TestCase):
                 self.assertGreaterEqual(len(served), 2)
         code, _, err = run_cli(["agent", "--serve-metrics", "localhost:8000", "--track", "cluster", "--key", "lg_test"], {**SIM, "JOULES_PROC": tempfile.mkdtemp()})
         self.assertEqual(code, 2); self.assertIn("--serve-metrics", err)
+
+
+# ---------------------------------------------------------------- 0.9: explain
+
+
+class Explain(unittest.TestCase):
+    """joules explain: why a comparison came out the way it did."""
+
+    @staticmethod
+    def runs(spec):
+        """spec: {name: [(energy_j, duration_s), ...]}; runs rotate positions each round like a fair harness."""
+        names, out = list(spec), []
+        for rnd in range(len(next(iter(spec.values())))):
+            for pos, n in enumerate(names[rnd % len(names):] + names[:rnd % len(names)]):
+                e, t = spec[n][rnd]
+                out.append({"name": n, "energy_j": e, "duration_s": t, "avg_w": e / t, "round": rnd + 1, "position": pos + 1})
+        return out
+
+    def explain(self, spec, baseline=None, facts=None):
+        from joules import explain as ex
+        return ex.explain(ex.from_runs(self.runs(spec), baseline), facts)
+
+    def titles(self, ex_):
+        return [r["title"] for r in ex_["reasons"]]
+
+    def test_saving_split_into_time_and_power(self):
+        # new: same power, half the time -> all of the saving is finishing sooner
+        ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old")
+        r = next(r for r in ex_["reasons"] if r["title"].startswith("new used"))
+        self.assertAlmostEqual(r["numbers"]["energy_pct"], -50); self.assertAlmostEqual(r["numbers"]["time_share"], 1.0)
+        self.assertIn("finishing time", r["detail"])
+        self.assertTrue(ex_["summary"].startswith("new used 50% less energy than old."))
+        # same time, lower power -> the saving is power draw
+        ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(6.0, 1.0)] * 5}, "old")
+        self.assertIn("power draw", next(r for r in ex_["reasons"] if r["title"].startswith("new used"))["detail"])
+
+    def test_noisy_arm_and_too_few_runs(self):
+        ex_ = self.explain({"base": [(10.0, 1.0)] * 3, "noisy": [(5.0, 1.0), (9.0, 1.0), (5.2, 1.0)]}, "base")
+        t = self.titles(ex_)
+        self.assertIn("noisy is not stable yet", t)
+        self.assertIn("too few runs to call any difference real", t)
+        self.assertEqual(ex_["reasons"][0]["severity"], "problem")
+        self.assertIn("listed below", ex_["summary"])
+
+    def test_steady_arms_with_enough_runs_raise_no_problem(self):
+        ex_ = self.explain({"base": [(10.0, 1.0), (10.1, 1.0), (9.9, 1.0), (10.0, 1.01), (10.05, 1.0)],
+                            "new": [(6.0, 0.8), (6.1, 0.8), (5.9, 0.8), (6.0, 0.81), (6.05, 0.8)]}, "base")
+        self.assertEqual([r for r in ex_["reasons"] if r["severity"] == "problem"], [])
+
+    def test_facts_catch_a_workload_that_did_not_run_as_asked(self):
+        facts = {"arms": {"new": {"requested": {"batch_size": 64, "mode": "eager"},
+                                  "actual": {"batch_size": 0, "mode": "eager"}, "hint": "Check the server's batch limit."}}}
+        ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", facts)
+        r = ex_["reasons"][0]
+        self.assertEqual(r["title"], "new: the workload was not what you asked for")
+        self.assertIn("batch_size: asked for 64, got 0 (none at all)", r["detail"]); self.assertIn("Check the server's batch limit.", r["detail"])
+        self.assertNotIn("mode", r["detail"])  # matching facts are not reported
+        ok = {"all": {"requested": {"batch_size": 64}, "actual": {"batch_size": 62}}}  # within 10%
+        self.assertNotIn("workload", " ".join(self.titles(self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", ok))))
+
+    def test_idle_explains_total_against_above_idle(self):
+        from joules import explain as ex
+        runs = self.runs({"old": [(10.0, 1.0)] * 5, "new": [(7.0, 1.0)] * 5})
+        for r in runs:
+            r["idle_w"] = 5.0; r["above_idle_j"] = r["energy_j"] - 5.0   # old 5 J above idle, new 2 J: -60% vs -30% total
+        out = ex.explain(ex.from_runs(runs, "old"))
+        r = next(r for r in out["reasons"] if r["title"] == "why the total and above-idle numbers differ")
+        self.assertIn("total -30%, above idle -60%", r["detail"]); self.assertIn("Idle is about 5 W", r["detail"])
+
+    def test_imported_runs_get_no_compare_flags_for_temperature(self):
+        # runs measured elsewhere: say one side began hotter, but not which joules compare flag would fix it
+        from joules import explain as ex, compare as cmp
+        runs = self.runs({"old": [(10.0, 1.0)] * 5, "new": [(7.0, 1.0)] * 5})
+        for r in runs:
+            r["temp_start_c"] = 70.0 if r["name"] == "old" else 50.0
+        notes = " ".join(n for b in ex.from_runs(runs, "old")["blocks"] for n in b["notes"])
+        self.assertIn("began on a hotter card.", notes); self.assertNotIn("--cool-to", notes)
+        rows = ex.from_runs(runs, "old")["blocks"][0]["rows"]
+        self.assertIn("--cool-to 50", " ".join(cmp.fairness_notes(rows)))   # a joules compare run still names the flag
+
+    def test_cli_csv_facts_and_errors(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["name,energy_j,duration_s,round,position"] + \
+               [f"{n},{e},{t},{k},{p}" for k in (1, 2, 3, 4, 5) for n, e, t, p in (("old", 10, 1, 1), ("new", 5, 0.5, 2), ("mid", 7, 0.7, 3))]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        code, out, err = run_cli(["explain", str(d / "runs.csv"), "--baseline", "old"])
+        self.assertEqual(code, 0, err); self.assertIn("new used 50% less energy than old.", out)
+        self.assertIn("always ran in the same order", out)  # three arms, always old, new, mid
+        (d / "facts.json").write_text(json.dumps({"all": {"requested": {"n": 4}, "actual": {"n": 0}}}), encoding="utf-8")
+        code, out, _ = run_cli(["explain", str(d / "runs.csv"), "--facts", str(d / "facts.json"), "--json"])
+        self.assertEqual(code, 0); self.assertEqual(json.loads(out)["reasons"][0]["severity"], "problem")
+        (d / "bad.csv").write_text("name,energy_j\nold,1\n", encoding="utf-8")
+        self.assertEqual(run_cli(["explain", str(d / "bad.csv")])[0], 2)
+        (d / "one.csv").write_text("name,energy_j,duration_s\nold,1,1\nold,1,1\n", encoding="utf-8")
+        self.assertEqual(run_cli(["explain", str(d / "one.csv")])[0], 2)
+        (d / "badfacts.json").write_text("[1]", encoding="utf-8")
+        self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--facts", str(d / "badfacts.json")])[0], 2)
+        self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--baseline", "zzz"])[0], 2)
+
+    def test_compare_explain_end_to_end(self):
+        sleep = '"{py}" -c "import time; time.sleep({s})"'
+        code, out, err = run_cli(["compare", "--names", "fast,slow", "--baseline", "slow", "--runs", "2", "--warmup", "0", "--quiet", "--no-cpu",
+                                  "--json", "--no-track", "--explain", sleep.format(py=sys.executable, s=0.1), sleep.format(py=sys.executable, s=0.6)],
+                                 {"JOULES_SIMULATE": "gpu:RTX 3070 Ti:200"})
+        self.assertEqual(code, 0, err)
+        ex_ = json.loads(out)["explain"]
+        self.assertTrue(ex_["summary"].startswith("fast used"))
+        fast = next(r for r in ex_["reasons"] if r["title"].startswith("fast used"))
+        self.assertIn("finishing time", fast["detail"])  # simulated GPU: same power, so the saving is all time
+        d = Path(tempfile.mkdtemp()); (d / "f.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(run_cli(["compare", "--facts", str(d / "f.json"), "--no-track", "a", "b"],
+                                 {"JOULES_SIMULATE": "gpu:X:100"})[0], 2)  # a bad facts file fails before any run
+
+    # ---- review fixes
+
+    def test_split_matches_the_headline_even_when_power_varies(self):
+        # per-run power varies, so median(t) x median(P) != median(E); the split must still equal the quoted change
+        ex_ = self.explain({"old": [(10.0, 1.0), (12.0, 1.1), (11.0, 1.05), (9.0, 0.95), (10.5, 1.0)],
+                            "new": [(6.0, 0.7), (7.5, 0.8), (6.2, 0.9), (6.9, 0.75), (6.4, 0.72)]}, "old")
+        r = next(r for r in ex_["reasons"] if r["title"].startswith("new used"))
+        self.assertAlmostEqual(r["numbers"]["energy_pct"], (6.4 - 10.5) / 10.5 * 100, places=6)
+        self.assertAlmostEqual(r["numbers"]["time_j"] + r["numbers"]["power_j"], 6.4 - 10.5, places=6)  # symmetric split, no leftover
+        self.assertIn(f"{abs(r['numbers']['energy_pct']):.0f}% less", ex_["summary"])
+
+    def test_good_news_notes_are_not_problems_and_every_power_limit_is_explained(self):
+        from joules import explain as ex
+        runs = []
+        for lim, (eo, en) in ((100, (10.0, 6.0)), (70, (8.0, 7.0))):
+            for k in range(5):
+                for pos, (n, e) in enumerate((("old", eo), ("new", en)) if k % 2 == 0 else (("new", en), ("old", eo))):
+                    runs.append({"name": n, "energy_j": e, "duration_s": 1.0, "avg_w": e, "round": k + 1, "position": pos + 1, "limit_pct": lim})
+        rep = ex.from_runs(runs, "old")
+        rep["blocks"][0]["notes"] = ["Clocks held at 1590 MHz under every command (the GPU never dropped below the lock), so the difference is the work."]
+        out = ex.explain(rep)
+        self.assertEqual([r for r in out["reasons"] if r["severity"] == "problem"], [])
+        self.assertTrue(any(r["title"].startswith("at 70% power: new used") for r in out["reasons"]))
+        self.assertTrue(any(r["title"].startswith("at 100% power: new used") for r in out["reasons"]))
+
+    def test_facts_for_an_unknown_arm_or_a_missing_actual(self):
+        with self.assertRaises(ValueError):
+            self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", {"arms": {"nwe": {"requested": {"x": 1}, "actual": {"x": 1}}}})
+        ex_ = self.explain({"old": [(10.0, 1.0)] * 5, "new": [(5.0, 0.5)] * 5}, "old", {"arms": {"new": {"requested": {"x": 1}, "actual": {}}}})
+        self.assertIn("x: asked for 1, but the facts give no actual value", ex_["reasons"][0]["detail"])
+
+    def test_power_only_meters_and_unknown_order_are_said(self):
+        from joules import explain as ex
+        rep = {"kind": "compare", "names": ["old", "new"], "baseline": "old", "blocks": None,
+               "results": [{"name": n, "energy_j": e, "duration_s": 1.0, "avg_w": e, "round": k, "position": 1 if n == "old" else 2}
+                           for k in (1, 2, 3, 4, 5) for n, e in (("old", 10.0), ("new", 6.0))]}
+        from joules.compare import summarize
+        rep["blocks"] = summarize(rep["results"], rep["names"], "old")
+        self.assertIn("power only", [r["title"] for r in ex.explain(rep)["reasons"]])
+        rows = [{"name": n, "energy_j": e, "duration_s": 1.0} for n, e in (("old", 10.0), ("new", 6.0))] * 5
+        self.assertIn("run order unknown", [r["title"] for r in ex.explain(ex.from_runs([dict(r) for r in rows], "old"))["reasons"]])
+
+    def test_strict_and_the_arm_column(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["arm,energy_j,duration_s,round,position"] + [f"{n},{e},1,{k},{p}" for k in (1, 2, 3) for n, e, p in (("old", 10, 1), ("new", 5, 2))]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        code, out, err = run_cli(["explain", str(d / "runs.csv")])
+        self.assertEqual(code, 0, err); self.assertIn("new used 50% less energy than old.", out)
+        self.assertEqual(run_cli(["explain", "--strict", str(d / "runs.csv")])[0], 3)  # 3 runs: too few for any difference to count
+        from joules import explain as ex  # two arms in A B A B order are fair: no order problem
+        two = ex.explain(ex.from_runs([{"name": n, "energy_j": e, "duration_s": 1.0, "round": k, "position": p}
+                                       for k in range(1, 6) for n, e, p in (("old", 10.0, 1), ("new", 6.0, 2))], "old"))
+        self.assertNotIn("the commands always ran in the same order", [r["title"] for r in two["reasons"]])
+
+
+class Fit(unittest.TestCase):
+    """joules fit: energy = fixed + per-unit x workload, the break-even and predictions."""
+
+    @staticmethod
+    def runs(levels, noise=0.0):
+        # new: 100 J fixed + 2 J per unit; old: 20 J fixed + 10 J per unit -> break-even at x = 10
+        out = []
+        for x in levels:
+            for k in range(5):
+                d = noise * (k - 2)
+                out.append({"name": "new", "x": x, "energy_j": 100 + 2 * x + d, "duration_s": 1.0, "avg_w": 1.0})
+                out.append({"name": "old", "x": x, "energy_j": 20 + 10 * x - d, "duration_s": 1.0, "avg_w": 1.0})
+        return out
+
+    def test_break_even_and_why(self):
+        from joules import explain as ex
+        f = ex.fit(self.runs([5, 15, 30], noise=0.5), "load", "old", [4, 30])
+        c = f["crossovers"]["energy_j"]["new"]
+        self.assertAlmostEqual(c["x"], 10.0, places=6); self.assertEqual(c["wins"], "above"); self.assertTrue(c["inside"])
+        self.assertAlmostEqual(c["extra_fixed_j"], 80); self.assertAlmostEqual(c["saved_per_unit_j"], 8)
+        self.assertGreater(f["fits"]["energy_j"]["new"]["r2"], 0.99)
+        self.assertEqual(f["notes"], [])  # three levels, a straight line, break-even inside the range
+        at4 = f["at"][0]["energy_j"]; self.assertAlmostEqual(at4["new"], 108); self.assertAlmostEqual(at4["old"], 60)
+        text = ex.render_fit(f)
+        self.assertIn("new beats old above load ≈ 10", text); self.assertIn("starts 80 J higher but rises 8 J less per 1 load", text)
+        self.assertIn("load = 4:  old 60 J;  new 108 J (+80%)   [outside the measured range: no data there]", text)  # 4 is below the measured 5
+
+    def test_two_levels_and_extrapolation_are_flagged(self):
+        from joules import explain as ex
+        f = ex.fit(self.runs([20, 40]), "load", "old")
+        self.assertIsNone(f["fits"]["energy_j"]["new"]["r2"])
+        self.assertTrue(any("Only two values" in n for n in f["notes"]))
+        self.assertTrue(any("outside the measured range" in n for n in f["notes"]))
+
+    def test_errors(self):
+        from joules import explain as ex
+        with self.assertRaises(ValueError):
+            ex.fit(self.runs([20]), "load", "old")
+        with self.assertRaises(ValueError):
+            ex.fit(self.runs([20, 40]), "load", "zzz")
+        with self.assertRaises(ValueError):
+            ex.load_points(["x.txt"], "load")
+
+    def test_cli_with_csv_and_reports(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["name,energy_j,duration_s,load"] + [f"{r['name']},{r['energy_j']},1,{r['x']}" for r in self.runs([5, 15, 30])]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        code, out, err = run_cli(["fit", "--x", "load", "--baseline", "old", "--at", "8", str(d / "runs.csv")])
+        self.assertEqual(code, 0, err); self.assertIn("new beats old above load ≈ 10", out)
+        from joules import explain as ex
+        for x in (10, 40):  # whole compare reports, one per workload value
+            rep = ex.from_runs([dict(r) for r in self.runs([x]) if True], "old")
+            (d / f"r{x}.json").write_text(json.dumps(rep), encoding="utf-8")
+        code, out, err = run_cli(["fit", "--x", "load", "--json", f"10={d / 'r10.json'}", f"40={d / 'r40.json'}"])
+        self.assertEqual(code, 0, err); f = json.loads(out)
+        self.assertEqual(f["baseline"], "old"); self.assertAlmostEqual(f["crossovers"]["energy_j"]["new"]["x"], 10.0, places=6)
+        self.assertEqual(run_cli(["fit", "--x", "load", "--at", "abc", str(d / "runs.csv")])[0], 2)
+        self.assertEqual(run_cli(["fit", "--x", "nope", str(d / "runs.csv")])[0], 2)
+
+
+class ExplainChecks(unittest.TestCase):
+    """joules explain --checks: the user's own workload checks."""
+
+    def test_checks_run_first_and_a_broken_check_is_reported(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "c.py").write_text(textwrap.dedent('''
+            def check(report, facts):
+                if facts.get("all", {}).get("workers") == 0:
+                    return [{"severity": "problem", "title": "no workers ran", "detail": "workers = 0"}]
+                return []
+        '''), encoding="utf-8")
+        (d / "bad.py").write_text("def check(report, facts):\n    raise RuntimeError('boom')\n", encoding="utf-8")
+        (d / "nocheck.py").write_text("x = 1\n", encoding="utf-8")
+        rows = ["name,energy_j,duration_s,round,position"] + [f"{n},{e},1,{k},{p}" for k in (1, 2, 3, 4, 5)
+                                                             for n, e, p in ((("old", 10, 1), ("new", 5, 2)) if k % 2 else (("new", 5, 1), ("old", 10, 2)))]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        (d / "f.json").write_text(json.dumps({"all": {"workers": 0}}), encoding="utf-8")
+        code, out, err = run_cli(["explain", str(d / "runs.csv"), "--baseline", "old", "--facts", str(d / "f.json"),
+                                  "--checks", str(d / "c.py"), "--checks", str(d / "bad.py"), "--json"])
+        self.assertEqual(code, 0, err)
+        r = json.loads(out)["reasons"]
+        self.assertEqual((r[0]["title"], r[0]["severity"]), ("no workers ran", "problem"))
+        self.assertTrue(any(x["title"].startswith("check ") and "boom" in x["detail"] for x in r))
+        self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "nocheck.py")])[0], 2)
+        from joules import explain as ex  # extra CSV columns reach the checks as run["fields"]
+        (d / "x.csv").write_text("name,energy_j,duration_s,steps\nold,1,1,100\nnew,1,1,99\n", encoding="utf-8")
+        self.assertEqual(ex.read_csv(str(d / "x.csv"))[0]["fields"], {"steps": "100"})
+        self.assertEqual(run_cli(["explain", str(d / "runs.csv"), "--checks", str(d / "missing.py")])[0], 2)
+
+
+class MannWhitneyFloor(unittest.TestCase):
+    def test_tied_samples_never_beat_the_exact_floor(self):
+        from joules.compare import mann_whitney, min_p
+        self.assertAlmostEqual(mann_whitney([5, 5, 5], [10, 10, 10]), min_p(3, 3))  # was 0.047 from the approximation
+        self.assertLess(mann_whitney([5] * 7, [10] * 7), 0.01)                       # enough runs can still be significant
+
+
+class CostModelAndRouter(unittest.TestCase):
+    """joules fit --export (a cost model a runtime can pick from) and joules router (the report card)."""
+
+    @staticmethod
+    def runs(levels):
+        # new: 100 + 2x, old: 20 + 10x (break-even 10); auto picks right except at 15 where it picks old
+        out = []
+        for x in levels:
+            for k in range(5):
+                for n, e in (("new", 100 + 2 * x), ("old", 20 + 10 * x)):
+                    out.append({"name": n, "x": x, "energy_j": e + 0.1 * (k - 2), "duration_s": 1.0, "avg_w": 1.0})
+                pick = 20 + 10 * x if x == 15 else min(100 + 2 * x, 20 + 10 * x)
+                out.append({"name": "auto", "x": x, "energy_j": pick + 0.1 * (k - 2), "duration_s": 1.0, "avg_w": 1.0})
+        return out
+
+    def test_export_choose_and_switch_point(self):
+        from joules import explain as ex
+        f = ex.fit([r for r in self.runs([5, 15, 30]) if r["name"] != "auto"], "load", "old")
+        m = ex.export_model(f)
+        self.assertEqual(m["schema"], "joules-costmodel/1"); self.assertEqual(set(m["strategies"]), {"new", "old"})
+        self.assertEqual((ex.choose(m, 4), ex.choose(m, 20)), ("old", "new"))
+        sp = m["switch_points"]; self.assertEqual(len(sp), 1)
+        self.assertAlmostEqual(sp[0]["at"], 10.0, places=6); self.assertEqual((sp[0]["from"], sp[0]["to"], sp[0]["inside"]), ("old", "new", True))
+
+    def test_router_card_regret_and_mix(self):
+        from joules import explain as ex
+        c = ex.router_card(self.runs([5, 15, 30]), "auto")
+        by = {r["x"]: r for r in c["rows"]}
+        self.assertAlmostEqual(by[5]["regret_pct"], 0, places=6); self.assertAlmostEqual(by[30]["regret_pct"], 0, places=6)
+        self.assertAlmostEqual(by[15]["regret_pct"], (170 / 130 - 1) * 100, places=6)   # picked old (170) where new (130) was best
+        self.assertGreater(c["regret_pct"], 0)
+        only_low = ex.router_card(self.runs([5, 15, 30]), "auto", mix={5: 1.0})
+        self.assertAlmostEqual(only_low["regret_pct"], 0, places=6)
+        self.assertLess(c["always"]["old"]["router_vs_pct"], 0)  # the router beats always-old over the mix
+        self.assertIn("Router report card: auto", ex.render_router(c, "load"))
+        with self.assertRaises(ValueError):
+            ex.router_card(self.runs([5]), "nobody")
+        with self.assertRaises(ValueError):
+            ex.router_card(self.runs([5]), "auto", ["zzz"])
+
+    def test_cli_router_and_export(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["name,energy_j,duration_s,load"] + [f"{r['name']},{r['energy_j']},1,{r['x']}" for r in self.runs([5, 15, 30])]
+        (d / "runs.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        code, out, err = run_cli(["router", "--router", "auto", "--x", "load", "--mix", "5:2,15:1,30:1", str(d / "runs.csv")])
+        self.assertEqual(code, 0, err); self.assertIn("regret", out); self.assertIn("vs always old", out)
+        self.assertEqual(run_cli(["router", "--router", "auto", "--mix", "bad", str(d / "runs.csv")])[0], 2)
+        code, _, err = run_cli(["fit", "--x", "load", "--router", "auto", "--baseline", "old", "--export", str(d / "m.json"), str(d / "runs.csv")])
+        self.assertEqual(code, 0, err)
+        m = json.loads((d / "m.json").read_text(encoding="utf-8"))
+        self.assertNotIn("auto", m["strategies"]); self.assertIn("cheapest switches: old → new", err)
+
+
+class BugHuntRegressions(unittest.TestCase):
+    """Bugs found by the November review, each pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def csv(self, name, text):
+        p = self.d / name
+        p.write_text(text, encoding="utf-8")
+        return str(p)
+
+    # ---- explain
+    def test_compare_explain_never_loses_measurements(self):
+        f = self.csv("typo.json", json.dumps({"arms": {"nwe": {"requested": {"b": 1}, "actual": {"b": 1}}}}))
+        out = self.d / "out.json"
+        sleep = f'"{sys.executable}" -c "import time; time.sleep(0.05)"'
+        code, _, err = run_cli(["compare", "--runs", "2", "--warmup", "0", "--quiet", "--no-track", "--facts", f, "--out", str(out), sleep, sleep],
+                               {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 2); self.assertFalse(out.exists())   # rejected before any run, not after
+        self.assertIn("nwe", err)
+
+    def test_zero_baseline_does_not_crash(self):
+        p = self.csv("z.csv", "name,energy_j,duration_s,idle_w\na,50,1,60\na,52,1,60\nb,90,1,60\nb,95,1,60\n")
+        code, out, err = run_cli(["explain", p])
+        self.assertEqual(code, 0, err)
+
+    def test_bad_facts_shapes_are_clean_errors(self):
+        p = self.csv("r.csv", "name,energy_j,duration_s\na,10,1\na,11,1\nb,5,1\nb,6,1\n")
+        for bad in ({"arms": {"b": "x"}}, {"arms": ["b"]}, {"all": 5}, {"arms": {"b": {"requested": [64]}}}):
+            f = self.csv("f.json", json.dumps(bad))
+            self.assertEqual(run_cli(["explain", p, "--facts", f])[0], 2, bad)
+
+    def test_broken_or_chatty_checks(self):
+        p = self.csv("r.csv", "name,energy_j,duration_s\na,10,1\na,11,1\nb,5,1\nb,6,1\n")
+        raise_ = self.csv("c1.py", "def check(report, facts):\n    raise RuntimeError('boom')\n")
+        chatty = self.csv("c2.py", "def check(report, facts):\n    print('checking...')\n    return []\n")
+        string = self.csv("c3.py", "def check(report, facts):\n    return 'all good'\n")
+        syntax = self.csv("c4.py", "def check(report, facts)\n    return []\n")
+        self.assertEqual(run_cli(["explain", p, "--strict", "--checks", raise_])[0], 3)       # a check that didn't run is a problem
+        code, out, _ = run_cli(["explain", p, "--json", "--checks", chatty]); json.loads(out)  # prints don't corrupt --json
+        self.assertIn(run_cli(["explain", p, "--checks", string])[0], (0, 3))                  # no traceback
+        self.assertEqual(run_cli(["explain", p, "--checks", syntax])[0], 2)
+
+    def test_bom_nan_negative_and_partial_too_few_runs(self):
+        bom = self.d / "bom.csv"; bom.write_bytes(b"\xef\xbb\xbfname,energy_j,duration_s\na,10,1\na,11,1\nb,5,1\nb,5.5,1\n")
+        self.assertEqual(run_cli(["explain", str(bom)])[0], 0)
+        for bad in ("nan", "inf", "-5"):
+            self.assertEqual(run_cli(["explain", self.csv("b.csv", f"name,energy_j,duration_s\na,10,1\na,11,1\nb,{bad},1\nb,5,1\n")])[0], 2, bad)
+        rows = ["name,energy_j,duration_s"] + [f"base,{100 + i},1" for i in range(5)] + [f"fast,{70 + i},0.7" for i in range(5)] + ["other,99,1", "other,103,1"]
+        from joules import explain as ex
+        out = ex.explain(ex.load(self.csv("few.csv", "\n".join(rows) + "\n"), "base"))
+        titles = [r["title"] for r in out["reasons"]]
+        self.assertNotIn("too few runs to call any difference real", titles)
+        self.assertIn("too few runs to call other vs base real", titles)
+
+    # ---- fit
+    def test_fit_export_uses_the_headline_basis(self):
+        rows = ["name,energy_j,duration_s,idle_w,load"]
+        for x in (5, 15, 30):
+            for k in range(3):
+                rows.append(f"slow,{110 + 12 * x},{(110 + 12 * x - (10 + 2 * x)) / 50},50,{x}")
+                rows.append(f"fast,{75 + 8.5 * x},{(75 + 8.5 * x - (50 + 6 * x)) / 50},50,{x}")
+        p = self.csv("idle.csv", "\n".join(rows) + "\n")
+        from joules import explain as ex
+        f = ex.fit(ex.load_points([p], "load"), "load", "fast", [20])
+        m = ex.export_model(f)
+        self.assertEqual(m["basis"], "energy_j"); self.assertEqual(ex.choose(m, 20), "fast")
+
+    def test_fit_router_as_report_baseline_and_mixed_limits(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": e, "duration_s": 1.0, "avg_w": e, "_baseline": "auto"}
+                for x in (5, 15, 30) for n, e in (("new", 100 + 2 * x), ("old", 20 + 10 * x))]
+        self.assertIn(ex.fit(runs, "load")["baseline"], ("new", "old"))   # the router was the report's baseline
+        lim = self.d / "lim.json"
+        rep = ex.from_runs([{"name": n, "energy_j": e * s, "duration_s": 1.0, "limit_pct": l}
+                            for l, s in ((100, 1.0), (70, 0.8)) for n, e in (("new", 110), ("old", 70)) for _ in range(2)], "old")
+        lim.write_text(json.dumps(rep), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            ex.load_points([f"5={lim}", f"30={lim}"], "load")
+
+    def test_fit_text_outside_range_and_zero_baseline_prediction(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": e, "duration_s": 1.0, "avg_w": 1.0}
+                for x in (5, 15, 30) for n, e in (("arm", 50 + 2 * x), ("base", 100 + 5 * x))]
+        text = ex.render_fit(ex.fit(runs, "load", "base"))
+        self.assertIn("none in the measured range", text); self.assertNotIn("-50 J higher", text)
+        runs = [{"name": n, "x": x, "energy_j": e, "duration_s": 1.0, "avg_w": 1.0}
+                for x in (1, 2, 3) for n, e in (("old", 10 * x), ("new", 5 + 8 * x))]
+        ex.render_fit(ex.fit(runs, "load", "old", [0]))   # baseline predicts 0 J at 0: no crash
+
+    # ---- router
+    def test_router_card_guards(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": e, "duration_s": 1.0}
+                for x, vals in ((1, (("A", 10), ("B", 20), ("R", 10))), (2, (("A", 30), ("B", 20), ("R", 20))), (4, (("R", 999),)))
+                for n, e in vals for _ in range(2)]
+        c = ex.router_card(runs, "R")
+        self.assertTrue(any("no fixed strategy" in n for n in c["notes"]))          # the R-only workload is not silently dropped
+        for bad in ({1: 0.0, 2: 0.0}, {1: 1.0, 2: -1.0}, {1: float("inf")}):
+            with self.assertRaises(ValueError):
+                ex.router_card(runs, "R", mix=bad)
+        with self.assertRaises(ValueError):
+            ex.router_card(runs, "R", ["R", "A"])                                     # the router can't be its own competitor
+        beat = [{"name": n, "x": 1, "energy_j": e, "duration_s": 1.0} for n, e in (("A", 100), ("B", 120), ("R", 90)) for _ in range(2)]
+        self.assertIn("below the best fixed choice", ex.render_router(ex.router_card(beat, "R")))
+        mixed = [{"name": n, "x": 0, "energy_j": e, "duration_s": 1.0, "fields": {"contract": c}}
+                 for n, e, c in (("R", 10, "exact"), ("A", 9, "exact"), ("B", 5, "approx")) for _ in range(2)]
+        with self.assertRaises(ValueError):
+            ex.router_card(mixed, "R")                                                # different contracts need an explicit --against
+
+
+class BugHuntRegressions2(unittest.TestCase):
+    def test_exact_p_with_ties(self):
+        from joules.compare import mann_whitney
+        self.assertAlmostEqual(mann_whitney([5, 3, 5, 5], [1, 1, 1, 3]), 0.0571, places=3)    # the approximation said 0.0325
+        self.assertAlmostEqual(mann_whitney([1, 2, 2, 2, 1], [4, 3, 2, 5, 2]), 0.0794, places=3)
+
+    def test_bom_facts_and_a_fixed_rotation(self):
+        d = Path(tempfile.mkdtemp())
+        rows = ["name,energy_j,duration_s,round,position"]
+        order = ["c", "base", "a"]
+        for k in range(3):  # rotate one slot per round: base always follows c
+            seq = order[k:] + order[:k]
+            for pos, n in enumerate(seq, 1):
+                rows.append(f"{n},{ {'base': 10, 'a': 6, 'c': 8}[n] + k * 0.1},1,{k + 1},{pos}")
+        (d / "rot.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        (d / "f.json").write_bytes(b"\xef\xbb\xbf" + json.dumps({"all": {"requested": {"x": 1}, "actual": {"x": 1}}}).encode())
+        code, out, err = run_cli(["explain", str(d / "rot.csv"), "--baseline", "base", "--facts", str(d / "f.json"), "--json"])
+        self.assertEqual(code, 0, err)
+        r = next(r for r in json.loads(out)["reasons"] if "right after the same command" in r["title"])
+        # base ran first in round 2 (right after a), so "always" and "in every round" would be false
+        self.assertEqual(r["title"], "the baseline nearly always ran right after the same command")
+        self.assertIn("in 2 of the 3 rounds it ran in, base followed c (it ran first in the other)", r["detail"])
+
+
+class FitRegressions3(unittest.TestCase):
+    """joules fit: bugs found by the second review of fit, break-even wording and --export."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def csv(self, name, text):
+        p = self.d / name
+        p.write_text(text, encoding="utf-8")
+        return str(p)
+
+    @staticmethod
+    def lines(spec, xs=(10, 20, 40)):
+        return [{"name": n, "x": x, "energy_j": f + b * x, "duration_s": 1.0, "avg_w": 1.0} for x in xs for n, f, b in spec]
+
+    def test_break_even_past_one_strategys_last_measurement_is_extrapolated(self):
+        from joules import explain as ex
+        runs = [{"name": "old", "x": x, "energy_j": 20 + 10 * x, "duration_s": 1.0} for x in (5, 15, 30)]
+        runs += [{"name": "new", "x": x, "energy_j": 180 + 2 * x, "duration_s": 1.0} for x in (5, 10, 15)]  # new stops at 15
+        f = ex.fit(runs, "load", "old", [20])
+        c = f["crossovers"]["energy_j"]["new"]
+        self.assertAlmostEqual(c["x"], 20.0, places=6); self.assertFalse(c["inside"]); self.assertEqual(c["range"], [5, 15])
+        text = ex.render_fit(f)
+        self.assertIn("none in the measured range (5–15): new is dearer than old all through it", text)
+        self.assertNotIn("new beats old above", text)
+        self.assertIn("[outside the measured range", text)                       # --at agrees with the headline
+        sp = ex.export_model(f)["switch_points"]
+        self.assertEqual((sp[0]["from"], sp[0]["to"], sp[0]["inside"]), ("old", "new", False))
+        self.assertEqual(ex.export_model(f)["strategies"]["new"]["measured_range"], [5, 15])
+
+    def test_tiny_costs_per_unit_are_not_the_same(self):
+        from joules import explain as ex
+        runs = self.lines((("dense", 50, 1e-12), ("sparse", 60, 0.4e-12)), (1e12, 5e12, 1e13))   # joules per FLOP
+        f = ex.fit(runs, "flops", "dense")
+        c = f["crossovers"]["energy_j"]["sparse"]
+        self.assertAlmostEqual(c["x"] / 1e13, 10 / 0.6e-12 / 1e13, places=6)
+        self.assertNotIn("same cost per unit", ex.render_fit(f))
+        sp = ex.export_model(f)["switch_points"]; self.assertEqual(len(sp), 1); self.assertEqual(sp[0]["to"], "sparse")
+        same = ex.fit(self.lines((("a", 1e6, 1e5), ("b", 1e6, 1e5))), "load", "b")   # identical big lines are still the same
+        self.assertIsNone(same["crossovers"]["energy_j"]["a"]["x"])
+
+    def test_why_wording_for_every_sign(self):
+        from joules import explain as ex
+        why = lambda spec: next(l for l in ex.render_fit(ex.fit(self.lines(spec), "hit_pct", "base")).splitlines() if "why:" in l)
+        self.assertIn("starts 100 J higher but falls 3 J more per 1 hit_pct", why((("new", 900, -5), ("base", 800, -2))))
+        self.assertIn("falls 3 J per 1 hit_pct where base's rises 4 J", why((("new", 500, -3), ("base", 100, 4))))
+        self.assertIn("starts at the same fixed cost and rises 3 J less", why((("new", 100, 2), ("base", 100, 5))))
+        self.assertIn("starts 80 J higher but rises 8 J less", why((("new", 100, 2), ("base", 20, 10))))
+
+    def test_bad_csv_cells_and_non_finite_values_are_clean_errors(self):
+        extra = self.csv("extra.csv", "name,energy_j,duration_s,load\na,1,1,5,\na,2,1,10\nb,3,1,5\nb,4,1,10\n")
+        self.assertEqual(run_cli(["fit", "--x", "load", extra])[0], 0)       # a trailing comma was an AttributeError
+        for bad in ("nan", "inf"):
+            p = self.csv(f"{bad}.csv", f"name,energy_j,duration_s,load\na,1,1,{bad}\na,2,1,10\na,2,1,5\nb,3,1,5\nb,4,1,10\nb,4,1,7\n")
+            self.assertEqual(run_cli(["fit", "--x", "load", p])[0], 2, bad)
+        self.assertEqual(run_cli(["fit", "--x", "load", "--at", "nan", extra])[0], 2)   # --json would print NaN, not JSON
+
+    def test_same_input_spelled_twice_and_same_limit_spelled_twice(self):
+        from joules import explain as ex
+        p = self.csv("r.csv", "name,energy_j,duration_s,load\na,1,1,5\na,2,1,10\nb,3,1,5\nb,4,1,10\n")
+        with self.assertRaises(ValueError):
+            ex.load_points([p, str(Path(p).parent / "." / "r.csv")], "load")
+        rep = ex.from_runs([{"name": n, "energy_j": e, "duration_s": 1.0, "limit_pct": 100} for n, e in (("a", 10), ("b", 20)) for _ in range(2)], "a")
+        (self.d / "lim.json").write_text(json.dumps(rep), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            ex.load_points([f"5={self.d / 'lim.json'}", f"30={self.d / 'lim.json'}"], "load")   # one report at two workloads
+        a = self.csv("a.csv", "name,energy_j,duration_s,limit_pct,load\n" + "".join(f"{n},{e},1,100,30\n" for n, e in (("a", 40), ("b", 30))))
+        b = self.csv("b.csv", "name,energy_j,duration_s,limit_pct,load\n" + "".join(f"{n},{e},1,100.0,60\n" for n, e in (("a", 70), ("b", 40))))
+        self.assertEqual(len(ex.load_points([f"5={self.d / 'lim.json'}", a, b], "load")), 8)   # 100, "100" and "100.0" are one limit
+        c = self.csv("c.csv", "name,energy_j,duration_s,limit_pct,load\na,1,1,70,90\nb,1,1,70,90\n")
+        with self.assertRaises(ValueError):
+            ex.load_points([a, c], "load")
+
+    def test_curve_with_high_r2_is_flagged_and_notes_name_the_basis(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": e, "duration_s": 1.0} for x in (1, 2, 4, 8, 16)
+                for n, e in (("old", 100 + 50 * x), ("new", 20 + 4 * x * x))]
+        f = ex.fit(runs, "batch", "old")
+        self.assertGreater(f["fits"]["energy_j"]["new"]["r2"], 0.9)              # R² alone passes a line that says -66 J at batch 1
+        self.assertTrue(any(n.startswith("new's energy does not follow a straight line") for n in f["notes"]))
+        rows = ["name,energy_j,duration_s,idle_w,batch"] + [f"{n},{e},2,100,{x}" for x in range(1, 7) for _ in range(2)
+                                                             for n, e in (("old", 300 + 50 * x), ("new", 300 + (40 if x % 2 else -40) + 10 * x))]
+        f = ex.fit(ex.load_points([self.csv("z.csv", "\n".join(rows) + "\n")], "batch"), "batch", "old")
+        bent = [n for n in f["notes"] if "straight line" in n]
+        self.assertEqual(len(bent), 2); self.assertEqual(len(set(bent)), 2); self.assertIn("energy above idle", bent[1])
+
+    def test_workload_values_print_without_exponents(self):
+        from joules import explain as ex
+        f = ex.fit(self.lines((("new", 143.5, 0.02), ("old", 20, 0.1)), (500, 1000, 2000, 8000)), "tokens", "old")
+        text = ex.render_fit(f)
+        self.assertIn("new beats old above tokens ≈ 1,544", text); self.assertNotIn("e+03", text)
+
+
+class RouterStatsRegressions(unittest.TestCase):
+    @staticmethod
+    def _brute(x, y):
+        """Twice the smaller tail of U over every split of the pooled runs, ties counted as half: an independent check."""
+        import itertools as it
+        pool, n = list(x) + list(y), len(x)
+        U = lambda a, b: sum((p > q) + 0.5 * (p == q) for p in a for q in b)
+        u0, lo, hi, tot = U(x, y), 0, 0, 0
+        for idx in it.combinations(range(len(pool)), n):
+            rest = [pool[i] for i in range(len(pool)) if i not in idx]
+            u = U([pool[i] for i in idx], rest)
+            tot += 1; lo += u <= u0; hi += u >= u0
+        return min(1.0, 2 * min(lo, hi) / tot)
+
+    def test_exact_tied_matches_brute_force_and_never_goes_below_the_floor(self):
+        import random
+        from joules.compare import mann_whitney, min_p
+        rng = random.Random(7)
+        for _ in range(300):
+            n, m, k = rng.randint(2, 6), rng.randint(2, 6), rng.choice([1, 2, 3, 50])
+            x = [rng.randint(0, k) for _ in range(n)]; y = [rng.randint(0, k) for _ in range(m)]
+            p = mann_whitney(x, y)
+            self.assertAlmostEqual(p, self._brute(x, y), places=12, msg=(x, y))
+            self.assertGreaterEqual(p, min_p(n, m) - 1e-15, (x, y))
+        self.assertAlmostEqual(mann_whitney([5, 5], [1] * 5), min_p(2, 5))      # was 1/21 = 0.048, below the stated floor 2/21
+        self.assertAlmostEqual(mann_whitney([2, 2, 2], [3, 3]), min_p(3, 2))     # was 0.1, floor 0.2
+
+    def test_exact_with_ties_past_20_runs(self):
+        import time
+        from joules.compare import mann_whitney
+        # 2 against 19 (21 runs) with ties: the normal approximation said 0.037, the exact p-value is 0.067
+        x, y = [0, 1], [0, 1, 1] + [2] * 11 + [3] * 5
+        self.assertAlmostEqual(mann_whitney(x, y), 0.0666666, places=5)
+        t = time.perf_counter()
+        self.assertEqual(mann_whitney([3] * 25, [3] * 25), 1.0)
+        self.assertLess(mann_whitney([1] * 25, [2] * 25), 1e-13)
+        self.assertLess(time.perf_counter() - t, 2.0)
+
+    def test_too_few_runs_note_uses_each_pair(self):
+        from joules.compare import summarize
+        run = lambda n, e: {"name": n, "energy_j": e, "duration_s": 1.0, "avg_w": e}
+        b = summarize([run("base", 10.0 + i) for i in range(10)] + [run("new", 1.0 + i) for i in range(3)], ["base", "new"], "base")[0]
+        self.assertLess(b["rows"][1]["vs"]["energy_p"], 0.01)
+        self.assertFalse(any("p cannot go below" in n for n in b["notes"]))     # 3 against 10 can reach 0.007: no "3 runs each" note
+        b = summarize([run("base", 1.0)] * 5 + [run("new", 5.0)] * 2, ["base", "new"], "base")[0]
+        note = next(n for n in b["notes"] if "p cannot go below" in n)
+        self.assertIn("With 2 and 5 runs, p cannot go below 0.10", note)
+        self.assertGreaterEqual(b["rows"][1]["vs"]["energy_p"], 0.095)
+
+    def test_router_contracts_blank_or_partial(self):
+        from joules import explain as ex
+        mk = lambda rows: [{"name": n, "x": 0.0, "energy_j": e, "duration_s": 1.0, **({"fields": {"contract": c}} if c else {})}
+                           for n, e, c in rows for _ in range(2)]
+        with self.assertRaises(ValueError):    # the router's own contract fields are blank, the fixed arms differ: not drop-ins
+            ex.router_card(mk([("R", 10, ""), ("A", 9, "exact"), ("B", 5, "approx")]), "R")
+        with self.assertRaisesRegex(ValueError, "no contract given"):
+            ex.router_card(mk([("R", 10, "exact"), ("A", 9, "")]), "R")
+        first_blank = mk([("R", 10, "")])[:1] + mk([("R", 10, "exact"), ("A", 9, "exact"), ("B", 5, "approx")])
+        with self.assertRaises(ValueError):    # only the router's first row is blank
+            ex.router_card(first_blank, "R")
+        c = ex.router_card(mk([("R", 10, "exact"), ("A", 9, "exact"), ("B", 5, "approx")]), "R", ["A", "B"])
+        self.assertTrue(any("different contracts" in n for n in c["notes"]))
+        with self.assertRaisesRegex(ValueError, "more than one contract"):
+            ex.router_card(mk([("R", 10, "exact"), ("A", 9, "exact")]) + mk([("A", 9, "approx")]), "R", ["A"])
+
+    def test_router_single_workload_and_bad_workload_values(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "one.csv").write_text("name,energy_j,duration_s\nR,10.06,1\nA,10,1\nR,10.06,1\nA,10,1\n", encoding="utf-8")
+        code, out, err = run_cli(["router", "--router", "R", str(d / "one.csv")])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("workload", out); self.assertNotIn("Over the mix", out)    # no made-up "workload 0"
+        self.assertIn("uses 0.6% more energy", out)                                 # as precise as the +0.6% regret
+        self.assertEqual(run_cli(["router", "--router", "R", "--mix", "5:1", str(d / "one.csv")])[0], 2)
+        for bad in ("nan", "inf"):
+            (d / "x.csv").write_text(f"name,energy_j,duration_s,load\nR,10,1,{bad}\nA,9,1,{bad}\nR,10,1,1\nA,9,1,1\n", encoding="utf-8")
+            code, out, err = run_cli(["router", "--router", "R", "--x", "load", "--json", str(d / "x.csv")])
+            self.assertEqual(code, 2, out); self.assertIn("finite", err)
+
+
+class StatsCliRegressions3(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def test_clock_note_is_kept_alongside_the_too_few_runs_note(self):
+        from joules.compare import summarize
+        run = lambda n, e, clock: {"name": n, "energy_j": e, "duration_s": e / 100, "avg_w": 100.0, "devices": {"GPU 0": e},
+                                   "gpu": {"GPU 0": {"clock_pct": clock, "throttled_pct": 0, "temp_c_max": 70}}}
+        notes = summarize([run("a", 100.0 + i, 97) for i in range(3)] + [run("b", 200.0 + i, 70) for i in range(3)], ["a", "b"], "a")[0]["notes"]
+        self.assertTrue(any("p cannot go below" in n for n in notes), notes)
+        self.assertTrue(any("clock differed by more than 10 points" in n for n in notes), notes)   # was dropped with 3 runs
+
+    def test_a_single_run_has_no_p_value_and_says_so(self):
+        from joules.compare import summarize, verdict_line
+        run = lambda n, e: {"name": n, "energy_j": e, "duration_s": 1.0, "avg_w": e}
+        b = summarize([run("a", 10.0), run("b", 20.0)], ["a", "b"], "a")[0]
+        line = verdict_line(b["rows"][1])
+        self.assertNotIn("()", line); self.assertIn("energy +100.0%,", line)
+        self.assertTrue(any("With 1 run each, there is no p-value" in n for n in b["notes"]), b["notes"])
+        self.assertFalse(any("p cannot go below" in n for n in b["notes"]))
+        from joules import explain as ex
+        p = self.d / "one.csv"; p.write_text("name,energy_j,duration_s\na,10,1\nb,20,1\n", encoding="utf-8")
+        out = ex.explain(ex.load(str(p)))
+        few = next(r for r in out["reasons"] if r["title"].startswith("too few runs"))
+        self.assertIn("no p-value", few["detail"]); self.assertNotIn("1 runs", few["detail"])
+        self.assertFalse(any("there is no p-value" in r["detail"] and r["title"].endswith("same conditions") for r in out["reasons"]))
+
+    def test_check_file_printing_at_import_keeps_json_valid(self):
+        csv_ = self.d / "r.csv"; csv_.write_text("name,energy_j,duration_s\na,10,1\na,11,1\nb,5,1\nb,6,1\n", encoding="utf-8")
+        chk = self.d / "c.py"; chk.write_text("print('loading checks')\ndef check(report, facts):\n    return []\n", encoding="utf-8")
+        code, out, err = run_cli(["explain", str(csv_), "--json", "--checks", str(chk)])
+        self.assertEqual(code, 0, err); json.loads(out); self.assertIn("loading checks", err)
+
+    def test_unwritable_compare_outputs_fail_before_any_run(self):
+        sleep = f'"{sys.executable}" -c "import time; time.sleep(0.01)"'
+        (self.d / "f").write_text("x", encoding="utf-8")
+        for opt, path in (("--out", self.d / "f" / "r.json"), ("--csv", self.d), ("--markdown", self.d / "f" / "no" / "r.md")):
+            code, _, err = run_cli(["compare", "--runs", "2", "--warmup", "0", "--quiet", "--no-track", opt, str(path), sleep, sleep],
+                                   {"JOULES_SIMULATE": "gpu:X:100"})
+            self.assertEqual(code, 2, err); self.assertIn(f"cannot write {opt}", err); self.assertNotIn("run 1 of", err)
+
+    def test_fit_export_to_a_bad_path_is_a_clean_error(self):
+        p = self.d / "f.csv"
+        p.write_text("name,energy_j,duration_s,load\na,10,1,1\na,11,1,1\nb,5,1,1\nb,6,1,1\na,20,1,10\na,21,1,10\nb,25,1,10\nb,26,1,10\n", encoding="utf-8")
+        code, _, err = run_cli(["fit", "--x", "load", str(p), "--export", str(self.d / "missing" / "m.json")])
+        self.assertEqual(code, 2, err); self.assertIn("could not write --export", err)
+
+    def test_report_with_bad_run_values_is_a_clean_error(self):
+        def rep(e):
+            return {"kind": "compare", "names": ["a", "b"], "baseline": "a", "blocks": [{"limit_pct": None, "rows": []}],
+                    "results": [{"name": n, "energy_j": e if n == "a" else 5, "duration_s": 1} for n in "ab" for _ in range(2)]}
+        good = self.d / "good.json"; good.write_text(json.dumps(rep(12)), encoding="utf-8")
+        for i, e in enumerate(("10", None, float("nan"))):
+            f = self.d / f"bad{i}.json"; f.write_text(json.dumps(rep(e)), encoding="utf-8")
+            for argv in (["fit", "--x", "load", f"1={f}", f"5={good}"], ["router", "--router", "a", "--x", "l", f"1={f}"],
+                         ["explain", "--json", "--baseline", "b", str(f)]):
+                code, out, err = run_cli(argv)
+                self.assertEqual(code, 2, (argv, out, err)); self.assertIn("energy_j", err)
+
+
+class ExplainRegressions4(unittest.TestCase):
+    """Round 3 of the explain review: each bug pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def file(self, name, text):
+        p = self.d / name
+        p.write_text(text, encoding="utf-8")
+        return str(p)
+
+    def test_small_changes_are_not_rounded_to_0_percent(self):
+        rows = "".join(f"a,{10 + i * 0.01},1\nb,{9.97 + i * 0.001},1\n" for i in range(5))
+        code, out, err = run_cli(["explain", self.file("small.csv", "name,energy_j,duration_s\n" + rows)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("b used 0.5% less energy than a.", out); self.assertIn("against a: b -0.5%", out)   # was "0% less"
+        code, out, _ = run_cli(["explain", self.file("same.csv", "name,energy_j,duration_s\na,10,1\na,10,1\nb,10,1\nb,10,1\n")])
+        self.assertIn("b used about the same energy as a.", out); self.assertNotIn("0% more", out)
+
+    def test_a_single_run_has_no_p_value_to_quote(self):
+        from joules.compare import summarize, verdict_line
+        code, out, err = run_cli(["explain", self.file("one.csv", "name,energy_j,duration_s\na,10,1\nb,5,1\n")])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("1 runs", out); self.assertNotIn("smallest p-value possible is 1", out)
+        self.assertIn("with only 1 run of a command there is no p-value at all", out)
+        b = summarize([{"name": n, "energy_j": e, "duration_s": 1.0, "avg_w": e} for n, e in (("a", 10.0), ("b", 5.0))], ["a", "b"], "a")[0]
+        self.assertTrue(b["notes"][0].startswith("With 1 run each, there is no p-value"), b["notes"])
+        self.assertNotIn("()", verdict_line(b["rows"][1]))                        # was "energy -50.0% ()"
+
+    def test_summary_comes_from_the_first_power_limit_with_the_baseline(self):
+        rows = ["name,limit_pct,energy_j,duration_s"]
+        for k in range(5):
+            rows += [f"b,100,{8 + k * 0.01},1", f"c,100,{9 + k * 0.01},1", f"a,50,{10 + k * 0.01},1", f"b,50,{6 + k * 0.01},1"]
+        code, out, err = run_cli(["explain", self.file("lim.csv", "\n".join(rows) + "\n"), "--baseline", "a"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Nothing to compare", out)
+        self.assertIn("At 50% power, b used 40% less energy than a.", out)
+
+    def test_runs_that_did_not_alternate_are_not_said_to(self):
+        rows = ["name,energy_j,duration_s,temp_start_c,round,position"]
+        for i, (n, e, t) in enumerate([(n, e + k * 0.01, t) for n, e in (("old", 10), ("new", 6))
+                                       for k, t in enumerate((45, 52, 58, 62, 64))], 1):
+            rows.append(f"{n},{e},1,{t},1,{i}")   # every old run, then every new run
+        code, out, err = run_cli(["explain", self.file("seq.csv", "\n".join(rows) + "\n")])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("since they alternate", out); self.assertIn("alike for every command", out)
+
+    def test_clock_note_is_not_hidden_by_the_too_few_runs_note(self):
+        from joules.compare import summarize
+        runs = [{"name": n, "energy_j": e + i * 0.01, "duration_s": 1.0, "avg_w": e, "limit_pct": None,
+                 "gpu": {"G": {"clock_pct": c, "throttled_pct": 0}}} for i in range(3) for n, e, c in (("old", 10, 60), ("new", 6, 95))]
+        notes = summarize(runs, ["old", "new"], "old")[0]["notes"]
+        self.assertTrue(any("p cannot go below" in n for n in notes))
+        self.assertTrue(any("clock differed by more than 10 points" in n for n in notes), notes)
+
+    def test_power_only_note_does_not_deny_the_start_temperatures(self):
+        from joules import explain as ex
+        from joules.compare import summarize
+        runs = [{"name": n, "energy_j": e + k * 0.01, "duration_s": 1.0, "avg_w": e, "round": k + 1, "position": p, "limit_pct": None,
+                 "temp_start_c": t} for k in range(5) for p, (n, e, t) in enumerate((("old", 10, 50 + 20 * (k % 2)), ("new", 6, 70 - 20 * (k % 2))), 1)]
+        rep = {"kind": "compare", "names": ["old", "new"], "baseline": "old", "order": "alternating", "results": runs,
+               "blocks": summarize(runs, ["old", "new"], "old")}
+        out = ex.explain(rep)
+        self.assertTrue(any("°C" in r["detail"] for r in out["reasons"]))          # the start temperatures were checked
+        note = next(r for r in out["reasons"] if r["title"] == "power only")
+        self.assertNotIn("temperature or throttling", note["detail"])
+
+    def test_unreadable_inputs_are_clean_errors(self):
+        big = '"' + "x" * 200_000 + '"'
+        bad = self.file("big.csv", f"name,energy_j,duration_s,load,log\na,1,1,1,{big}\nb,1,1,1,\na,2,1,2,\nb,2,1,2,\n")
+        for argv in (["explain", bad], ["fit", "--x", "load", bad], ["router", "--router", "a", bad]):
+            code, _, err = run_cli(argv)
+            self.assertEqual(code, 2, argv); self.assertIn("field limit", err)
+        deep = "[" * 100_000 + "]" * 100_000
+        self.assertEqual(run_cli(["explain", self.file("deep.json", deep)])[0], 2)
+        facts = self.file("deep_facts.json", '{"arms": ' + deep + "}")
+        r = self.file("r.csv", "name,energy_j,duration_s\na,10,1\na,11,1\nb,5,1\nb,6,1\n")
+        self.assertEqual(run_cli(["explain", r, "--facts", facts])[0], 2)
+        code, _, err = run_cli(["compare", "--facts", facts, "--no-track", "true", "true"], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 2); self.assertIn("nested too deeply", err)
+
+    def test_notes_are_observations_not_instructions(self):
+        from joules import explain as ex
+        from joules.compare import idle_above, summarize
+        gpu = lambda thr, clk, mem: {"G": {"throttled_pct": thr, "clock_pct": clk, "mem_util_pct": mem, "sm_clock_mhz": 1000}}
+        texts = []
+        for g_old, g_new, locks, cool in ((gpu(60, 80, 80), gpu(0, 95, 40), None, None), (gpu(0, 60, 80), gpu(0, 95, 40), None, None),
+                                          (gpu(0, 90, 80), gpu(0, 90, 40), {"G": 1500}, None)):
+            for temps in ((50, 70), (70, 50)):
+                for cool in (None, 60):
+                    runs = [{"name": n, "energy_j": e + k * 0.01, "duration_s": 1.0, "avg_w": e, "round": k + 1, "position": p,
+                             "limit_pct": None, "gpu": g, "temp_start_c": temps[(k + p) % 2] if n == "old" else [45, 70][k % 2]}
+                            for k in range(5) for p, (n, e, g) in enumerate((("old", 10, g_old), ("new", 6, g_new)), 1)]
+                    rep = {"kind": "compare", "names": ["old", "new"], "baseline": "old", "order": "alternating", "results": runs,
+                           "blocks": summarize(runs, ["old", "new"], "old", cool, locks)}
+                    texts += rep["blocks"][0]["notes"] + [r["detail"] for r in ex.explain(rep)["reasons"]]
+        texts += summarize([{"name": n, "energy_j": 1.0, "duration_s": 1.0, "avg_w": 1.0} for n in ("a", "b")], ["a", "b"], "a")[0]["notes"]
+        texts += idle_above([{"energy_j": 10.0, "duration_s": 1.0}], 10.0, 20.0, 0.0, 1.0)
+        fit = ex.fit([{"name": n, "x": x, "energy_j": e, "duration_s": 1.0} for x in (1, 2, 4, 8, 16)
+                      for n, e in (("old", 100 + 50 * x), ("new", 20 + 4 * x * x))], "load", "old")
+        texts += fit["notes"]
+        self.assertTrue(any("clock differed" in t for t in texts) and any("throttled 60%" in t for t in texts)
+                        and any("memory less busy" in t or "memory busy" in t for t in texts) and any("straight line" in t for t in texts))
+        for t in texts:
+            for phrase in ("Compare again", "Lock lower", "lock the clocks", "add warm-up", "use --runs", "Close other",
+                           "expect it", "treat the"):
+                self.assertNotIn(phrase, t)
+
+
+class ExplainRegressions5(unittest.TestCase):
+    """Round 4 of the explain review: each bug pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def file(self, name, rows):
+        p = self.d / name
+        p.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return str(p)
+
+    def test_summary_does_not_tie_another_arms_problems_to_the_best_arm(self):
+        rows = ["name,energy_j,duration_s"]
+        for k in range(5):
+            rows += [f"a,{100 + k},10", f"b,{80 + k * 10},8", f"c,{60 + k},10"]   # only b is unstable and unclear
+        code, out, err = run_cli(["explain", self.file("other.csv", rows)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("c used 39% less energy than a. 2 problems listed below.", out)
+        self.assertNotIn("affect", out.splitlines()[1])                            # was "2 problems that affect it"
+
+    def test_clocks_below_the_lock_under_every_command_are_not_called_different_conditions(self):
+        from joules import explain as ex
+        from joules.compare import summarize
+        g = {"G": {"sm_clock_mhz": 1200, "clock_pct": 60, "throttled_pct": 90, "throttle_reasons": {"power cap": 1}}}
+        runs = [{"name": n, "energy_j": e + k * 0.01, "duration_s": 1.0, "avg_w": e, "round": k + 1, "position": p, "limit_pct": None,
+                 "gpu": g} for k in range(5) for p, (n, e) in enumerate((("old", 10), ("new", 6)), 1)]
+        rep = {"kind": "compare", "names": ["old", "new"], "baseline": "old", "order": "alternating", "results": runs,
+               "blocks": summarize(runs, ["old", "new"], "old", None, {"G": 1500})}
+        titles = [r["title"] for r in ex.explain(rep)["reasons"]]
+        self.assertIn("the GPU did not hold the locked clock", titles)
+        self.assertNotIn("the commands did not run under the same conditions", titles)
+
+    def test_a_split_beyond_a_float_gives_no_nan_in_json(self):
+        rows = ["name,energy_j,duration_s", "a,1e300,1e-10", "a,1.01e300,1e-10", "b,5e299,2e-10", "b,5.01e299,2e-10",
+                "c,1e-100,1e100", "c,1.01e-100,1e100"]
+        code, out, err = run_cli(["explain", self.file("big.csv", rows), "--baseline", "a", "--json"])
+        self.assertEqual(code, 0, err)
+        json.loads(out, parse_constant=lambda c: self.fail(f"{c} in --json"))   # was "power_j": NaN, "time_j": Infinity
+        code, out, _ = run_cli(["explain", self.file("big2.csv", rows[:1] + rows[5:] + ["d,1e100,1e-100", "d,1.01e100,1e-100"]), "--json"])
+        json.loads(out, parse_constant=lambda c: self.fail(f"{c} in --json"))   # was "power_pct": Infinity
+
+    def test_runs_each_alone_in_their_round_are_not_a_fixed_order(self):
+        rows, k = ["name,energy_j,duration_s,round,position"], 0
+        for i in range(5):
+            for n, e in (("a", 10), ("b", 8), ("c", 9)):
+                k += 1
+                rows.append(f"{n},{e + i * 0.01},1,{k},1")
+        code, out, err = run_cli(["explain", self.file("alone.csv", rows)])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("always ran in the same order", out)
+
+    def test_fixed_order_does_not_claim_warmer_starts_the_temperatures_deny(self):
+        rows = ["name,energy_j,duration_s,round,position,temp_start_c"]
+        for i in range(5):
+            rows += [f"{n},{e + i * 0.01},1,{i + 1},{p},40" for p, (n, e) in enumerate((("a", 10), ("b", 8), ("c", 9)), 1)]
+        code, out, err = run_cli(["explain", self.file("same40.csv", rows)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("always ran in the same order", out)
+        self.assertNotIn("always started on a warmer", out)                         # every run started at 40 °C
+
+
+class ExplainRegressions6(unittest.TestCase):
+    """Round 5 of the explain review: each bug pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def file(self, name, rows):
+        p = self.d / name
+        p.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return str(p)
+
+    def runs(self):
+        rows = ["name,energy_j,duration_s"]
+        for k in range(5):
+            rows += [f"a,{10 + k * 0.01},1", f"b,{8 + k * 0.01},1"]
+        return self.file("r.csv", rows)
+
+    def test_a_check_result_that_cannot_be_read_is_a_failed_check_not_a_traceback(self):
+        chk = self.d / "loop.py"
+        chk.write_text("def check(report, facts):\n    d = {}\n    d['self'] = d\n"
+                       "    return [{'severity': 'note', 'title': 'x', 'numbers': d}]\n", encoding="utf-8")
+        code, out, err = run_cli(["explain", self.runs(), "--checks", str(chk), "--json"])   # was a RecursionError traceback
+        self.assertEqual(code, 0, err)
+        r = json.loads(out)["reasons"][0]
+        self.assertEqual((r["severity"], r["title"]), ("problem", f"check {chk} failed"))
+        self.assertIn("RecursionError", r["detail"])
+
+    def test_a_fall_short_of_all_the_energy_is_not_called_100_percent(self):
+        rows = ["name,energy_j,duration_s"]
+        for k in range(5):
+            rows += [f"a,{2000 + k},200", f"b,{1 + k * 0.01},0.1", f"c,{3 + k * 0.01},0.2"]
+        code, out, err = run_cli(["explain", self.file("far.csv", rows)])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("100% less", out); self.assertNotIn("-100%", out)          # b used 1 J, not none
+        self.assertIn("b used 99.94% less energy than a.", out)
+        self.assertIn("c used 99.84% less energy than a", out)
+
+    def test_microjoule_ranges_are_not_printed_as_0_mj(self):
+        rows = ["name,energy_j,duration_s", "a,0.000002,0.001", "a,0.000004,0.001", "a,0.000003,0.001",
+                "b,0.000002,0.001", "b,0.0000021,0.001", "b,0.0000022,0.001"]
+        code, out, err = run_cli(["explain", self.file("small.csv", rows)])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("0.00 mJ", out)
+        self.assertIn("ranged from 2.00 µJ to 4.00 µJ", out)
+
+    def test_a_fixed_order_is_found_at_a_power_limit_that_left_a_command_out(self):
+        rows, rnd = ["name,energy_j,duration_s,round,position,limit_pct"], 0
+        for lim, arms in ((100, "abcd"), (70, "abc")):
+            for k in range(5):
+                rnd += 1
+                rows += [f"{n},{10 + i + k * 0.01},1,{rnd},{i + 1},{lim}" for i, n in enumerate(arms)]
+        code, out, err = run_cli(["explain", self.file("lim.csv", rows)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("at 100% power: the commands always ran in the same order", out)
+        self.assertIn("at 70% power: the commands always ran in the same order", out)   # d was not run there
+
+    def test_imported_runs_in_a_fixed_order_get_no_compare_flags(self):
+        rows = ["name,energy_j,duration_s,round,position"]
+        for k in range(5):
+            rows += [f"{n},{e + k * 0.01},1,{k + 1},{p}" for p, (n, e) in enumerate((("a", 10), ("b", 8), ("c", 9)), 1)]
+        code, out, err = run_cli(["explain", self.file("fixed.csv", rows)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("always ran in the same order", out)
+        self.assertNotIn("--order abba", out); self.assertNotIn("--cool-to", out)
+
+    def test_a_csv_written_by_joules_compare_is_not_said_to_come_from_elsewhere(self):
+        out_csv = self.d / "c.csv"
+        code, _, err = run_cli(["compare", "--no-track", "--runs", "2", "--warmup", "0", "--quiet", "--csv", str(out_csv),
+                                "true", "true --version"], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 0, err)
+        code, out, err = run_cli(["explain", str(out_csv)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("imported runs", out)
+        self.assertNotIn("measured outside joules compare", out)                   # they were measured by it
+
+
+class FitRouterRegressions4(unittest.TestCase):
+    """joules fit and router: bugs found by the third review."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def put(self, name, text):
+        p = self.d / name
+        p.write_text(text, encoding="utf-8")
+        return str(p)
+
+    def report(self, name, rows):
+        from joules import explain as ex
+        rep = ex.from_runs([{"name": n, "energy_j": e, "duration_s": 1.0} for n, e in rows for _ in range(3)], rows[-1][0])
+        return self.put(name, json.dumps(rep))
+
+    def test_router_notes_name_no_made_up_workload(self):
+        p = self.put("one.csv", "name,energy_j,duration_s\na,10,1\nb,9,1\na,20,1\nb,9,1\na,14,1\nb,9.2,1\n")
+        code, out, err = run_cli(["router", "--router", "a", p])
+        self.assertEqual(code, 0, err)
+        self.assertIn("! the router's runs ranged 71% of their median", out)
+        self.assertNotIn("at 0", out)                                   # these runs have no workload value
+
+    def test_router_plain_report_among_valued_reports_is_an_error(self):
+        a, b = self.report("a.json", [("a", 10), ("b", 9)]), self.report("b.json", [("a", 30), ("b", 20)])
+        code, out, err = run_cli(["router", "--router", "a", f"5={a}", b])
+        self.assertEqual(code, 2, out)                                  # b.json was scored at a made-up workload 0
+        self.assertIn("no workload value", err)
+
+    def test_fit_export_to_unwritable_path_is_a_clean_error(self):
+        p = self.put("f.csv", "name,energy_j,duration_s,load\nnew,100,1,10\nold,50,1,10\nnew,120,1,20\nold,100,1,20\n")
+        code, out, err = run_cli(["fit", "--x", "load", p, "--export", str(self.d / "no" / "such" / "m.json")])
+        self.assertEqual(code, 2); self.assertIn("could not write --export", err)
+
+    def test_fit_export_onto_an_input_is_refused(self):
+        text = "name,energy_j,duration_s,load\nnew,100,1,10\nold,50,1,10\nnew,120,1,20\nold,100,1,20\n"
+        p = self.put("f.csv", text)
+        self.assertEqual(run_cli(["fit", "--x", "load", p, "--export", p])[0], 2)
+        self.assertEqual(Path(p).read_text(encoding="utf-8"), text)    # the runs are still there
+        r = self.report("r.json", [("new", 10), ("old", 9)]); r2 = self.report("r2.json", [("new", 30), ("old", 20)])
+        self.assertEqual(run_cli(["fit", "--x", "load", f"5={r}", f"10={r2}", "--export", r])[0], 2)
+        self.assertEqual(json.loads(Path(r).read_text(encoding="utf-8"))["kind"], "compare")
+
+    def test_fit_values_past_float_range_are_clean_errors(self):
+        big_x = self.put("x.csv", "name,energy_j,duration_s,load\nnew,100,1,1e200\nold,50,1,1e200\nnew,120,1,2e200\nold,100,1,2e200\n")
+        code, out, err = run_cli(["fit", "--x", "load", big_x])           # was an OverflowError traceback
+        self.assertEqual(code, 2); self.assertIn("too large", err)
+        big_e = self.put("e.csv", "name,energy_j,duration_s,load\n" + "".join(
+            f"{n},{e},1,{x}\n" for x, a, b in ((1, 1e308, 1e308), (2, 1.7e308, 1.5e308), (3, 1.7e308, 1.5e308)) for n, e in (("new", a), ("old", b))))
+        code, out, err = run_cli(["fit", "--x", "load", "--json", big_e])  # was NaN in the JSON
+        self.assertEqual(code, 2, out); self.assertIn("too large", err)
+
+    def test_router_totals_past_float_range_are_clean_errors(self):
+        p = self.put("m.csv", "name,energy_j,duration_s,load\na,100,1,10\nb,50,1,10\na,120,1,20\nb,100,1,20\n")
+        code, out, err = run_cli(["router", "--router", "a", "--x", "load", "--mix", "10:1e308,20:1e308", "--json", p])
+        self.assertEqual(code, 0, err)                                  # was NaN and Infinity in the JSON
+        card = json.loads(out, parse_constant=lambda c: self.fail(f"{c} in the JSON"))
+        self.assertAlmostEqual(card["router_j"], 110.0)                 # two equal weights
+
+    def test_bent_line_note_is_an_observation(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": e, "duration_s": 1.0} for x in (1, 2, 4, 8, 16)
+                for n, e in (("old", 100 + 50 * x), ("new", 20 + 4 * x * x))]
+        note = next(n for n in ex.fit(runs, "batch", "old")["notes"] if "straight line" in n)
+        self.assertNotIn("treat", note); self.assertTrue(note.endswith("off the line), so the break-even is rough."), note)
+
+
+class FitRouterRegressions5(unittest.TestCase):
+    """joules fit and router: bugs found by the fourth review."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def put(self, name, text):
+        p = self.d / name
+        p.write_text(text, encoding="utf-8")
+        return str(p)
+
+    def test_router_reads_one_csv_per_command_without_x(self):
+        a = self.put("a.csv", "name,energy_j,duration_s\na,10,1\na,11,1\n")
+        b = self.put("b.csv", "name,energy_j,duration_s\nb,8,1\nb,9,1\n")
+        code, out, err = run_cli(["router", "--router", "a", a, b])
+        self.assertEqual(code, 0, err)                                  # was "explain needs runs of at least two commands"
+        self.assertIn("b 8.50 J", out)
+
+    def test_report_with_null_above_idle_is_read_as_not_measured(self):
+        paths = []
+        for x, (e_new, e_old) in ((1, (10, 20)), (2, (20, 25)), (3, (30, 30))):
+            res = [{"name": n, "energy_j": e, "duration_s": 1.0, "above_idle_j": None} for n, e in (("new", e_new), ("old", e_old)) for _ in range(2)]
+            paths.append(f"{x}=" + self.put(f"r{x}.json", json.dumps(
+                {"kind": "compare", "names": ["new", "old"], "baseline": "old", "results": res, "blocks": [{}]})))
+        code, out, err = run_cli(["fit", "--x", "load", *paths])        # was a TypeError traceback
+        self.assertEqual(code, 0, err); self.assertNotIn("above idle", out)
+        code, out, err = run_cli(["router", "--router", "new", "--above-idle", *paths[:2]])
+        self.assertEqual(code, 0, err); self.assertIn("judged on total energy", out)
+
+    def test_fit_at_too_far_out_is_a_clean_error(self):
+        p = self.put("f.csv", "name,energy_j,duration_s,load\nnew,100,1,10\nold,50,1,10\nnew,120,1,20\nold,100,1,20\n")
+        code, out, err = run_cli(["fit", "--x", "load", "--at", "1e308", "--json", p])
+        self.assertEqual(code, 2, out); self.assertIn("too far", err)   # was Infinity in the JSON
+
+    def test_router_tiny_mix_weight_is_used(self):
+        p = self.put("m.csv", "name,energy_j,duration_s,load\na,0.012,1,1\nb,0.010,1,1\na,0.03,1,2\nb,0.02,1,2\n")
+        code, out, err = run_cli(["router", "--router", "a", "--x", "load", "--mix", "1:5e-324", "--json", p])
+        self.assertEqual(code, 0, err)                                  # was a ZeroDivisionError traceback
+        self.assertAlmostEqual(json.loads(out)["regret_pct"], 20.0)
+
+
+
+class FitRouterRegressions6(unittest.TestCase):
+    """joules fit and router: bugs found by the fifth review."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def put(self, name, text):
+        p = self.d / name
+        p.write_text(text, encoding="utf-8")
+        return str(p)
+
+    def test_edited_report_with_odd_names_or_fields_is_a_clean_error(self):
+        def report(name, fields):
+            res = [{"name": n, "energy_j": e, "duration_s": 1.0} for n, e in (("a", 10), ("b", 12), ("a", 11), ("b", 13))]
+            res[0]["name"], res[0]["fields"] = name, fields
+            return json.dumps({"kind": "compare", "names": ["a", "b"], "baseline": "b", "results": res, "blocks": [{}]})
+        ok = self.put("ok.json", report("a", None))
+        for i, (name, fields) in enumerate(((["a"], None), (5, None), ("a", "text"))):
+            p = self.put(f"e{i}.json", report(name, fields))
+            for argv in (["fit", "--x", "load", f"1={p}", f"2={ok}"], ["router", "--router", "a", p]):
+                code, out, err = run_cli(argv)                          # was a TypeError or AttributeError traceback
+                self.assertEqual(code, 2, out); self.assertIn("run 1", err)
+        p = self.put("c.json", report("a", {"contract": 5}))
+        code, out, err = run_cli(["router", "--router", "a", p])        # a contract that is a number, not text
+        self.assertEqual(code, 2, out); self.assertIn("contract", err)
+
+    def test_fit_workloads_too_close_together_are_a_clean_error(self):
+        p = self.put("t.csv", "name,energy_j,duration_s,load\na,10,1,1e-200\na,12,1,2e-200\nb,5,1,1e-200\nb,20,1,2e-200\n")
+        code, out, err = run_cli(["fit", "--x", "load", p])            # was a ZeroDivisionError traceback
+        self.assertEqual(code, 2, out); self.assertIn("differ by too little", err)
+
+    def test_break_even_just_under_1000_prints_without_an_exponent(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": a + b * x, "duration_s": 1.0} for x in (500, 1000, 1500)
+                for n, a, b in (("new", 1999.7, 1.0), ("old", 0.0, 3.0))]  # lines cross at 999.85
+        text = ex.render_fit(ex.fit(runs, "load", "old"))
+        self.assertIn("new beats old above load ≈ 1,000", text); self.assertNotIn("e+03", text)
+
+class FitRouterRegressions7(unittest.TestCase):
+    """joules fit and router: bugs found by the sixth review."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def put(self, name, text):
+        p = self.d / name
+        p.write_text(text, encoding="utf-8")
+        return str(p)
+
+    def test_power_limit_as_the_workload_is_not_refused(self):
+        p = self.put("l.csv", "name,energy_j,duration_s,limit_pct\na,100,1,100\nb,90,1,100\na,80,1,80\nb,85,1,80\na,70,1,70\nb,80,1,70\n")
+        code, out, err = run_cli(["fit", "--x", "limit_pct", p])       # was "measured at more than one GPU power limit"
+        self.assertEqual(code, 0, err); self.assertIn("Break-even: a beats b below limit_pct", out)
+        code, out, err = run_cli(["router", "--router", "a", "--x", "limit_pct", p])
+        self.assertEqual(code, 0, err)
+        q = self.put("m.csv", "name,energy_j,duration_s,limit_pct,load\na,10,1,100,1\nb,9,1,100,1\na,20,1,70,2\nb,19,1,70,2\n")
+        self.assertEqual(run_cli(["fit", "--x", "load", q])[0], 2)     # a limit that moves with another workload still is
+
+    def test_no_break_even_names_the_command(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": a + 2 * x + j, "duration_s": 1.0} for x in (10, 20, 30) for j in (-1, 1)
+                for n, a in (("p", 50), ("q", 80), ("base", 50))]
+        text = ex.render_fit(ex.fit(runs, "load", "base"))             # was "none. same cost per unit ..." with no name
+        self.assertIn("Break-even: none between p and base. Same cost per unit and same fixed cost", text)
+        self.assertIn("Break-even: none between q and base. Same cost per unit: base is always cheaper", text)
+
+    def test_at_percentages_are_not_rounded_to_0_or_100(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": e(x), "duration_s": 1.0} for x in (10, 20, 30)
+                for n, e in (("p", lambda x: 1003 + 10 * x), ("q", lambda x: 2000 - 66.6 * x), ("base", lambda x: 1000 + 10 * x))]
+        text = ex.render_fit(ex.fit(runs, "load", "base", [30]))     # was "(+0%)" and "(-100%)"
+        self.assertIn("p 1,303 J (+0.2%)", text); self.assertIn("q 2 J (-99.84%)", text)
+
+    def test_same_energy_at_every_workload_fits_perfectly(self):
+        from joules import explain as ex
+        runs = [{"name": n, "x": x, "energy_j": e, "duration_s": 1.0} for x in (10, 20, 30) for _ in range(2)
+                for n, e in (("p", 123.4), ("base", 5.0 * x))]
+        self.assertEqual(ex.fit(runs, "load", "base")["fits"]["energy_j"]["p"]["r2"], 1.0)  # was 0.0 from rounding
+
+
+class FitRouterRegressions8(unittest.TestCase):
+    """joules fit and router: bugs found by the seventh review."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def report(self, name, runs):
+        from joules import explain as ex
+        p = self.d / name
+        p.write_text(json.dumps(ex.from_runs(runs, "b")), encoding="utf-8")
+        return str(p)
+
+    def test_report_saved_without_a_json_name_is_read_as_a_report(self):
+        paths = [f"{x}=" + self.report(f"r{x}.out", [{"name": n, "energy_j": e, "duration_s": 1.0} for n, e in (("a", ea), ("b", eb)) for _ in range(2)])
+                 for x, (ea, eb) in ((1, (10, 20)), (2, (20, 25)), (3, (30, 30)))]
+        code, out, err = run_cli(["fit", "--x", "load", *paths])          # was "give VALUE=report.json ..."
+        self.assertEqual(code, 0, err); self.assertIn("a beats b below load ≈ 3", out)
+        code, out, err = run_cli(["router", "--router", "a", paths[0].split("=", 1)[1]])  # was read as a CSV
+        self.assertEqual(code, 0, err); self.assertIn("b 20.00 J", out)
+        code, out, err = run_cli(["router", "--router", "a", "--mix", "1:1,2:1", *paths[:2]])  # was "no workload value"
+        self.assertEqual(code, 0, err); self.assertIn("-33.3%", out)
+
+    def test_power_limit_as_the_workload_from_one_report_with_several_limits(self):
+        p = self.report("lim.json", [{"name": n, "energy_j": e, "duration_s": 1.0, "limit_pct": lim}
+                                     for lim, (ea, eb) in ((100, (10, 20)), (85, (14, 21)), (70, (30, 22)))
+                                     for n, e in (("a", ea), ("b", eb)) for _ in range(2)])
+        code, out, err = run_cli(["fit", "--x", "limit_pct", p])        # was "give VALUE=report.json ...", which then failed too
+        self.assertEqual(code, 0, err); self.assertIn("a beats b above limit_pct ≈ 80", out)
+        code, out, err = run_cli(["router", "--router", "a", "--x", "limit_pct", p])
+        self.assertEqual(code, 0, err); self.assertIn("+36.4%", out)
+
+
+class FitRouterRegressions9(unittest.TestCase):
+    """joules fit and router: bugs found by the eighth review."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def report(self, path, ea, eb):
+        from joules import explain as ex
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(ex.from_runs([{"name": n, "energy_j": e, "duration_s": 1.0} for n, e in (("a", ea), ("b", eb)) for _ in range(2)], "b")),
+                        encoding="utf-8")
+        return str(path)
+
+    def test_a_report_path_with_an_equals_sign_is_a_path(self):
+        p = self.report(self.d / "set=1" / "r.json", 10, 20)
+        code, out, err = run_cli(["router", "--router", "a", p])        # was "write the workload value before '='"
+        self.assertEqual(code, 0, err); self.assertIn("-50.0%", out)
+        code, out, err = run_cli(["fit", "--x", "load", f"5={p}", "6=" + self.report(self.d / "set=2.json", 20, 25)])
+        self.assertEqual(code, 0, err); self.assertIn("the lines cross at load ≈ 7", out)
+
+    def test_a_report_saved_under_a_csv_name_is_read_as_a_report(self):
+        p, q = self.report(self.d / "r1.csv", 10, 20), self.report(self.d / "r2.csv", 20, 25)
+        code, out, err = run_cli(["router", "--router", "a", p])        # was read as a CSV: "the columns ... appear more than once"
+        self.assertEqual(code, 0, err); self.assertIn("-50.0%", out)
+        code, out, err = run_cli(["fit", "--x", "load", f"5={p}", f"6={q}"])  # was "No such file or directory: '5=...'"
+        self.assertEqual(code, 0, err); self.assertIn("the lines cross at load ≈ 7", out)
+        c = self.d / "c.csv"
+        c.write_text("{k,name,energy_j,duration_s\n1,a,10,1\n1,b,12,1\n2,a,20,1\n2,b,18,1\n", encoding="utf-8")
+        self.assertEqual(run_cli(["fit", "--x", "{k", str(c)])[0], 0)  # a CSV header that starts with "{" is still a CSV
+
+    def test_a_csv_not_in_utf8_is_named_with_x(self):
+        p = self.d / "w.csv"
+        p.write_bytes("name,energy_j,duration_s,load\na,10,1,1\nb\u00b5,12,1,1\n".encode("cp1252"))
+        code, _, err = run_cli(["fit", "--x", "load", str(p)])            # was the codec's own message, naming no file
+        self.assertEqual(code, 2); self.assertIn("w.csv: not UTF-8 text", err)
+
+
+class StatsCliRegressions4(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.sleep = f'"{sys.executable}" -c "import time; time.sleep(0.01)"'
+
+    def compare(self, *args):
+        return run_cli(["compare", "--runs", "2", "--warmup", "0", "--quiet", "--no-track", *args], {"JOULES_SIMULATE": "gpu:X:100"})
+
+    def test_json_stays_valid_when_the_commands_print(self):
+        say = f'"{sys.executable}" -c "print(12345)"'
+        env = dict(os.environ, PYTHONPATH=str(Path(cli.__file__).parents[1]), JOULES_SIMULATE="gpu:X:100", PYTHONDONTWRITEBYTECODE="1")
+        p = subprocess.run([sys.executable, "-m", "joules", "compare", "--runs", "2", "--warmup", "0", "--no-track", "--json", say, say],
+                           capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)["kind"], "compare")
+        self.assertIn("12345", p.stderr)   # the commands' output is still shown, on stderr
+
+    def test_output_path_ending_in_a_slash_fails_before_any_run(self):
+        code, _, err = self.compare("--out", str(self.d / "newdir") + "/", self.sleep, self.sleep)
+        self.assertEqual(code, 2, err); self.assertIn("is a folder", err); self.assertNotIn("run 1 of", err)
+
+    def test_output_under_a_file_is_not_called_a_missing_folder(self):
+        (self.d / "f").write_text("x", encoding="utf-8")
+        code, _, err = self.compare("--csv", str(self.d / "f" / "r.csv"), self.sleep, self.sleep)
+        self.assertEqual(code, 2, err); self.assertIn("is a file, not a folder", err); self.assertNotIn("does not exist", err)
+
+    def test_two_outputs_on_one_file_are_refused(self):
+        p = str(self.d / "same.json")
+        code, _, err = self.compare("--out", p, "--markdown", p, self.sleep, self.sleep)
+        self.assertEqual(code, 2, err); self.assertIn("same file", err); self.assertFalse(os.path.exists(p))
+
+    def test_unclosed_quote_is_a_usage_error(self):
+        code, _, err = self.compare("echo 'a", self.sleep)
+        self.assertEqual(code, 2, err); self.assertIn("quotes", err); self.assertNotIn("Traceback", err)
+
+    def test_missing_command_is_a_clean_error(self):
+        code, _, err = self.compare("no-such-command-r4 --x", self.sleep)
+        self.assertEqual(code, 1, err); self.assertIn("could not start", err); self.assertIn("no-such-command-r4", err)
+
+    def test_held_clock_note_matches_the_average_clock(self):
+        from joules.compare import summarize
+        run = lambda n, e, sm: {"name": n, "energy_j": e, "duration_s": e / 100, "avg_w": 100.0, "devices": {"GPU 0": e},
+                                "gpu": {"GPU 0": {"sm_clock_mhz": sm, "throttled_pct": 0, "temp_c_max": 70}}}
+        notes = summarize([run("a", 300 + i, 1550) for i in range(5)] + [run("b", 400 + i, 1560) for i in range(5)],
+                          ["a", "b"], "a", locks={"GPU 0": 1590})[0]["notes"]
+        held = next(n for n in notes if n.startswith("Clocks held at 1590 MHz"))
+        self.assertNotIn("never dropped below", held)   # both averaged below 1590 MHz
+        self.assertIn("within 3% of the lock", held)
+
+    def test_start_temperatures_are_not_called_alike_when_a_command_has_none(self):
+        from joules.compare import summarize
+        rs = [{"name": "old", "energy_j": 10.0 + i, "duration_s": 1.0, "avg_w": 10.0, "temp_start_c": t} for i, t in enumerate((40, 60, 50, 45, 55))]
+        rs += [{"name": "new", "energy_j": 5.0 + i, "duration_s": 1.0, "avg_w": 5.0} for i in range(5)]
+        notes = summarize(rs, ["old", "new"], "old", imported=True)[0]["notes"]
+        self.assertFalse(any("alike for every command" in n for n in notes), notes)
+
+    def test_ci_verdict_symbols_have_plain_stand_ins(self):
+        for verdict in ("✅", "❌", "🔺"):  # joules ci prints these; an ASCII pipe showed "?" for each
+            plain = verdict.encode("ascii", "joules").decode("ascii")
+            self.assertNotIn("?", plain); self.assertTrue(plain)
+
+    def test_run_output_under_a_file_fails_before_the_command(self):
+        mark = self.d / "ran"
+        (self.d / "f").write_text("x", encoding="utf-8")
+        code, _, err = run_cli(["run", "--no-track", "--out", str(self.d / "f" / "r.json"), "--",
+                                sys.executable, "-c", f"open(r'{mark}', 'w').close()"], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 2, err); self.assertIn("cannot write --out", err); self.assertFalse(mark.exists())
+
+
+class StatsCliRegressions5(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def test_output_folder_made_by_the_command_is_accepted(self):
+        out = self.d / "made" / "r.json"
+        code, _, err = run_cli(["run", "--no-track", "--out", str(out), "--",
+                                sys.executable, "-c", f"import os; os.makedirs(r'{out.parent}')"], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 0, err); self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["kind"], "run")
+
+    def test_ci_summary_given_as_markdown_too_is_written_once(self):
+        summary = self.d / "summary.md"
+        env = {"JOULES_SIMULATE": "gpu:X:100", "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_BASE_REF": "", "GITHUB_OUTPUT": ""}
+        code, _, err = run_cli(["ci", "--runs", "1", "--no-track", "--markdown", str(summary), "--", sys.executable, "-c", "pass"], env)
+        self.assertEqual(code, 0, err); self.assertEqual(summary.read_text(encoding="utf-8").count("Energy check"), 1)
+
+    def test_markdown_table_keeps_its_columns_with_a_pipe_in_a_name(self):
+        from joules import compare
+        runs = [{"name": n, "energy_j": e, "duration_s": 1.0, "avg_w": e, "limit_pct": None}
+                for n, e in (("a | b", 10.0), ("a | b", 11.0), ("c", 12.0), ("c", 13.0))]
+        report = {"runs": 2, "order": "alternating", "tool": "joules 0", "devices": ["X"], "names": ["a | b", "c"],
+                  "commands": ["a | b", "c"], "blocks": compare.summarize(runs, ["a | b", "c"], "a | b")}
+        rows = [ln for ln in compare.markdown(report).splitlines() if ln.startswith("|")]
+        cells = lambda ln: len(ln.replace("\\|", "").split("|"))
+        self.assertEqual({cells(ln) for ln in rows}, {cells(rows[0])})
+
+
+class StatsCliRegressions6(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def test_output_under_a_link_to_a_missing_folder_fails_before_any_run(self):
+        try:
+            os.symlink(self.d / "gone", self.d / "link", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot make a symbolic link here")
+        sleep = f'"{sys.executable}" -c "import time; time.sleep(0.01)"'
+        code, _, err = run_cli(["compare", "--runs", "2", "--warmup", "0", "--quiet", "--no-track",
+                                "--out", str(self.d / "link" / "r.json"), sleep, sleep], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 2, err); self.assertIn("cannot write --out", err); self.assertNotIn("run 1 of", err)
+
+    def test_output_path_starting_with_a_tilde_goes_to_the_home_folder(self):
+        code, _, err = run_cli(["run", "--no-track", "--out=~/sub/r.json", "--", sys.executable, "-c", "pass"],
+                               {"JOULES_SIMULATE": "gpu:X:100", "HOME": str(self.d), "USERPROFILE": str(self.d)})
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads((self.d / "sub" / "r.json").read_text(encoding="utf-8"))["kind"], "run")
+
+
+class ExplainRegressions7(unittest.TestCase):
+    """Round 6 of the explain review: each bug pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def file(self, name, rows):
+        p = self.d / name
+        p.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return str(p)
+
+    def test_a_report_saved_without_a_json_name_is_read_as_a_report(self):
+        out = self.d / "result"
+        code, _, err = run_cli(["compare", "--no-track", "--runs", "2", "--warmup", "0", "--quiet", "--out", str(out),
+                                "true", "true --version"], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 0, err)
+        code, out_, err = run_cli(["explain", str(out)])
+        self.assertEqual(code, 0, err)                                             # was read as a CSV: "every row needs name, ..."
+        self.assertNotIn("imported runs", out_)
+
+    def test_the_split_and_the_summary_give_the_same_whole_percentage(self):
+        rows = ["name,energy_j,duration_s"] + [f"{n},{e},1" for _ in range(5) for n, e in (("a", 120), ("b", 111))]
+        code, out, err = run_cli(["explain", self.file("half.csv", rows)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("b used 8% less energy than a.", out)
+        self.assertIn("- b used 8% less energy than a\n", out)                    # was "7% less" under an "8% less" summary
+        self.assertIn("(average power -8%,", out)                                  # the same time: the same change
+
+    def test_power_only_advice_does_not_offer_cool_to_without_a_temperature(self):
+        code, out, err = run_cli(["compare", "--no-track", "--runs", "2", "--warmup", "0", "--quiet", "--explain", "--cool-to", "50",
+                                  "true", "true --version"], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 0, err)
+        self.assertIn("--cool-to needs an NVIDIA GPU", err)                       # compare: it did not wait
+        note = err[err.index("power only"):]
+        self.assertNotIn("(joules compare --rest, --cool-to) keeps heat out", note)  # explain recommended it all the same
+
+
+class ExplainRegressions8(unittest.TestCase):
+    """Round 7 of the explain review: each bug pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def test_a_report_and_facts_saved_as_utf16_are_read(self):
+        out = self.d / "result.json"
+        code, _, err = run_cli(["compare", "--no-track", "--runs", "2", "--warmup", "0", "--quiet", "--out", str(out),
+                                "true", "true --version"], {"JOULES_SIMULATE": "gpu:X:100"})
+        self.assertEqual(code, 0, err)
+        ps = self.d / "ps"  # what Windows PowerShell 5.1's > writes: UTF-16 with a BOM, CRLF line ends
+        ps.write_bytes(out.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-16"))
+        facts = self.d / "facts.json"
+        facts.write_bytes('{"arms": {"true": {"requested": {"n": 2}, "actual": {"n": 1}}}}'.encode("utf-16"))
+        code, out_, err = run_cli(["explain", str(ps), "--facts", str(facts)])
+        self.assertEqual(code, 0, err)                                             # was "'utf-8' codec can't decode byte 0xff"
+        self.assertIn("n: asked for 2, got 1", out_)
+        bad = self.d / "bad.json"
+        bad.write_bytes(b'{"arms": {"a": {"hint": "caf\xe9"}}}')                  # neither UTF-8 nor UTF-16: the error names --facts
+        code, _, err = run_cli(["explain", str(out), "--facts", str(bad)])
+        self.assertEqual(code, 2)
+        self.assertIn("could not read --facts", err)
+
+    def test_facts_objects_with_the_same_keys_in_another_order_match(self):
+        facts = self.d / "facts.json"
+        facts.write_text(json.dumps({"arms": {"b": {"requested": {"shape": {"h": 4, "w": 3}}, "actual": {"shape": {"w": 3, "h": 4}}}}}),
+                         encoding="utf-8")
+        runs = self.d / "runs.csv"
+        runs.write_text("name,energy_j,duration_s\n" + "".join(f"a,10,1\nb,{8 + i / 10},1\n" for i in range(5)), encoding="utf-8")
+        code, out, err = run_cli(["explain", str(runs), "--facts", str(facts), "--strict"])
+        self.assertEqual(code, 0, out + err)                                       # was exit 3: "shape: asked for {...}, got {...}"
+        self.assertNotIn("not what you asked for", out)
+
+
+class CsvEncodingRegression(unittest.TestCase):
+    def test_a_csv_that_is_not_utf8_is_a_clean_error(self):
+        d = Path(tempfile.mkdtemp())
+        p = d / "r.csv"
+        p.write_bytes("name,energy_j,duration_s,note\na,10,1,caf\xe9\nb,5,1,x\n".encode("cp1252"))
+        code, out, err = run_cli(["explain", str(p)])
+        self.assertEqual(code, 2, err); self.assertIn("not UTF-8", err); self.assertNotIn("Traceback", err)
+
+
+class PercentNoiseRegression(unittest.TestCase):
+    def test_an_exact_doubling_reads_as_100_percent(self):
+        from joules import explain as ex
+        self.assertEqual(ex._pct((0.3 * 2 - 0.3) / 0.3 * 100 - 1e-13), "+100%")
+        self.assertEqual(ex._pct(-99.94), "-99.94%")
+
+
+class FitRouterRegressions10(unittest.TestCase):
+    """joules fit and router: bugs found by the ninth review."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def report(self, name, ea, eb):
+        from joules import explain as ex
+        p = self.d / name
+        p.write_text(json.dumps(ex.from_runs([{"name": n, "energy_j": e, "duration_s": 1.0} for n, e in (("a", ea), ("b", eb)) for _ in range(2)], "b")),
+                     encoding="utf-8")
+        return p
+
+    def test_a_broken_report_among_several_is_named(self):
+        p, q, bad = self.report("r1.json", 10, 20), self.report("r2.json", 20, 25), self.d / "r3.json"
+        bad.write_text(self.report("r3.json", 30, 30).read_text(encoding="utf-8").replace(",", ",,", 1), encoding="utf-8")
+        for cmd in (["fit", "--x", "load"], ["router", "--router", "a"]):
+            code, _, err = run_cli([*cmd, f"1={p}", f"2={q}", f"3={bad}"])  # was the JSON parser's own message, naming no file
+            self.assertEqual(code, 2); self.assertIn("r3.json: not readable JSON", err)
+
+    def test_a_tilde_after_the_workload_value_is_the_home_folder(self):
+        home = self.d / "home"
+        home.mkdir()
+        self.report("home/r1.json", 10, 20); self.report("home/r2.json", 20, 25)
+        code, out, err = run_cli(["fit", "--x", "load", "5=~/r1.json", "6=~/r2.json"], {"HOME": str(home), "USERPROFILE": str(home)})
+        self.assertEqual(code, 0, err); self.assertIn("the lines cross at load ≈ 7", out)  # was "No such file or directory: '~/r1.json'"
+
+
+class ExplainRegressions9(unittest.TestCase):
+    """Round 8 of the explain review: each bug pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.runs = self.d / "runs.csv"
+        self.runs.write_text("name,energy_j,duration_s\n" + "".join(f"a,10,1\nb,{8 + i / 10},1\n" for i in range(5)), encoding="utf-8")
+
+    def test_nested_numbers_in_facts_match_as_top_level_ones_do(self):
+        facts = self.d / "facts.json"
+        facts.write_text(json.dumps({"arms": {"b": {"requested": {"shape": [64, 64], "opt": {"lr": 0.3}},
+                                                    "actual": {"shape": [64.0, 64.0], "opt": {"lr": 0.1 * 3}}}}}), encoding="utf-8")
+        code, out, err = run_cli(["explain", str(self.runs), "--facts", str(facts), "--strict"])
+        self.assertEqual(code, 0, out + err)                                       # was exit 3: "shape: asked for [64, 64], got [64.0, 64.0]"
+        self.assertNotIn("not what you asked for", out)
+        facts.write_text(json.dumps({"arms": {"b": {"requested": {"shape": [64, 64]}, "actual": {"shape": [32, 64]}}}}), encoding="utf-8")
+        code, out, err = run_cli(["explain", str(self.runs), "--facts", str(facts), "--strict"])
+        self.assertEqual(code, 3, out + err)
+        self.assertIn("shape: asked for [64, 64], got [32, 64]", out)
+
+    def test_a_csv_saved_as_utf16_is_read(self):
+        ps = self.d / "ps.csv"  # what Windows PowerShell 5.1's > writes: UTF-16 with a BOM, CRLF line ends
+        ps.write_bytes(self.runs.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-16"))
+        code, out, err = run_cli(["explain", str(ps)])
+        self.assertEqual(code, 0, err)                                             # was "not UTF-8 text; save it as UTF-8"
+        self.assertIn("b used 18% less energy than a", out)
+
+
+class ExplainRegressions10(unittest.TestCase):
+    """Round 9 of the explain review: each bug pinned so it can't come back."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.runs = self.d / "runs.csv"
+        self.runs.write_text("name,energy_j,duration_s\n" + "".join(f"a,10,1\nb,{8 + i / 10},1\n" for i in range(5)), encoding="utf-8")
+
+    def test_facts_exactly_10_percent_off_are_within_the_tolerance(self):
+        facts = self.d / "facts.json"
+        facts.write_text(json.dumps({"arms": {"b": {"requested": {"x": 0.3, "y": [0.3]}, "actual": {"x": 0.33, "y": [0.33]}}}}), encoding="utf-8")
+        code, out, err = run_cli(["explain", str(self.runs), "--facts", str(facts), "--strict"])
+        self.assertEqual(code, 0, out + err)                                       # was exit 3: "x: asked for 0.3, got 0.33 (10% off)"
+        self.assertNotIn("not what you asked for", out)
+
+    def test_csv_errors_name_the_files_own_line_past_a_blank_one(self):
+        p = self.d / "gap.csv"
+        p.write_text("name,energy_j,duration_s\na,10,1\na,10,1\n\nb,8,1\nb,8 J,1\n", encoding="utf-8")
+        code, _, err = run_cli(["explain", str(p)])
+        self.assertEqual(code, 2)
+        self.assertIn("line 6:", err)                                              # was "line 5": the blank line was not counted
+
+
+class FitUtf16Regression(unittest.TestCase):
+    def test_fit_reads_a_utf16_csv(self):
+        d = Path(tempfile.mkdtemp())
+        p = d / "r.csv"
+        rows = "name,energy_j,duration_s,load\r\n" + "".join(f"a,{10 + x},1,{x}\r\nb,{5 + 2 * x},1,{x}\r\n" for x in (1, 2, 4) for _ in range(2))
+        p.write_bytes(rows.encode("utf-16"))
+        code, out, err = run_cli(["fit", "--x", "load", "--baseline", "a", str(p)])
+        self.assertEqual(code, 0, err); self.assertIn("Break-even", out)
+
+
+
+class GpuOptionRegression(unittest.TestCase):
+    def test_gpus_that_are_not_numbers_are_a_usage_error(self):
+        for argv in (["run", "--gpus", "all", "--", sys.executable, "-c", "pass"], ["devices", "--gpus", "all"],
+                     ["compare", "--gpus", "0,", "--runs", "1", "--no-track", "a", "b"]):
+            code, _, err = run_cli(argv, SIM)                                   # was a ValueError traceback
+            self.assertEqual(code, 2, err); self.assertIn("--gpus takes GPU numbers", err)
+
+
+class FitLineNumberRegression(unittest.TestCase):
+    def test_x_errors_name_the_files_own_line_after_a_blank_line(self):
+        d = Path(tempfile.mkdtemp())
+        p = d / "g.csv"
+        p.write_text("name,energy_j,duration_s,load\na,10,1,1\n\nb,5,1,1\na,11,1,big\n", encoding="utf-8")
+        code, out, err = run_cli(["fit", "--x", "load", str(p)])
+        self.assertEqual(code, 2, err); self.assertIn("line 5", err)
+
+
+
+class PowerLimitRestoreRegression(unittest.TestCase):
+    def test_the_limit_set_with_nvidia_smi_is_put_back_not_the_enforced_one(self):
+        # a cap from outside (e.g. the server's BMC) holds the enforced limit at 600 W under a 700 W management limit
+        class Capped(FakeNVMLHealth):
+            def power_limit_mw(self, h): return min(self.limits[h], 600_000)
+            def management_limit_mw(self, h): return self.limits[h]
+        nv = Capped([{"name": "NVIDIA H100 80GB HBM3", "power_mw": 650_000}])
+        gen = lambda *a, **k: {"output_tokens": 10, "prompt_tokens": 5, "gen_s": 0.01}
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(meters, "NVML_FACTORY", lambda: nv), \
+                mock.patch.object(cli, "generate", gen), mock.patch.object(cli, "ensure_model", lambda *a: None), \
+                mock.patch.dict(os.environ, {"JOULES_SYSFS": t, "CUDA_VISIBLE_DEVICES": "0"}):
+            os.environ.pop("JOULES_SIMULATE", None)
+            code, out, err = run_cli(["tune", "ollama:x", "--limits", "100,70", "--runs", "1", "--warmup", "0", "--no-cpu", "--json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(nv.sets[-1], (0, 700_000))  # was (0, 600_000): the card stayed capped once the outside cap was lifted
+        self.assertEqual(json.loads(out)["original_limit_w"], [700.0])
+
+
+class SignalExitStatusRegression(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Windows has no signals that end a process")
+    def test_a_command_killed_by_a_signal_exits_as_the_shell_reports_it(self):
+        code, _, err = run_cli(["run", "--", sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"], SIM)
+        self.assertEqual(code, 128 + signal.SIGKILL, err)  # was -9, which the process exits with as 247
+
+
+class StartFailureRegression(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "a file with no #! line is a POSIX exec failure")
+    def test_a_script_the_system_cannot_execute_is_reported_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t, "job.sh")
+            p.write_text("echo hello\n"); p.chmod(0o755)  # no #! line: exec fails with "Exec format error"
+            for argv in (["run", "--", str(p)], ["calibrate", "--wall-w", "100", "--", str(p)]):
+                code, _, err = run_cli(argv, SIM)                                # was an OSError traceback
+                self.assertEqual(code, 126, err); self.assertIn("cannot run", err)
+
+    def test_ci_with_a_command_that_is_not_there_is_reported_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as t:
+            old = os.getcwd(); os.chdir(t)
+            try:
+                code, _, err = run_cli(["ci", "--runs", "1", "--no-track", "--", "no-such-command-r11"], {**SIM, "GITHUB_BASE_REF": ""})
+            finally:
+                os.chdir(old)
+        self.assertEqual(code, 1, err); self.assertIn("could not start", err)  # was a FileNotFoundError traceback
+
+
+class TuneHintRegression(unittest.TestCase):
+    def test_the_nvidia_smi_hint_names_only_the_gpus_that_were_tuned(self):
+        rows = [{"limit_pct": 100, "limit_w": [700.0], "tokens_per_s": 100.0, "j_per_token": 1.0, "gpu_avg_w": 650},
+                {"limit_pct": 70, "limit_w": [490.0], "tokens_per_s": 95.0, "j_per_token": 0.8, "gpu_avg_w": 490}]
+        r = {"target": "ollama:x", "gpus": ["GPU 1 NVIDIA H100 80GB HBM3"], "rows": rows, "original_limit_w": [700.0],
+             "max_slowdown_pct": 10.0, "pick": cli.power_sweep_pick(rows, 10.0), "notes": []}
+        text = cli.render_tune(r)  # was "nvidia-smi -pl 490", which sets every GPU on the machine, GPU 0 too
+        self.assertIn("nvidia-smi -i 1 -pl 490", text); self.assertIn("nvidia-smi -i 1 -pl 700 puts it back", text)
+
+
+class CiGitRegression(unittest.TestCase):
+    def test_ci_where_git_is_not_installed_is_reported_not_a_traceback(self):
+        from joules import ci
+        real = subprocess.run
+        def no_git(args, *a, **k):  # a slim container: actions/checkout downloads the code without git
+            if isinstance(args, list) and args[:1] == ["git"]:
+                raise FileNotFoundError(2, "No such file or directory", "git")
+            return real(args, *a, **k)
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(ci.subprocess, "run", no_git):
+            old = os.getcwd(); os.chdir(t)
+            try:
+                code, out, err = run_cli(["ci", "--runs", "1", "--no-track", "--", sys.executable, "-c", "pass"], {**SIM, "GITHUB_BASE_REF": ""})
+                code2, _, err2 = run_cli(["ci", "--runs", "1", "--no-track", "--base", "main", "--", sys.executable, "-c", "pass"], SIM)
+            finally:
+                os.chdir(old)
+        self.assertEqual(code, 0, err); self.assertIn("this checkout", out)  # no base: git is not needed at all
+        self.assertEqual(code2, 1, err2); self.assertIn("git could not run", err2)  # both were FileNotFoundError tracebacks
+
+    def test_ci_with_a_base_that_is_not_there_leaves_no_folder_behind(self):
+        from joules import ci
+        real = tempfile.mkdtemp
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as scratch:
+            Ci.repo(self, t)
+            old = os.getcwd(); os.chdir(t)
+            try:
+                with mock.patch.object(ci.tempfile, "mkdtemp", lambda **k: real(dir=scratch, **k)):
+                    code, _, err = run_cli(["ci", "--runs", "1", "--no-track", "--base", "no-such-ref", "--", sys.executable, "-c", "pass"], SIM)
+            finally:
+                os.chdir(old)
+            self.assertEqual(code, 1, err); self.assertIn("no-such-ref", err)
+            self.assertEqual(os.listdir(scratch), [])  # was an empty joules-base-* folder left in the temp folder

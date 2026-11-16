@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 import math
 import os
 import re
@@ -37,8 +38,45 @@ def _u_count(n: int, m: int, u: int) -> int:
     return _u_count(n - 1, m, u - m) + _u_count(n, m - 1, u)
 
 
+EXACT_TIED_MAX = 50  # with ties and at most this many runs in all, use the exact permutation p-value (as without ties)
+
+
+def _exact_tied(x: list[float], y: list[float]) -> float:
+    """Exact two-sided p-value with ties: over every way of splitting the pooled midranks into groups of len(x) and
+    len(y), twice the smaller tail of x's rank sum at or beyond the observed one (the same two-sided rule as the
+    no-ties path, so it never goes below min_p). Counted by dynamic programming over the groups of tied values, with
+    midranks doubled to whole numbers, so it is exact and fast up to EXACT_TIED_MAX runs."""
+    allv = sorted(list(x) + list(y))
+    n, N = len(x), len(allv)
+    rank2: dict[float, int] = {}   # twice the midrank of each value
+    groups: list[tuple[int, int]] = []  # (twice the midrank, how many runs share it)
+    i = 0
+    while i < N:
+        j = i
+        while j + 1 < N and allv[j + 1] == allv[i]:
+            j += 1
+        rank2[allv[i]] = i + j + 2
+        groups.append((i + j + 2, j - i + 1))
+        i = j + 1
+    ways: list[dict[int, int]] = [{} for _ in range(n + 1)]  # ways[k][s]: k runs picked so far with doubled rank sum s
+    ways[0][0] = 1
+    seen = 0
+    for r2, g in groups:
+        seen += g
+        for k in range(min(n, seen), 0, -1):  # downwards, so ways[k - j] is still from before this group
+            row = ways[k]
+            for j in range(1, min(g, k) + 1):
+                c, add = math.comb(g, j), j * r2
+                for s, w in ways[k - j].items():
+                    row[s + add] = row.get(s + add, 0) + w * c
+    obs = sum(rank2[v] for v in x)
+    lo = sum(w for s, w in ways[n].items() if s <= obs)
+    hi = sum(w for s, w in ways[n].items() if s >= obs)
+    return min(1.0, 2 * min(lo, hi) / math.comb(N, n))
+
+
 def mann_whitney(x: list[float], y: list[float]) -> float | None:
-    """Two-sided p-value of the Mann-Whitney U test: exact when there are no ties and the samples are small,
+    """Two-sided p-value of the Mann-Whitney U test: exact when the samples are small (with or without ties),
     else the normal approximation with the tie correction. None with fewer than 2 values on a side."""
     n, m = len(x), len(y)
     if n < 2 or m < 2:
@@ -52,6 +90,8 @@ def mann_whitney(x: list[float], y: list[float]) -> float | None:
         lo = sum(_u_count(n, m, i) for i in range(0, k + 1)) / total
         hi = sum(_u_count(n, m, i) for i in range(k, n * m + 1)) / total
         return min(1.0, 2 * min(lo, hi))
+    if ties and n + m <= EXACT_TIED_MAX:
+        return _exact_tied(x, y)
     N = n + m
     counts: dict[float, int] = {}
     for v in allv:
@@ -61,7 +101,9 @@ def mann_whitney(x: list[float], y: list[float]) -> float | None:
     if var <= 0:
         return 1.0
     z = max(0.0, abs(u - n * m / 2) - 0.5) / math.sqrt(var)
-    return min(1.0, math.erfc(z / math.sqrt(2)))
+    # the normal approximation can go below what any arrangement of n and m runs allows (e.g. 0.047 for 3 against 3
+    # identical-valued runs, where the exact floor is 0.1), so never report less than that floor
+    return min(1.0, max(math.erfc(z / math.sqrt(2)), 2 / math.comb(n + m, n)))
 
 
 # ---------------------------------------------------------------- running
@@ -114,6 +156,12 @@ def hottest(gpus: list) -> float | None:
     return max(temps) if temps else None
 
 
+def restore_limit_mw(m) -> int | None:
+    """The limit to put a GPU back to: the one set with nvidia-smi -pl, not the enforced one, which an outside cap
+    can hold lower (putting that back would leave the card capped after the outside cap is lifted)."""
+    return getattr(m.nvml, "management_limit_mw", m.nvml.power_limit_mw)(m.h)
+
+
 @contextlib.contextmanager
 def power_limits(gpus: list):
     """set(pct) puts every GPU at pct% of its maximum power limit; the original limits come back at the end."""
@@ -121,7 +169,7 @@ def power_limits(gpus: list):
     for m in gpus:
         if not hasattr(m.nvml, "set_power_limit_mw"):
             raise RuntimeError(f"{m.name}: this driver cannot set a power limit")
-        rng, cur = m.nvml.power_limit_range_mw(m.h), m.nvml.power_limit_mw(m.h)
+        rng, cur = m.nvml.power_limit_range_mw(m.h), restore_limit_mw(m)
         if not rng or not cur:
             raise RuntimeError(f"{m.name}: the driver does not report its power limits")
         ranges.append(rng); original.append(cur)
@@ -255,8 +303,8 @@ def lock_text(locks: dict | None) -> str:
     return " / ".join(f"{v} MHz" for v in sorted(set(locks.values()))) if locks else ""
 
 
-def measure(d: Discovery, cmd, shell: bool, interval: float, quiet: bool) -> dict:
-    out = subprocess.DEVNULL if quiet else None
+def measure(d: Discovery, cmd, shell: bool, interval: float, quiet: bool, to_stderr: bool = False) -> dict:
+    out = subprocess.DEVNULL if quiet else 2 if to_stderr else None  # 2: the command's stdout onto our stderr
     with Sampler(d.meters, interval) as s:
         p = subprocess.Popen(cmd, shell=shell, stdin=subprocess.DEVNULL, stdout=out)
         for m in d.meters:
@@ -298,7 +346,7 @@ def idle_above(runs: list[dict], start_w: float, end_w: float, t0: float, t1: fl
     if start_w > 0 and abs(end_w - start_w) / start_w > IDLE_DRIFT:
         return [f"Idle moved from {start_w:.1f} W before the runs to {end_w:.1f} W after them ({(end_w - start_w) / start_w * 100:+.0f}%). "
                 "Energy above idle takes idle on a straight line between the two for each run; the total energy does not "
-                "depend on idle. Close other programs and let the machine settle (or idle longer) for a steadier baseline."]
+                "depend on idle. Other programs starting or stopping, or a machine still settling, move idle."]
     return []
 
 
@@ -308,7 +356,7 @@ def _med(xs):
 
 
 def summarize(runs: list[dict], names: list[str], baseline: str, cool_to: float | None = None,
-              locks: dict | None = None) -> list[dict]:
+              locks: dict | None = None, imported: bool = False) -> list[dict]:
     """One block per power limit (one block, limit None, without --limits): per command its statistics, and
     against the baseline the changes and p-values. locks: {GPU meter name: MHz} when the clocks were locked."""
     blocks = []
@@ -363,7 +411,7 @@ def summarize(runs: list[dict], names: list[str], baseline: str, cool_to: float 
         for row in rows.values():
             for k in ("_e", "_s", "_edp", "_ai"):
                 row.pop(k, None)
-        blocks.append({"limit_pct": lim, "rows": list(rows.values()), "notes": fairness_notes(list(rows.values()), cool_to, locks)})
+        blocks.append({"limit_pct": lim, "rows": list(rows.values()), "notes": fairness_notes(list(rows.values()), cool_to, locks, imported)})
     return blocks
 
 
@@ -375,15 +423,24 @@ def min_p(n: int, m: int) -> float:
 HELD_PCT = 97  # an average SM clock below this share of the locked clock: the card did not hold the lock
 
 
-def fairness_notes(rows: list[dict], cool_to: float | None = None, locks: dict | None = None) -> list[str]:
+def fairness_notes(rows: list[dict], cool_to: float | None = None, locks: dict | None = None,
+                   imported: bool = False) -> list[str]:
     """Say so when the commands did not get the same GPU: different throttling, clocks or starting temperatures.
     With locked clocks, whether the GPU held the lock: a power or thermal cap is then the only thing besides the
     work that can make the commands differ. And when there are too few runs for any p-value to come out below 0.05."""
     notes = []
-    ns = [r["runs"] for r in rows]
-    if len(ns) >= 2 and min_p(min(ns), min(ns)) > 0.05:
-        notes.append(f"With {min(ns)} runs each, p cannot go below {min_p(min(ns), min(ns)):.2f} even for a real difference; "
-                     "use --runs 5 or more for a result that can reach p < 0.01.")
+    # the floor of each command's p-value against the baseline, from both sides' run counts (they can differ)
+    runs_of = {r["name"]: r["runs"] for r in rows}
+    pairs = [(r["runs"], runs_of[r["vs"]["baseline"]]) for r in rows if r.get("vs") and r["vs"]["baseline"] in runs_of]
+    if not pairs and len(rows) >= 2:  # no baseline among the rows: every pair of commands
+        pairs = [(a["runs"], b["runs"]) for a, b in itertools.combinations(rows, 2)]
+    stuck = [(a, b) for a, b in pairs if min_p(a, b) > 0.05]
+    if stuck:
+        a, b = max(stuck, key=lambda ab: (min(ab) < 2, min_p(*ab)))
+        notes.append(f"With {a} run{'s' if a != 1 else ''} each, " if a == b else f"With {min(a, b)} and {max(a, b)} runs, ")
+        notes[-1] += ("there is no p-value: Mann-Whitney needs at least 2 runs of each command; " if min(a, b) < 2 else
+                      f"p cannot go below {min_p(a, b):.2f} even for a real difference; ")
+        notes[-1] += f"with 5 runs of each (--runs 5), p can reach {min_p(5, 5):.4f}."
     g = [(r["name"], r["gpu"]) for r in rows if r.get("gpu")]
     thr = [(n, x["throttled_pct"]) for n, x in g if x.get("throttled_pct") is not None]
     if locks:
@@ -394,19 +451,20 @@ def fairness_notes(rows: list[dict], cool_to: float | None = None, locks: dict |
             notes.append(f"Clocks were locked at {lock_text(locks)}, but the GPU still ran below that under "
                          + " and ".join(f"{n} (average {x['sm_clock_mhz']:.0f} MHz{why(x)})" for n, x in below)
                          + ": its power or thermal cap set the speed there, and that, not only the work, can make the commands "
-                         "differ. Lock lower (--lock-clocks base) to hold one clock for every command.")
+                         "differ. The card's base clock (--lock-clocks base) is a lock it can usually hold under every command.")
         elif held and len(held) == len(g):
-            notes.append(f"Clocks held at {lock_text(locks)} under every command (the GPU never dropped below the lock), so the "
+            notes.append(f"Clocks held at {lock_text(locks)} under every command (an average SM clock within {100 - HELD_PCT}% of the lock), so the "
                          "difference is the work, not boost or throttling.")
-    elif len(thr) >= 2 and max(v for _, v in thr) - min(v for _, v in thr) > 20:
+    throttle_note = not locks and len(thr) >= 2 and max(v for _, v in thr) - min(v for _, v in thr) > 20
+    if throttle_note:
         hi = max(thr, key=lambda t: t[1]); lo = min(thr, key=lambda t: t[1])
         notes.append(f"The GPU was throttled {hi[1]:.0f}% of the time under {hi[0]} but {lo[1]:.0f}% under {lo[0]}: part of the "
-                     "difference may be the card's power or thermal limit rather than the work. Compare again at a fixed "
-                     "power limit (--limits) or with locked clocks (--lock-clocks base, needs root).")
+                     "difference may be the card's power or thermal limit rather than the work. A fixed power limit (--limits) "
+                     "or locked clocks (--lock-clocks base, needs root) give both commands the same limit.")
     clk = [(n, x["clock_pct"]) for n, x in g if x.get("clock_pct") is not None]
-    if not locks and len(clk) >= 2 and max(v for _, v in clk) - min(v for _, v in clk) > 10 and not notes:
-        notes.append("The GPU's clock differed by more than 10 points of its maximum between the commands; lock the clocks "
-                     "(--lock-clocks base, needs root) to compare at the same speed.")
+    if not locks and len(clk) >= 2 and max(v for _, v in clk) - min(v for _, v in clk) > 10 and not throttle_note:
+        notes.append("The GPU's clock differed by more than 10 points of its maximum between the commands; with locked "
+                     "clocks (--lock-clocks base, needs root) they would run at the same speed.")
     # Where each command's runs started. Alternating runs give every command the same spread, which only widens the
     # IQR; a command that started hotter as a rule is a bias. --cool-to waits for a hot card to cool, never warms a
     # cool one, so once it is set the advice is more warm-up rounds rather than --cool-to again.
@@ -415,15 +473,16 @@ def fairness_notes(rows: list[dict], cool_to: float | None = None, locks: dict |
     if len(med) >= 2 and max(m for _, m in med) - min(m for _, m in med) > 10:
         hi = max(med, key=lambda t: t[1]); lo = min(med, key=lambda t: t[1])
         notes.append(f"{hi[0]}'s runs started at {hi[1]:.0f} °C (median) but {lo[0]}'s at {lo[1]:.0f} °C, so one side began on a "
-                     "hotter card. " + ("--cool-to only waits for a card to cool, so add warm-up rounds (--warmup 3) to bring "
+                     "hotter card." + ("" if imported else " " + ("--cool-to only waits for a card to cool; warm-up rounds (--warmup 3) bring "
                      "the card to its working temperature first." if cool_to is not None else
-                     f"--cool-to {lo[1]:.0f} starts every run from no hotter than {lo[1]:.0f} °C."))
-    elif st and max(t["max"] for _, t in st) - min(t["min"] for _, t in st) > 10:
+                     f"--cool-to {lo[1]:.0f} starts every run from no hotter than {lo[1]:.0f} °C.")))
+    elif len(st) == len(rows) >= 2 and max(t["max"] for _, t in st) - min(t["min"] for _, t in st) > 10:  # "alike" needs every command's temperatures
         lo, hi = min(t["min"] for _, t in st), max(t["max"] for _, t in st)
-        notes.append(f"The runs started between {lo:.0f} and {hi:.0f} °C, alike for every command since they alternate, so this "
-                     "widens the spread rather than favouring one side. " + ("--cool-to only waits for a card to cool; add "
-                     "warm-up rounds (--warmup 3) to start them closer." if cool_to is not None else
-                     f"--cool-to {lo + 10:.0f} starts every run from a closer temperature."))
+        notes.append(f"The runs started between {lo:.0f} and {hi:.0f} °C, alike for every command (their median starting "
+                     "temperatures are within 10 °C), so this widens the spread rather than favouring one side."
+                     + ("" if imported else " " + ("--cool-to only waits for a card to cool; warm-up rounds (--warmup 3) start them closer."
+                        if cool_to is not None else
+                     f"--cool-to {lo + 10:.0f} starts every run from a closer temperature.")))
     return notes
 
 
@@ -446,19 +505,20 @@ def _pct(x: float | None) -> str:
 
 
 def _p(p: float | None) -> str:
+    """" (p = ...)" after a change, or nothing when there is no p-value (a single run on a side)."""
     if p is None:
         return ""
-    return "p < 0.001" if p < 0.001 else f"p = {p:.3f}" if p < 0.1 else f"p = {p:.2f}"
+    return " (" + ("p < 0.001" if p < 0.001 else f"p = {p:.3f}" if p < 0.1 else f"p = {p:.2f}") + ")"
 
 
 def verdict_line(row: dict) -> str:
     v = row["vs"]
-    line = (f"{row['name']} vs {v['baseline']}: energy {_pct(v['energy_pct'])} ({_p(v['energy_p'])}), "
-            f"time {_pct(v['time_pct'])} ({_p(v['time_p'])}), energy × time {_pct(v['edp_pct'])} ({_p(v['edp_p'])})")
+    line = (f"{row['name']} vs {v['baseline']}: energy {_pct(v['energy_pct'])}{_p(v['energy_p'])}, "
+            f"time {_pct(v['time_pct'])}{_p(v['time_p'])}, energy × time {_pct(v['edp_pct'])}{_p(v['edp_p'])}")
     if v.get("power_pct") is not None:
         line += f", average power {_pct(v['power_pct'])}"
     if v.get("above_idle_pct") is not None:
-        line += f", above idle {_pct(v['above_idle_pct'])} ({_p(v['above_idle_p'])})"
+        line += f", above idle {_pct(v['above_idle_pct'])}{_p(v['above_idle_p'])}"
     return line
 
 
@@ -518,7 +578,8 @@ def markdown(r: dict) -> str:
         for x in b["rows"]:
             g = x.get("gpu") or {}
             f = lambda k, fmt: "" if g.get(k) is None else fmt.format(g[k])
-            out.append(f"| {x['name']} | {_fmt_j(x['energy_j']['median'])} | {x['energy_j']['spread_pct']:.1f}% | "
+            cell = x["name"].replace("|", "\\|")  # a name from a --shell pipeline would otherwise split its row's cells
+            out.append(f"| {cell} | {_fmt_j(x['energy_j']['median'])} | {x['energy_j']['spread_pct']:.1f}% | "
                        f"{_fmt_s(x['duration_s']['median'])} | {x['avg_w']['median']:.1f} W | {_fmt_j(x['edp_js']['median'])}·s |"
                        + (f" {f('clock_pct', '{:.0f}%')} |" + (f" {f('sm_clock_mhz', '{:.0f} MHz')} |" if mhz else "")
                           + f" {f('throttled_pct', '{:.0f}%')} | {f('temp_c_max', '{:.0f} °C')} |" if has_gpu else ""))

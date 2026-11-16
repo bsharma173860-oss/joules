@@ -2,6 +2,37 @@
 
 joules is published on PyPI as [landauer-gap](https://pypi.org/project/landauer-gap/). Newest first.
 
+## Unreleased
+
+- **Fixes from a second review of explain, fit and router.** Statistics: with ties, compare's exact p-value now uses
+  the same two-sided rule as without ties and stays exact up to 50 runs (it switched to an approximation at 21), and
+  the "too few runs" note uses each command's own run count. Explain: a `--checks` plugin that exits or edits the
+  report can no longer lose the measurements; CSV `limit_pct` keeps power limits apart; joules compare's default order
+  with 3+ commands is reported as fixed; text facts are compared exactly; duplicate CSV columns are refused. Fit: each
+  break-even is judged inside the range where both commands were measured; the parallel-lines test scales with the
+  units; curved data is flagged by its worst miss, not only R²; same power limit written as 100 and "100.0" is one
+  limit; the same file given twice under another path is refused. Router: contracts are checked on every run, a
+  single workload no longer shows a made-up "workload 0", and non-finite workload values are refused everywhere.
+  Advice in the output is now worded as observations.
+
+- **Fix:** with tied run values, compare's p-value could fall below the smallest value its run counts allow (0.047
+  for 3 against 3, where the floor is 0.1), calling a difference significant too early. It is now floored there.
+
+- **`joules compare --explain` and `joules explain`: why a comparison came out the way it did.** After the numbers,
+  joules says whether a saving came from finishing sooner or from drawing less power, why the total and above-idle
+  changes differ, whether the runs were fair (fixed order, starting temperature, throttling), which arms are too noisy
+  to quote, and when there are too few runs for any difference to be real. With `--facts FILE` it also checks that
+  each command did the work you asked for (requested vs actual workload numbers you supply). `joules explain` reads a
+  saved compare report or a CSV of runs measured another way. `--strict` exits 3 when there is a problem to fix before
+  quoting the result. Every power limit of a `--limits` run is explained.
+- The `compare` help and error examples now use `new`/`old` as names.
+- **Pick by energy.** `joules fit --export` writes a cost model a runtime can pick from, and `joules router` grades a
+  strategy picker against the best fixed choice at each workload and over a workload mix.
+- `--checks FILE.py` adds your own workload checks to `--explain` (a `check(report, facts)` function), shown first.
+- **`joules fit`: the break-even.** From comparisons at two or more workload sizes, it fits energy = fixed + per-unit x
+  workload for each command and says where one starts to beat the other, why (fixed cost against cost per unit), and
+  what to expect at a given workload, with warnings when the break-even is extrapolated or the fit is poor.
+
 ## 0.8.2 (3 November 2026)
 
 - **AMD GPUs on Windows.** joules now reads AMD GPU power on Windows through ADLX, the library that ships with every

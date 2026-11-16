@@ -41,7 +41,10 @@ class Sampler:
         with self.lock:
             self.t1 = time.monotonic()
             for m in self.meters:
-                m.stop(self.t1)
+                try:
+                    m.stop(self.t1)
+                except (OSError, ValueError):
+                    pass  # the last reading failed: the meter keeps what it counted up to its last good one
 
     @property
     def duration_s(self) -> float:
