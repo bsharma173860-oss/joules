@@ -2410,6 +2410,7 @@ class GpuHealth(unittest.TestCase):
         self.assertEqual(code, 1); self.assertIn("sudo", err); self.assertEqual(nv.sets, [])
         self.assertEqual(run_cli(["tune", "ollama:x", "--limits", "150"], SIM)[0], 2)
 
+    @unittest.skipIf(os.name == "nt", "Windows has no SIGTERM to catch: os.kill ends the process outright")
     def test_tune_puts_the_limit_back_when_terminated(self):
         # kill, timeout or a batch job's time limit sends SIGTERM: the card must not stay capped
         nv = FakeNVMLHealth([{"name": "NVIDIA H100 80GB HBM3", "power_mw": 650_000}])
