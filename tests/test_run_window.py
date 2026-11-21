@@ -204,25 +204,32 @@ class RunWindow(unittest.TestCase):
     def test_ctrl_c_still_reports_and_passes_the_exit_code(self):
         import signal
         Path(self.script).write_text(textwrap.dedent("""\
-            #!/bin/bash
-            trap 'echo ">>> done"; exit 7' INT
-            echo 45000 > "$FAKE_NVML_POWER_FILE"; sleep 0.5
-            echo ">>> running"
-            sleep 20 & wait $!
+            import signal, sys, time
+            def stop(*_):
+                print(">>> done", flush=True)
+                sys.exit(7)
+            signal.signal(signal.SIGINT, stop)
+            open(sys.argv[1], "w").write("45000"); time.sleep(0.5)
+            print(">>> running", flush=True)
+            while True:
+                time.sleep(0.1)
             """))
         out = os.path.join(self.d, "r.json")
         env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "HOME": self.d, "JOULES_NO_PROMPT": "1", "JOULES_TELEMETRY": "0",
                "JOULES_NVML_LIB": self.laptop, "FAKE_NVML_POWER_FILE": self.power}
         q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--out", out, "--from", ">>> running",
-                              "--until", ">>> done", "--", "bash", self.script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             env=env, start_new_session=True)
-        while q.stdout.readline().strip() != b">>> running":             # the trap is set and bash is waiting
-            pass
+                              "--until", ">>> done", "--", sys.executable, self.script, self.power], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env, start_new_session=True)
+        for ln in iter(q.stdout.readline, b""):                           # its handler is set and it is waiting
+            if ln.strip() == b">>> running":
+                break
         time.sleep(1.0)
+        t_sig = time.monotonic()
         os.killpg(q.pid, signal.SIGINT)                                  # Ctrl-C in a terminal reaches the whole group
-        q.communicate(timeout=30)
+        so, se = q.communicate(timeout=30)
+        took = time.monotonic() - t_sig
         r = json.loads(Path(out).read_text())
-        self.assertEqual(q.returncode, 7)
+        self.assertEqual(q.returncode, 7, f"{took:.1f} s after SIGINT; stdout {so[-300:]!r}; stderr {se[-600:]!r}")
         self.assertEqual(r["exit_code"], 7)
         self.assertTrue(r["window"]["found_until"])
         self.assertAlmostEqual(r["window_energy_j"], 45.0 * r["window_s"], delta=1e-6 * r["window_energy_j"])
@@ -452,6 +459,73 @@ class RunWindow(unittest.TestCase):
         os.close(m)
         q.wait(timeout=20)
         self.assertIn(b"size 160 50", shown)
+
+    # ---- found in review round 5
+    def test_a_slow_reader_on_joules_output_loses_nothing(self):
+        """A pager, or tee to a slow disk: joules waits for its reader instead of dropping output at the end."""
+        code = "import sys; print('go'); sys.stdout.write('x\\n' * 60_000)"   # fits in the pipes: the command exits first
+        q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu --from go -- {shlex.quote(sys.executable)} -c "
+                           f"{shlex.quote(code)} 2>/dev/null | (sleep 5; wc -c)", shell=True, capture_output=True,
+                           env=self.env(), timeout=90)
+        self.assertEqual(int(q.stdout.split()[0]), 3 + 120_000)
+
+    def test_crlf_lines_lookaround_patterns_and_no_false_note(self):
+        p, r = self.run_j(["--no-cpu", "--from", "start", "--until", "^$"],
+                          ["bash", "-c", "printf 'start\\r\\n'; sleep 0.5; printf 'a\\r\\n\\r\\n'; sleep 0.2"])
+        self.assertEqual(r["window"]["until_line"], "")                 # the real empty line, not a phantom one
+        self.assertTrue(0.4 < r["window_s"] < 0.8, r["window_s"])
+        p, r = self.run_j(["--no-cpu", "--from", "go", "--until", "(?s)done(?!.)"],
+                          ["bash", "-c", "echo go; sleep 0.3; printf 'done\\nnext\\n'; sleep 0.2"])
+        self.assertTrue(r["window"]["found_until"], r["notes"])
+        p, r = self.run_j(["--no-cpu", "--from", "start"], ["bash", "-c", "sleep 1; echo start; sleep 0.05"])
+        self.assertFalse(any("only read when" in n for n in r["notes"]), r["notes"])
+
+    def _on_own_terminal(self, cmd, cols=50, rows=30, stdout_file=None, resize=None):
+        """joules on a terminal of its own session (so a resize sends a real SIGWINCH); returns what it showed."""
+        import fcntl
+        import pty
+        import struct
+        import termios
+        m, sl = pty.openpty()
+        fcntl.ioctl(sl, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+        def own_session():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        out = open(stdout_file, "wb") if stdout_file else None
+        q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", *cmd], stdin=sl, stdout=out or sl,
+                             stderr=sl, env=self.env(), preexec_fn=own_session)
+        os.close(sl)
+        shown, t0, done = b"", time.monotonic(), False
+        while time.monotonic() - t0 < 25:
+            if resize and not done and time.monotonic() - t0 > 1.5:
+                fcntl.ioctl(m, termios.TIOCSWINSZ, struct.pack("HHHH", resize[1], resize[0], 0, 0)); done = True
+            b = select_read(m)
+            if b is None:
+                break
+            shown += b
+            if q.poll() is not None and not b:
+                break
+        os.close(m)
+        q.wait(timeout=20)
+        if out:
+            out.close()
+        return shown
+
+    def test_stderr_gets_its_own_terminal_size_when_stdout_is_a_file(self):
+        shown = self._on_own_terminal(["--from", "x", "--", sys.executable, "-c",
+                                       "import os; print('x'); import sys; sys.stderr.write('%d %d\\n' % tuple(os.get_terminal_size(2)))"],
+                                      stdout_file=os.path.join(self.d, "out"))
+        self.assertIn(b"50 30", shown)
+
+    def test_a_resize_reaches_the_command_s_children_too(self):
+        code = ("import os, signal, time\ngot = []\n"
+                "signal.signal(signal.SIGWINCH, lambda *a: got.append(os.get_terminal_size(1).columns))\n"
+                "time.sleep(3)\nprint('seen', got, flush=True)\n")
+        shown = self._on_own_terminal(["--until", "zzz", "--", "bash", "-c", f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}; true"],
+                                      resize=(100, 40))
+        seen = [ln for ln in shown.decode(errors="replace").splitlines() if ln.startswith("seen")]
+        self.assertTrue(seen and "100" in seen[0], shown[-500:])
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""

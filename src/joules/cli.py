@@ -176,7 +176,19 @@ def _not_found(cmd: list[str], windows: bool = os.name == "nt") -> int:
     return 127
 
 
-def _pty_pair() -> tuple[int, int]:
+def _term_size(dst) -> tuple[int, int]:
+    """(columns, lines) of the terminal dst writes to (each stream's own: stdout may be a file while stderr is not)."""
+    try:
+        sz = os.get_terminal_size(dst.fileno())
+        if sz.columns and sz.lines:
+            return sz.columns, sz.lines
+    except (OSError, ValueError, AttributeError):
+        pass
+    sz = shutil.get_terminal_size((80, 24))
+    return sz.columns, sz.lines
+
+
+def _pty_pair(dst=None) -> tuple[int, int]:
     """A pseudo-terminal for one of the command's streams. The command sees a terminal, so C programs flush every
     line (and keep colours and progress bars) as they would on screen; output processing is off, so the bytes reach
     joules unchanged (no \n -> \r\n)."""
@@ -189,8 +201,8 @@ def _pty_pair() -> tuple[int, int]:
     try:
         import fcntl
         import struct
-        size = shutil.get_terminal_size((80, 24))
-        fcntl.ioctl(sl, termios.TIOCSWINSZ, struct.pack("HHHH", size.lines, size.columns, 0, 0))
+        cols, rows = _term_size(dst)
+        fcntl.ioctl(sl, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     except (OSError, ImportError):
         pass
     return m, sl
@@ -199,7 +211,9 @@ def _pty_pair() -> tuple[int, int]:
 def _same_place() -> bool:
     """Do our stdout and stderr go to the same terminal or file (as on screen, or with 2>&1)?"""
     try:
-        return os.path.samestat(os.fstat(sys.stdout.fileno()), os.fstat(sys.stderr.fileno()))
+        a, b = os.fstat(sys.stdout.fileno()), os.fstat(sys.stderr.fileno())
+        # Windows gives 0 for the identity of consoles, pipes and NUL: two of those cannot be told apart
+        return os.path.samestat(a, b) and (os.name == "posix" or a.st_ino != 0)
     except (OSError, ValueError, AttributeError):
         return False
 
@@ -224,7 +238,7 @@ def _start(cmd: list[str], piped: bool = False):
                 made = []
 
                 def stream(dst):
-                    pair = _pty_pair() if _isatty(dst) else os.pipe()
+                    pair = _pty_pair(dst) if _isatty(dst) else os.pipe()
                     made.append(pair)
                     return pair
                 out = stream(sys.stdout)
@@ -504,21 +518,25 @@ def cmd_run(a) -> int:
                 except KeyboardInterrupt:
                     continue  # a late Ctrl-C must not lose the report
         if any(t.is_alive() for t in pumps):
-            moved = False
+            moved, left = False, []
             if os.name == "posix":   # stop our reader (all it read is written), then hand the streams over
                 pump_state["stop"].set()
-                for t in pumps:
-                    end = time.monotonic() + 1.0
-                    while t.is_alive() and time.monotonic() < end:
-                        with contextlib.suppress(KeyboardInterrupt):
-                            t.join(max(0.0, end - time.monotonic()))
+                try:   # it stops after the write it is in (a slow reader on our side may hold it): never drop output
+                    for t in pumps:
+                        t.join()
+                except KeyboardInterrupt:
+                    pass   # a Ctrl-C here means: stop now
                 left = [(fd, dst) for fd, dst, _ in proc.joules_streams if pump_state.get(fd) == "stopped"]
                 moved = bool(left) and not any(t.is_alive() for t in pumps) and all(_hand_off(fd, dst) for fd, dst in left)
                 for fd, _ in left:
                     with contextlib.suppress(OSError):
                         os.close(fd)
-            d.notes.append("A process the command left running still writes output; " +
-                           ("it keeps being passed on after joules finishes." if moved else "joules stopped reading it."))
+            if moved:
+                d.notes.append("The command's output was still open when it exited (a process it started, or output "
+                               "not yet passed on); a small helper keeps passing it on after joules finishes.")
+            elif left or os.name != "posix":   # (POSIX: nothing left open once the reader drained it all)
+                d.notes.append("The command's output was still open when it exited (a process it started keeps it "
+                               "open); joules stopped reading it.")
         if os.name == "posix":
             _stop_following(old_winch)
     devices = _devices(d, idle, s.duration_s)
@@ -585,7 +603,7 @@ class Window:
         self.end = None
         self.frozen = None   # set when the command has exited: a mark read after that is the end of the run
         # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
-        self.pre = {rx: (None if re.search(r"\\[AZ]", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
+        self.pre = {rx: (None if re.search(r"\\[AZ]|\(\?", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
                     for rx in (self.start_re, self.end_re) if rx}
 
     def _mark(self, text: str) -> dict:
@@ -602,7 +620,7 @@ class Window:
             self.frozen = {"t": snap["t"], "j": dict(snap["j"])}
 
     def _lines(self, text: str, rx) -> list[str] | None:
-        text = ANSI.sub("", text).replace("\r", "\n")   # a marker printed in colour still matches
+        text = ANSI.sub("", text).replace("\r\n", "\n").replace("\r", "\n")   # colour codes off; \r\n is one line end
         pre = self.pre.get(rx)
         if pre is not None and not pre.search(text):
             return None
@@ -659,7 +677,8 @@ class _Lines:
         i = max(data.rfind(b"\n"), data.rfind(b"\r"))
         done = None
         if i >= 0:
-            done, data = data[:i].decode("utf-8", "replace"), data[i + 1:]
+            j = i - 1 if data[i:i + 1] == b"\n" and data[i - 1:i] == b"\r" else i   # \r\n is one line end
+            done, data = data[:j].decode("utf-8", "replace"), data[i + 1:]
         if len(data) > 1 << 20:
             if done is not None:
                 win.feed([done]); done = None
@@ -773,24 +792,29 @@ COPIER = ("import os, sys\n"
 
 def _follow_resizes(proc):
     """When the user resizes the terminal, give the command's pseudo-terminals the new size too."""
-    ptys = [fd for fd, dst, _ in proc.joules_streams if _isatty(dst)]
+    ptys = [(fd, dst) for fd, dst, _ in proc.joules_streams if _isatty(dst)]
     if not ptys or not hasattr(signal, "SIGWINCH") or threading.current_thread() is not threading.main_thread():
         return None
+    echo = {"n": 0}   # signals we sent ourselves (the command shares joules' process group)
 
     def resize(*_):
+        if echo["n"] > 0:
+            echo["n"] -= 1
+            return
         try:
             import fcntl
             import struct
             import termios
-            size = shutil.get_terminal_size((80, 24))
-            for fd in ptys:
+            for fd, dst in ptys:
+                cols, rows = _term_size(dst)
                 with contextlib.suppress(OSError):
-                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", size.lines, size.columns, 0, 0))
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         except ImportError:
             return
-        if proc.poll() is None:   # it may have read its size already on the terminal's own signal: tell it again
+        if proc.poll() is None:   # the command and its children may have read their size already: tell them again
+            echo["n"] += 1
             with contextlib.suppress(OSError):
-                os.kill(proc.pid, signal.SIGWINCH)
+                os.killpg(os.getpgrp(), signal.SIGWINCH)
     try:
         return ("set", signal.signal(signal.SIGWINCH, resize))
     except (ValueError, OSError):
@@ -829,7 +853,8 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         after = "after the --from line" if a.window_from is not None else "in the command's output"
         notes.append(f"--until {a.window_until!r} never appeared {after}, so the window runs to the end of the command.")
     exit_t = (w.frozen or {}).get("t", s.t1)
-    if begin.get("late") or end.get("late") or (a.window_from is not None and begin["t"] >= exit_t - 0.1):
+    at_exit = a.window_from is not None and end["t"] - begin["t"] < 0.01 and begin["t"] >= exit_t - 0.1
+    if begin.get("late") or end.get("late") or at_exit:   # (a window of no time that ends as the command exits)
         notes.append("The marker lines were only read when the command exited, so the window may be wrong: the command "
                      "probably held its output (a C program writing into a file or pipe does). Run it with `stdbuf -oL` "
                      "(Linux), or let joules write to a terminal.")
