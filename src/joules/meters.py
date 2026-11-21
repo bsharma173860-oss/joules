@@ -66,6 +66,9 @@ class Meter:
 class CounterMeter(Meter):
     """Hardware energy counter in joules; wrap is the counter's range (None if it never wraps)."""
     wrap_j: float | None = None
+    # Peak power is taken over windows of at least this long: counters are refreshed in steps (NVML about every
+    # 100 ms), so one poll gap can hold two refreshes and a steady 300 W would show as a peak near 600 W.
+    peak_window_s = 1.0
 
     def read_j(self) -> float:
         raise NotImplementedError
@@ -73,19 +76,28 @@ class CounterMeter(Meter):
     def start(self, now: float) -> None:
         super().start(now)
         self._last = self.read_j()
+        self._win_e, self._win_t0, self._win_done = 0.0, now, False
 
     def poll(self, now: float) -> None:
         v = self.read_j()
         d = v - self._last
         if d < 0:
             d += self.wrap_j if self.wrap_j else 0.0
-        dt = now - self._t_last
         if d >= 0:  # the counter's change is energy used whatever the clock says (two readers may poll out of order)
-            if dt > 0:
-                self.peak_w = max(self.peak_w, d / dt)
             self.energy_j += d
+            self._win_e += d
         self._last = v
         self._t_last = max(self._t_last, now)
+        span = self._t_last - self._win_t0
+        if span >= self.peak_window_s:
+            self.peak_w = max(self.peak_w, self._win_e / span)
+            self._win_e, self._win_t0, self._win_done = 0.0, self._t_last, True
+
+    def stop(self, now: float) -> None:
+        self.poll(now)
+        span = self._t_last - self._win_t0
+        if not self._win_done and span > 0:  # shorter than one window: the average is the best peak there is
+            self.peak_w = max(self.peak_w, self._win_e / span)
 
 
 class PowerMeter(Meter):
