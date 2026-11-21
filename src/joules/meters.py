@@ -885,7 +885,10 @@ class NvmlCounterMeter(GpuHealth, CounterMeter):
         self.nvml, self.h = nvml, h
 
     def read_j(self) -> float:
-        return self.nvml.energy_mj(self.h) / 1000.0
+        mj = self.nvml.energy_mj(self.h)
+        if mj is None:  # NVML returned an error: an OSError makes the sampler skip this poll instead of dying
+            raise OSError(f"{self.name}: NVML energy read failed")
+        return mj / 1000.0
 
     def start(self, now: float) -> None:
         super().start(now)
