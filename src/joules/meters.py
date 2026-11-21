@@ -420,7 +420,9 @@ class AdlxPowerMeter(PowerMeter):
 
     def read_w(self) -> float:
         w = self.adlx.power_w(self.gpu, self.board)
-        return w if w is not None else 0.0
+        if w is None:  # a failed read: skip this poll (the next good one bridges the gap) rather than integrate 0 W
+            raise OSError(f"{self.name}: ADLX power read failed")
+        return w
 
 
 def discover_adlx(notes: list[str], gpus: list[int] | None = None) -> tuple[list[Meter], Adlx | None]:
@@ -908,7 +910,10 @@ class NvmlPowerMeter(GpuHealth, PowerMeter):
         self.nvml, self.h = nvml, h
 
     def read_w(self) -> float:
-        return (self.nvml.power_mw(self.h) or 0) / 1000.0
+        mw = self.nvml.power_mw(self.h)
+        if mw is None:  # a failed read: skip this poll (the next good one bridges the gap) rather than integrate 0 W
+            raise OSError(f"{self.name}: NVML power read failed")
+        return mw / 1000.0
 
     def start(self, now: float) -> None:
         super().start(now)
