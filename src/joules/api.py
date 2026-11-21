@@ -113,7 +113,7 @@ class Session:
             raise NoMeters("; ".join(self.discovery.notes) or "no energy counters found")
         self.meters = self.discovery.meters
         self.notes = list(self.discovery.notes)
-        self._sampler = Sampler(self.meters, interval)
+        self._sampler = Sampler(self.meters, interval, notes=self.notes)
         self._sampler.__enter__()
         self.clock = PhaseClock(self.meters, self._sampler.lock)
         self._start = self.clock.snapshot()  # the whole session is measured like one phase, outside the phase lists

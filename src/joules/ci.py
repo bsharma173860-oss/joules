@@ -26,7 +26,7 @@ MARKER = "<!-- landauer-gap-energy-check -->"
 
 
 def measure(d: Discovery, cmd: list[str], cwd: str, interval: float) -> dict:
-    with Sampler(d.meters, interval) as s:
+    with Sampler(d.meters, interval, notes=d.notes) as s:
         p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL)
         for m in d.meters:
             if hasattr(m, "attach"):

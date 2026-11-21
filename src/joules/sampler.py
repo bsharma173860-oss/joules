@@ -8,8 +8,10 @@ from .meters import Meter
 
 
 class Sampler:
-    def __init__(self, meters: list[Meter], interval: float = 0.1, lock: threading.Lock | None = None):
+    def __init__(self, meters: list[Meter], interval: float = 0.1, lock: threading.Lock | None = None,
+                 notes: list[str] | None = None):
         self.meters = meters
+        self.notes = notes if notes is not None else []  # read errors at start or stop are explained here
         self.interval = interval
         self.lock = lock or threading.Lock()  # shared with a PhaseClock, which reads the meters between polls
         self._stop = threading.Event()
@@ -18,8 +20,12 @@ class Sampler:
 
     def __enter__(self) -> "Sampler":
         self.t0 = time.monotonic()
+        self._unstarted: list[Meter] = []
         for m in self.meters:
-            m.start(self.t0)
+            try:
+                m.start(self.t0)
+            except (OSError, ValueError):
+                self._unstarted.append(m)  # retried on every poll until a reading works
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
@@ -30,7 +36,13 @@ class Sampler:
                 now = time.monotonic()
                 for m in self.meters:
                     try:
-                        m.poll(now)
+                        if m in self._unstarted:
+                            m.start(now)
+                            self._unstarted.remove(m)
+                            self._note(f"{m.name}: the first reading failed, so its energy is measured from "
+                                       f"{now - self.t0:.1f} s into the run.")
+                        else:
+                            m.poll(now)
                     except (OSError, ValueError):
                         pass  # a transient read error loses one interval, not the run
 
@@ -41,7 +53,19 @@ class Sampler:
         with self.lock:
             self.t1 = time.monotonic()
             for m in self.meters:
-                m.stop(self.t1)
+                if m in self._unstarted:
+                    self._note(f"{m.name}: no reading worked during the run, so its energy is not counted.")
+                    continue
+                try:
+                    m.stop(self.t1)
+                except (OSError, ValueError):
+                    last = m._t_last if m._t_last is not None else self.t0
+                    self._note(f"{m.name}: the last reading failed, so its energy runs to the last good reading, "
+                               f"{self.t1 - last:.1f} s before the end.")
+
+    def _note(self, text: str) -> None:
+        if text not in self.notes:
+            self.notes.append(text)
 
     @property
     def duration_s(self) -> float:

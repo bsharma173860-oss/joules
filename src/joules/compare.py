@@ -257,7 +257,7 @@ def lock_text(locks: dict | None) -> str:
 
 def measure(d: Discovery, cmd, shell: bool, interval: float, quiet: bool) -> dict:
     out = subprocess.DEVNULL if quiet else None
-    with Sampler(d.meters, interval) as s:
+    with Sampler(d.meters, interval, notes=d.notes) as s:
         p = subprocess.Popen(cmd, shell=shell, stdin=subprocess.DEVNULL, stdout=out)
         for m in d.meters:
             if hasattr(m, "attach"):
