@@ -382,7 +382,7 @@ def fairness_notes(rows: list[dict], cool_to: float | None = None, locks: dict |
     notes = []
     ns = [r["runs"] for r in rows]
     if len(ns) >= 2 and min_p(min(ns), min(ns)) > 0.05:
-        notes.append(f"With {min(ns)} runs each, p cannot go below {min_p(min(ns), min(ns)):.2f} even for a real difference; "
+        notes.append(f"With {min(ns)} run{'s' if min(ns) != 1 else ''} each, p cannot go below {min_p(min(ns), min(ns)):.2f} even for a real difference; "
                      "use --runs 5 or more for a result that can reach p < 0.01.")
     g = [(r["name"], r["gpu"]) for r in rows if r.get("gpu")]
     thr = [(n, x["throttled_pct"]) for n, x in g if x.get("throttled_pct") is not None]
@@ -451,14 +451,19 @@ def _p(p: float | None) -> str:
     return "p < 0.001" if p < 0.001 else f"p = {p:.3f}" if p < 0.1 else f"p = {p:.2f}"
 
 
+def _pp(p: float | None) -> str:
+    """ (p = …) after a change, or nothing when there is no p-value (one run each)."""
+    return f" ({_p(p)})" if p is not None else ""
+
+
 def verdict_line(row: dict) -> str:
     v = row["vs"]
-    line = (f"{row['name']} vs {v['baseline']}: energy {_pct(v['energy_pct'])} ({_p(v['energy_p'])}), "
-            f"time {_pct(v['time_pct'])} ({_p(v['time_p'])}), energy × time {_pct(v['edp_pct'])} ({_p(v['edp_p'])})")
+    line = (f"{row['name']} vs {v['baseline']}: energy {_pct(v['energy_pct'])}{_pp(v['energy_p'])}, "
+            f"time {_pct(v['time_pct'])}{_pp(v['time_p'])}, energy × time {_pct(v['edp_pct'])}{_pp(v['edp_p'])}")
     if v.get("power_pct") is not None:
         line += f", average power {_pct(v['power_pct'])}"
     if v.get("above_idle_pct") is not None:
-        line += f", above idle {_pct(v['above_idle_pct'])} ({_p(v['above_idle_p'])})"
+        line += f", above idle {_pct(v['above_idle_pct'])}{_pp(v['above_idle_p'])}"
     return line
 
 
@@ -498,7 +503,7 @@ def render(r: dict) -> str:
 
 
 def markdown(r: dict) -> str:
-    out = [f"### Energy comparison ({r['runs']} runs each, {r['order']}, joules {r['tool'].split()[-1]})", "",
+    out = [f"### Energy comparison ({r['runs']} run{'s' if r['runs'] != 1 else ''} each, {r['order']}, joules {r['tool'].split()[-1]})", "",
            f"Devices: {', '.join(r['devices'])}", ""]
     if r.get("locked_mhz"):
         out += [f"GPU clocks: SM clock locked at {lock_text(r['locked_mhz'])} (nvidia-smi -lgc) for every run, warm-ups included.", ""]

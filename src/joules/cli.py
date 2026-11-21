@@ -214,8 +214,8 @@ def _plain_streams() -> None:
 # ---------------------------------------------------------------- shared options
 def common(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("measurement")
-    g.add_argument("--interval", type=float, default=0.1, help="sampling interval in seconds (default 0.1)")
-    g.add_argument("--gpus", help="only these GPU indices, e.g. 0,1 (default: CUDA_VISIBLE_DEVICES or all)")
+    g.add_argument("--interval", type=_interval_arg, default=0.1, help="sampling interval in seconds (default 0.1)")
+    g.add_argument("--gpus", type=_gpus_arg, help="only these GPU indices, e.g. 0,1 (default: CUDA_VISIBLE_DEVICES or all)")
     g.add_argument("--no-cpu", action="store_true", help="do not measure CPU and DRAM")
     g.add_argument("--subtract-idle", type=float, default=0, metavar="SECONDS",
                    help="first measure the idle machine for this long and report energy above idle too")
@@ -227,6 +227,26 @@ def common(p: argparse.ArgumentParser) -> None:
     o = p.add_argument_group("output")
     o.add_argument("--json", action="store_true", help="print the result as JSON")
     o.add_argument("--out", metavar="FILE", help="also write the JSON result to FILE")
+
+
+def _gpus_arg(s: str) -> str:
+    """--gpus: comma-separated GPU indices, checked when the command line is read rather than after setup."""
+    if not s.strip():
+        return s  # empty: all GPUs, as before
+    toks = [t.strip() for t in s.split(",")]
+    if not all(t.isascii() and t.isdigit() for t in toks):
+        raise argparse.ArgumentTypeError(f"expected GPU indices separated by commas, e.g. 0,1 (got {s!r})")
+    return ",".join(toks)
+
+
+def _interval_arg(s: str) -> float:
+    try:
+        v = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of seconds (got {s!r})") from None
+    if not v > 0 or v == float("inf"):
+        raise argparse.ArgumentTypeError(f"must be more than 0 seconds (got {s})")
+    return v
 
 
 def _gpu_list(s: str | None):
@@ -712,7 +732,10 @@ def cmd_ci(a) -> int:
                     if cwd is None:
                         continue
                     print(dim(f"joules ci: {side}, run {i + 1 - a.warmup if i >= a.warmup else 'warm-up'}…"), file=sys.stderr)
-                    r = ci.measure(d, cmd, cwd, a.interval)
+                    try:
+                        r = ci.measure(d, cmd, cwd, a.interval)
+                    except FileNotFoundError:
+                        return _not_found(cmd)
                     if r["exit_code"] != 0:
                         raise RuntimeError(f"the command failed on {side} (exit {r['exit_code']}): {short_cmd(cmd)}")
                     if i >= a.warmup:
@@ -822,7 +845,11 @@ def cmd_compare(a) -> int:
                         t0 = cmp.wait_cool(gpus, a.cool_to, a.cool_timeout, cmp.log) if (a.cool_to is not None and gpus) else cmp.hottest(gpus)
                         cmp.log(f"{names[i]}, {'warm-up' if warm else f'run {rnd - a.warmup + 1} of {a.runs}'} ({k}/{total})")
                         started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-                        r = cmp.measure(d, argvs[i], a.shell, a.interval, a.quiet)
+                        try:
+                            r = cmp.measure(d, argvs[i], a.shell, a.interval, a.quiet)
+                        except FileNotFoundError:
+                            d.close()
+                            return _not_found(argvs[i] if isinstance(argvs[i], list) else [argvs[i]])
                         if r["exit_code"] != 0:
                             raise RuntimeError(f"{names[i]} failed (exit {r['exit_code']}): {cmds[i]}")
                         if warm:
@@ -1613,8 +1640,8 @@ def build_parser() -> argparse.ArgumentParser:
     ag.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1; 0.0.0.0 lets Prometheus on another machine scrape it)")
     ag.add_argument("--port", type=int, default=9877, help="port to listen on (default 9877)")
     ag.add_argument("--name", help="this machine's name in metrics (default: host name; in Kubernetes pass the node name)")
-    ag.add_argument("--interval", type=float, default=1.0, help="seconds between readings (default 1)")
-    ag.add_argument("--gpus", help="only these GPU indices, e.g. 0,1 (default all)")
+    ag.add_argument("--interval", type=_interval_arg, default=1.0, help="seconds between readings (default 1)")
+    ag.add_argument("--gpus", type=_gpus_arg, help="only these GPU indices, e.g. 0,1 (default all)")
     ag.add_argument("--no-cpu", action="store_true", help="do not measure CPU and DRAM")
     ag.add_argument("--idle-util", type=float, default=5.0, metavar="PERCENT",
                     help="a job's GPU energy counts as idle while the GPU is under this busy %% (default 5)")
@@ -1675,7 +1702,7 @@ def build_parser() -> argparse.ArgumentParser:
                         description="Checks what joules can measure here (with a live reading from each meter), the GPU "
                                     "drivers, CPU energy counters, your API key, the connection to WattOps and Ollama. "
                                     "The report has no key, machine name, user name or home folder.")
-    dr.add_argument("--gpus", help="only these GPU indices, e.g. 0,1")
+    dr.add_argument("--gpus", type=_gpus_arg, help="only these GPU indices, e.g. 0,1")
     dr.add_argument("--seconds", type=float, default=1.0, help="how long to read each meter (default 1)")
     dr.add_argument("--offline", action="store_true", help="do not contact WattOps or Ollama")
     dr.add_argument("--json", action="store_true", help="print the report as JSON")
@@ -1722,7 +1749,7 @@ def build_parser() -> argparse.ArgumentParser:
     te.set_defaults(fn=cmd_telemetry)
 
     dv = sub.add_parser("devices", help="list what can be measured here")
-    dv.add_argument("--gpus"); dv.add_argument("--no-cpu", action="store_true"); dv.add_argument("--json", action="store_true")
+    dv.add_argument("--gpus", type=_gpus_arg); dv.add_argument("--no-cpu", action="store_true"); dv.add_argument("--json", action="store_true")
     dv.set_defaults(fn=cmd_devices)
     return p
 
