@@ -134,12 +134,16 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
   - If `--until` never appears, the window runs to the end.
   - If `--from` never appears, joules says so and you get the whole run.
 - **Output:** the script's output still reaches you as it is printed, stdout and stderr, unchanged.
-  - The script now writes into a pipe, not a terminal, so some tools drop their colours or progress bars.
-  - Lines from stdout and stderr may interleave a little differently.
-  - A server the script leaves running does not keep joules waiting.
-- **Laptop GPUs:** many have no energy counter. joules then samples their power every 0.1 s (`joules doctor` says
-  "power readings (no energy counter)"), so a window shorter than a few seconds is less exact. Leave
-  `--subtract-idle` on for a laptop, where the idle draw is a large share.
+  - On Linux and macOS the script runs on its own terminal (a pseudo-terminal), so programs print line by line and
+    keep their colours and progress bars, as on screen. On Windows it writes into a pipe instead: programs that
+    buffer their output there can show their marker lines late.
+  - Measuring stops when the script exits. A server it leaves running keeps its output after joules finishes, and
+    does not keep joules waiting.
+  - The CPU-time estimate (used where there are no energy counters) is only known for the whole run, so it is not
+    in the window.
+- **Laptop GPUs:** many have no energy counter. joules then samples their power, every 0.1 s by default
+  (`--interval`; `joules doctor` says "power readings (no energy counter)"), so a window shorter than a few seconds
+  is less exact. Leave `--subtract-idle` on for a laptop, where the idle draw is a large share.
 
 ## Phases of your own program
 

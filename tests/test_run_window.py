@@ -3,6 +3,7 @@ model server has loaded. Tested end to end on a stand-in laptop GPU that reports
 with a script shaped like a typical benchmark runner: a server started in the background and killed by a trap, a
 model-loading phase, then the benchmark between two marker lines, each phase at its own power."""
 import json
+import shlex
 import os
 import shutil
 import subprocess
@@ -129,12 +130,27 @@ class RunWindow(unittest.TestCase):
         self.assertTrue(any("runs to the end" in n for n in r["notes"]), r["notes"])
         self.assertGreater(r["window_s"], 2.9)                           # benchmark + the tail after it
 
+    def env(self, **extra):
+        e = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "HOME": self.d, "JOULES_NO_PROMPT": "1", "JOULES_TELEMETRY": "0",
+             "JOULES_NVML_LIB": self.laptop, "FAKE_NVML_POWER_FILE": self.power, "NO_COLOR": "1", **extra}
+        e.pop("JOULES_SIMULATE", None)
+        return e
+
     def test_a_background_process_left_running_does_not_hang_joules(self):
+        """joules itself finishes promptly; the leftover process keeps its output (here it holds it 30 s)."""
         Path(self.script).write_text("#!/bin/bash\n(sleep 30) &\necho '>>> running'\nsleep 0.5\necho '>>> done'\n")
-        p, r, took = self.joules(["--from", r">>> running", "--until", r">>> done"], timeout=25)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertLess(took, 15)
-        self.assertTrue(r["window_s"] > 0.3)
+        out = os.path.join(self.d, "r.json")
+        with open(os.path.join(self.d, "stdout"), "wb") as so:
+            t0 = time.monotonic()
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--out", out, "--from", ">>> running",
+                                  "--until", ">>> done", "--", "bash", self.script], stdout=so, stderr=subprocess.DEVNULL, env=self.env())
+            code = q.wait(timeout=25)
+            took = time.monotonic() - t0
+        r = json.loads(Path(out).read_text())
+        self.assertEqual(code, 0)
+        self.assertLess(took, 8)
+        self.assertTrue(0.3 < r["window_s"] < 1.5, r["window_s"])
+        self.assertLess(r["duration_s"], 2.0)                            # measuring stopped when the command exited
 
     def test_only_the_first_markers_count(self):
         """A repeated --from line does not restart the window, and a line matching both starts it but does not end it."""
@@ -201,6 +217,85 @@ class RunWindow(unittest.TestCase):
         self.assertEqual(r["exit_code"], 7)
         self.assertTrue(r["window"]["found_until"])
         self.assertAlmostEqual(r["window_energy_j"], 45.0 * r["window_s"], delta=1e-6 * r["window_energy_j"])
+
+    # ---- found in review round 2
+    def run_j(self, args, cmd, lib=None, timeout=60, **kw):
+        out = os.path.join(self.d, "r.json")
+        p = subprocess.run([sys.executable, "-m", "joules", "run", "--out", out, *args, "--", *cmd], capture_output=True,
+                           env=self.env(JOULES_NVML_LIB=lib or self.laptop), timeout=timeout, **kw)
+        return p, (json.loads(Path(out).read_text()) if os.path.exists(out) else None)
+
+    def test_a_c_program_that_buffers_into_pipes_still_marks_on_time(self):
+        """C stdio buffers a pipe until exit; on its own terminal the program flushes each line, so marks are on time."""
+        src = os.path.join(self.d, "cbuf.c")
+        Path(src).write_text('#include <stdio.h>\n#include <unistd.h>\nint main(void){puts("loading");sleep(1);'
+                             'puts("start");sleep(2);puts("end");sleep(1);return 0;}\n')
+        exe = os.path.join(self.d, "cbuf")
+        subprocess.run(["gcc", "-O2", "-o", exe, src], check=True)
+        p, r = self.run_j(["--no-cpu", "--from", "^start", "--until", "^end"], [exe])
+        self.assertTrue(1.8 < r["window_s"] < 2.4, r["window"])
+        self.assertTrue(0.8 < r["window"]["starts_at_s"] < 1.5, r["window"])
+        self.assertIn(b"loading\nstart\nend\n", p.stdout)                 # unchanged bytes: no \r added by the terminal
+
+    def test_a_leftover_process_does_not_lengthen_the_measurement(self):
+        p0, r0 = self.run_j(["--no-cpu"], ["bash", "-c", "(sleep 4) & sleep 1"], timeout=30)
+        p1, r1 = self.run_j(["--no-cpu", "--from", "x"], ["bash", "-c", "(sleep 4) & sleep 1"], timeout=30)
+        self.assertLess(r1["duration_s"], r0["duration_s"] + 0.3)
+        self.assertLess(r1["totals"]["devices_j"], r0["totals"]["devices_j"] * 1.3)
+
+    def test_a_server_left_running_keeps_its_output_after_joules_exits(self):
+        log = os.path.join(self.d, "server.log")
+        Path(self.script).write_text(textwrap.dedent("""\
+            #!/bin/bash
+            ( trap 'echo "server got SIGPIPE" >> "$LOG"; exit 1' PIPE
+              for i in $(seq 15); do echo "server log $i" || { echo "server write failed" >> "$LOG"; exit 1; }; sleep 0.2; done
+              echo "server finished normally" >> "$LOG" ) &
+            echo start; sleep 0.5; echo end
+            """))
+        with open(os.path.join(self.d, "stdout"), "wb") as so:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "start", "--", "bash", self.script],
+                                 stdout=so, stderr=subprocess.DEVNULL, env=self.env(LOG=log))
+            self.assertEqual(q.wait(timeout=20), 0)
+        for _ in range(100):
+            if os.path.exists(log):
+                break
+            time.sleep(0.1)
+        self.assertEqual(Path(log).read_text().strip(), "server finished normally")
+        self.assertIn(b"server log 15", Path(self.d, "stdout").read_bytes())
+
+    def test_a_closed_output_stops_the_command_as_without_a_window(self):
+        q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu --from x -- yes | head -1", shell=True,
+                           capture_output=True, env=self.env(), timeout=30)
+        self.assertEqual(q.stdout, b"y\n")
+
+    def test_the_cpu_time_estimate_is_not_put_in_a_window(self):
+        p, r = self.run_j(["--from", "start", "--until", "end"], ["bash", "-c", "echo start; sleep 0.3; echo end"],
+                          lib=os.path.join(self.d, "no-such-lib.so"))
+        if not any(x["kind"] == "est" for x in r["devices"]):
+            self.skipTest("this machine has real energy counters")
+        self.assertTrue(any("CPU-time estimate" in n for n in r["notes"]), r["notes"])
+        if all(x["kind"] == "est" for x in r["devices"]):
+            self.assertIsNone(r["window_energy_j"])
+
+    def test_a_marker_inside_a_very_long_line(self):
+        code = 'import sys, time; sys.stdout.write("a" * 1500000 + "START" + "b" * 1500000 + "\\n"); sys.stdout.flush(); time.sleep(0.5)'
+        p, r = self.run_j(["--no-cpu", "--from", "START"], [sys.executable, "-c", code])
+        self.assertTrue(r["window"]["found_from"], r["notes"])
+        self.assertEqual(len(p.stdout), 3000006)                         # passed on in full
+
+    def test_chatty_output_is_not_slowed_down(self):
+        cmd = ["bash", "-c", "yes | head -c 40000000"]
+        t0 = time.monotonic(); self.run_j(["--no-cpu"], cmd); plain = time.monotonic() - t0
+        t0 = time.monotonic(); p, r = self.run_j(["--no-cpu", "--from", "never"], cmd); win = time.monotonic() - t0
+        self.assertEqual(len(p.stdout), 40000000)
+        self.assertLess(win, plain + 3.0)
+
+    def test_until_alone_and_an_empty_from(self):
+        p, r = self.run_j(["--no-cpu", "--until", "no such line"], ["bash", "-c", "echo hi; sleep 0.3"])
+        self.assertTrue(any("never appeared in the command's output" in n and "--from" not in n for n in r["notes"]), r["notes"])
+        p, r = self.run_j(["--no-cpu", "--from", ""], ["bash", "-c", "sleep 0.3; echo first; sleep 0.5"])
+        self.assertTrue(r["window"]["found_from"])                       # an empty pattern matches the first line
+        self.assertTrue(0.2 < r["window"]["starts_at_s"] < 0.9, r["window"])
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
