@@ -237,6 +237,21 @@ def _product_name(hw: str, fallback: str) -> str:
     return re.sub(r"\s+", " ", name)[:80] or fallback
 
 
+# PCI device IDs (vendor 1002) of AMD's built-in GPUs (APUs: Ryzen with Radeon graphics, Steam Deck, MI300A). On these
+# amdgpu's power1_average / power1_input is the power of the whole chip, which the CPU package's RAPL figure also covers.
+_AMD_APU_IDS = {0x15dd, 0x15d8, 0x1636, 0x1638, 0x164c, 0x15e7, 0x163f, 0x1681, 0x164e, 0x1506, 0x15bf, 0x15c8,
+                0x150e, 0x1586, 0x1114, 0x13c0, 0x74a0}
+
+
+def _amd_apu(hw: str) -> bool:
+    """Is this amdgpu hwmon folder a built-in GPU (APU)?"""
+    try:
+        dev = os.path.join(hw, "..", "..")
+        return int(_read(os.path.join(dev, "vendor")), 16) == 0x1002 and int(_read(os.path.join(dev, "device")), 16) in _AMD_APU_IDS
+    except (OSError, ValueError):
+        return False
+
+
 def _pci_of(hw: str) -> str | None:
     """PCI address of the card a hwmon folder belongs to, e.g. 0000:03:00.0 (matches drm-pdev in /proc/<pid>/fdinfo)."""
     name = os.path.basename(os.path.realpath(os.path.join(hw, "device")))
@@ -261,12 +276,14 @@ def discover_amdgpu(notes: list[str], gpus: list[int] | None = None) -> list[Met
         if os.path.exists(os.path.join(hw, "energy1_input")):
             meters.append(HwmonEnergyMeter(hw, label))
             meters[-1].pci = _pci_of(hw)
+            meters[-1].apu = _amd_apu(hw)
             continue
         for f in ("power1_average", "power1_input"):
             p = os.path.join(hw, f)
             if os.path.exists(p):
                 meters.append(HwmonPowerMeter(p, label))
                 meters[-1].pci = _pci_of(hw)
+                meters[-1].apu = _amd_apu(hw)
                 break
         else:
             notes.append(f"{label}: the amdgpu driver reports no energy or power here.")
@@ -1257,7 +1274,14 @@ def discover(gpus: list[int] | None = None, cpu: bool = True, estimate: bool = F
         handles.append(adlx)
     meters += discover_intelgpu(notes)
     if cpu:
-        meters += discover_rapl(notes)
+        rapl = discover_rapl(notes)
+        meters += rapl
+        if rapl and any(m.kind == "cpu" for m in rapl):
+            for m in meters:
+                if getattr(m, "apu", False):  # same kind of warning as the ADLX path gives for built-in GPUs
+                    notes.append(f"{m.name}: built-in GPU. On AMD APUs the amdgpu driver reports the power of the whole chip, "
+                                 "which the CPU package figure (RAPL) also covers, so the total may count it twice. "
+                                 "Use --no-cpu or --gpus to measure one of them.")
         if platform.system() == "Darwin":
             root = hasattr(os, "geteuid") and os.geteuid() == 0
             sudo = not root and mac_sudo(notes)
