@@ -16,6 +16,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+def select_read(fd):
+    """Read what a pseudo-terminal has (b"" if nothing yet), or None once it is closed."""
+    import select
+    if not select.select([fd], [], [], 0.1)[0]:
+        return b""
+    try:
+        return os.read(fd, 65536) or None
+    except OSError:
+        return None
+
 # Power (mW) changes at least half a second before and after every marker line, so the window sees one constant
 # power and its exact energy is that power times the window's length, whatever the sampling phase.
 RUNNER = textwrap.dedent("""\
@@ -370,6 +381,77 @@ class RunWindow(unittest.TestCase):
         p, r = self.run_j(["--no-cpu", "--from", ""], ["bash", "-c", "sleep 0.3; echo first; sleep 0.5"])
         self.assertTrue(r["window"]["found_from"])                       # an empty pattern matches the first line
         self.assertTrue(0.2 < r["window"]["starts_at_s"] < 0.9, r["window"])
+
+    # ---- found in review round 4
+    def test_markers_on_streams_that_go_to_different_places(self):
+        """print() to stdout and logging to stderr, each into its own file: both marks are found, every time."""
+        code = ("import sys, time\ntime.sleep(0.3)\nsys.stdout.write('START\\n'); sys.stdout.flush()\n"
+                "sys.stderr.write('END\\n'); sys.stderr.flush()\ntime.sleep(0.6)\n")
+        out = os.path.join(self.d, "r.json")
+        for _ in range(5):
+            with open(os.path.join(self.d, "o"), "wb") as o, open(os.path.join(self.d, "e"), "wb") as e:
+                subprocess.run([sys.executable, "-m", "joules", "run", "--no-cpu", "--out", out, "--from", "START",
+                                "--until", "END", "--", sys.executable, "-c", code], stdout=o, stderr=e, env=self.env(), timeout=60)
+            r = json.loads(Path(out).read_text())
+            self.assertTrue(r["window"]["found_until"], r["notes"])
+            self.assertLess(r["window_s"], 0.3)
+
+    def test_charset_codes_anchors_and_a_closed_output(self):
+        p, r = self.run_j(["--no-cpu", "--from", "^>>> running"],
+                          ["bash", "-c", "printf '\\033(B\\033[m>>> running\\n'; sleep 0.3"])   # what tput sgr0 prints
+        self.assertTrue(r["window"]["found_from"], r["notes"])
+        p, r = self.run_j(["--no-cpu", "--from", r"\A>>> start"], ["bash", "-c", "printf 'one\\n>>> start\\nthree\\n'; sleep 0.3"])
+        self.assertTrue(r["window"]["found_from"], r["notes"])
+        q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu --from x -- bash -c 'echo hi; echo x; sleep 0.3' >&-",
+                           shell=True, capture_output=True, env=self.env(), timeout=60)
+        self.assertNotIn(b"Traceback", q.stderr)
+
+    def test_until_is_never_the_same_long_line_as_from(self):
+        code = ("import sys, time\nw = sys.stdout.buffer\n"                 # MARK just past where the long line is trimmed
+                "w.write(b'a' * (33 * 65536 - 200) + b' MARK ' + b'b' * 300000 + b'\\n'); w.flush()\n"
+                "time.sleep(1.0)\nw.write(b'MARK second\\n'); w.flush()\ntime.sleep(0.2)\n")
+        p, r = self.run_j(["--no-cpu", "--from", "MARK", "--until", "MARK"], [sys.executable, "-c", code])
+        self.assertEqual(r["window"]["until_line"], "MARK second")
+        self.assertTrue(0.8 < r["window_s"] < 1.5, r["window_s"])
+
+    def test_markers_read_only_at_exit_are_flagged(self):
+        src = os.path.join(self.d, "late.c")
+        Path(src).write_text('#include <stdio.h>\n#include <unistd.h>\nint main(void){puts(">>> running");sleep(1);'
+                             'puts(">>> done");sleep(1);return 0;}\n')
+        exe = os.path.join(self.d, "late")
+        subprocess.run(["gcc", "-O2", "-o", exe, src], check=True)
+        p, r = self.run_j(["--no-cpu", "--from", ">>> running", "--until", ">>> done"], [exe])   # into a pipe: held to exit
+        self.assertTrue(any("only read when the command exited" in n for n in r["notes"]), r["notes"])
+        p, r = self.run_j(["--no-cpu", "--from", ">>> running trie", "--until", r">>> done\."], ["bash", self.script])
+        self.assertFalse(any("only read when" in n for n in r["notes"]), r["notes"])           # an on-time run: no note
+
+    def test_a_resized_terminal_reaches_the_command(self):
+        import fcntl
+        import pty
+        import signal as sig
+        import struct
+        import termios
+        m, sl = pty.openpty()
+        fcntl.ioctl(sl, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        code = ("import os, signal, time\nsignal.signal(signal.SIGWINCH, lambda *a: print('size', *os.get_terminal_size(1), flush=True))\n"
+                "print('size', *os.get_terminal_size(1), flush=True)\ntime.sleep(2.5)\n")
+        q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--until", "zzz", "--", sys.executable, "-c", code],
+                             stdin=sl, stdout=sl, stderr=sl, env=self.env(), start_new_session=True)
+        os.close(sl)
+        shown, t0 = b"", time.monotonic()
+        while time.monotonic() - t0 < 20:
+            if b"size 100 30" in shown and not hasattr(self, "_resized"):
+                time.sleep(0.3)
+                fcntl.ioctl(m, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))   # the user resizes the window
+                os.killpg(q.pid, sig.SIGWINCH)
+                self._resized = True
+            r = select_read(m)
+            if r is None:
+                break
+            shown += r
+        os.close(m)
+        q.wait(timeout=20)
+        self.assertIn(b"size 160 50", shown)
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""

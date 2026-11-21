@@ -30,6 +30,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -476,8 +477,12 @@ def cmd_run(a) -> int:
                 clock = PhaseClock(d.meters, s.lock)
                 win = Window(clock, s.t0, d.meters, a.window_from, a.window_until)
                 pump_state = {"stop": threading.Event()}
-                pumps = [threading.Thread(target=_pump, args=(fd, dst, win, pump_state, owned), daemon=True)
-                         for fd, dst, owned in proc.joules_streams]
+                if os.name == "posix":
+                    pumps = [threading.Thread(target=_pump_all, args=(proc.joules_streams, win, pump_state), daemon=True)]
+                    old_winch = _follow_resizes(proc)
+                else:
+                    pumps = [threading.Thread(target=_pump, args=(fd, dst, win, pump_state, owned), daemon=True)
+                             for fd, dst, owned in proc.joules_streams]
                 for t in pumps:
                     t.start()
             while True:
@@ -500,17 +505,22 @@ def cmd_run(a) -> int:
                     continue  # a late Ctrl-C must not lose the report
         if any(t.is_alive() for t in pumps):
             moved = False
-            if os.name == "posix":   # stop our readers (all they read is written), then hand the streams over
+            if os.name == "posix":   # stop our reader (all it read is written), then hand the streams over
                 pump_state["stop"].set()
                 for t in pumps:
-                    t.join(1.0)
+                    end = time.monotonic() + 1.0
+                    while t.is_alive() and time.monotonic() < end:
+                        with contextlib.suppress(KeyboardInterrupt):
+                            t.join(max(0.0, end - time.monotonic()))
                 left = [(fd, dst) for fd, dst, _ in proc.joules_streams if pump_state.get(fd) == "stopped"]
-                moved = bool(left) and all(_hand_off(fd, dst) for fd, dst in left)
+                moved = bool(left) and not any(t.is_alive() for t in pumps) and all(_hand_off(fd, dst) for fd, dst in left)
                 for fd, _ in left:
                     with contextlib.suppress(OSError):
                         os.close(fd)
             d.notes.append("A process the command left running still writes output; " +
                            ("it keeps being passed on after joules finishes." if moved else "joules stopped reading it."))
+        if os.name == "posix":
+            _stop_following(old_winch)
     devices = _devices(d, idle, s.duration_s)
     ops = a.flops or (training_flops(a.params, a.tokens) if a.params and a.tokens else None)
     report = {"schema": "joules/1", "tool": f"joules {__version__}", "kind": "run", "command": cmd, "exit_code": code,
@@ -558,7 +568,7 @@ def cmd_run(a) -> int:
     return code
 
 
-ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")   # colours, cursor moves, titles
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b[@-Z\\-_]")  # colours, moves, titles, charsets
 
 
 class Window:
@@ -574,11 +584,13 @@ class Window:
         self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
         self.end = None
         self.frozen = None   # set when the command has exited: a mark read after that is the end of the run
-        self.pre = {rx: re.compile(rx.pattern, rx.flags | re.M) for rx in (self.start_re, self.end_re) if rx}
+        # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
+        self.pre = {rx: (None if re.search(r"\\[AZ]", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
+                    for rx in (self.start_re, self.end_re) if rx}
 
     def _mark(self, text: str) -> dict:
         snap = self.frozen or self.clock.snapshot()
-        return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200]}
+        return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200], "late": self.frozen is not None}
 
     def pending(self) -> bool:
         """Is a mark still to be found? Once not, output is passed on without looking at it."""
@@ -589,77 +601,160 @@ class Window:
         with self.lock:
             self.frozen = {"t": snap["t"], "j": dict(snap["j"])}
 
-    def line(self, text: str) -> None:
-        text = ANSI.sub("", text)   # a marker printed in colour (on a terminal) still matches
-        with self.lock:
-            if self.begin is None:
-                if self.start_re.search(text):
-                    self.begin = self._mark(text)
-            elif self.end is None and self.end_re and self.end_re.search(text):
-                self.end = self._mark(text)
+    def _lines(self, text: str, rx) -> list[str] | None:
+        text = ANSI.sub("", text).replace("\r", "\n")   # a marker printed in colour still matches
+        pre = self.pre.get(rx)
+        if pre is not None and not pre.search(text):
+            return None
+        return text.split("\n")
 
-    def block(self, text: str) -> None:
-        """Several whole lines at once: one search over the block, and line by line only where it can match."""
-        rx = self.start_re if self.begin is None else self.end_re if self.end is None else None
-        if rx is None:
+    def feed(self, texts: list[str]) -> bool:
+        """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
+        first, then the --until line in what follows it, so marks on stdout and stderr that arrive together are
+        both found. Returns True if a mark was set."""
+        set_one = False
+        with self.lock:
+            where = None   # (block, line) of a --from line found now
+            if self.begin is None:
+                for bi, text in enumerate(texts):
+                    lines = self._lines(text, self.start_re)
+                    for li, ln in enumerate(lines or ()):
+                        if self.start_re.search(ln):
+                            self.begin, where, set_one = self._mark(ln), (bi, li), True
+                            break
+                    if where:
+                        break
+                if self.begin is None:
+                    return False
+            if self.end is None and self.end_re is not None:
+                for bi, text in enumerate(texts):
+                    lines = self._lines(text, self.end_re)
+                    if not lines:
+                        continue
+                    first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
+                    for ln in lines[first:]:
+                        if self.end_re.search(ln):
+                            self.end, set_one = self._mark(ln), True
+                            break
+                    if self.end is not None:
+                        break
+        return set_one
+
+
+class _Lines:
+    """The unfinished line of one stream, between reads. A line longer than 1 MB is searched before only its end is
+    kept; once a mark is found in it, the rest of that line is skipped (the next mark must be on a later line)."""
+
+    def __init__(self):
+        self.buf, self.skip = b"", False
+
+    def add(self, chunk: bytes, win: "Window") -> str | None:
+        data = self.buf + chunk
+        if self.skip:
+            k = min((x for x in (data.find(b"\n"), data.find(b"\r")) if x >= 0), default=-1)
+            if k < 0:
+                self.buf = b""
+                return None
+            data, self.skip = data[k + 1:], False
+        i = max(data.rfind(b"\n"), data.rfind(b"\r"))
+        done = None
+        if i >= 0:
+            done, data = data[:i].decode("utf-8", "replace"), data[i + 1:]
+        if len(data) > 1 << 20:
+            if done is not None:
+                win.feed([done]); done = None
+            if win.feed([data.decode("utf-8", "replace")]):
+                self.skip, data = True, b""
+            else:
+                data = data[-65536:]
+        self.buf = data
+        return done
+
+    def end(self, win: "Window") -> None:
+        if self.buf and not self.skip and win.pending():
+            win.feed([self.buf.decode("utf-8", "replace")])
+        self.buf = b""
+
+
+def _write(dst, chunk: bytes) -> bool:
+    """Pass a chunk on unchanged. False if our own output is gone (closed, or a pipe whose reader left)."""
+    try:
+        out = getattr(dst, "buffer", None)
+        if out is not None:
+            out.write(chunk); out.flush()
+        else:
+            dst.write(chunk.decode("utf-8", "replace")); dst.flush()
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _pump_all(streams: list, win: "Window", state: dict) -> None:
+    """POSIX: one loop over all the command's streams, so marks on stdout and stderr are seen in the order they come.
+    Each chunk is passed on at once, unchanged; marks are looked for in each finished line (ended by \n or \r, so
+    progress bars count). If our own output is closed (e.g. `| head`), that stream is closed too, so the command
+    sees it closed, as it would without joules. Stops (leaving the streams open) when state["stop"] is set."""
+    open_ = {fd: dst for fd, dst, _ in streams}
+    order = [fd for fd, _, _ in streams]
+    lines = {fd: _Lines() for fd in order}
+
+    def finish(fd):
+        lines[fd].end(win)
+        state[fd] = "done"
+        del open_[fd]
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    while open_:
+        if state["stop"].is_set():   # handing over to the copier: everything read so far has been written
+            for fd in open_:
+                state[fd] = "stopped"
             return
-        text = ANSI.sub("", text).replace("\r", "\n")
-        if not self.pre[rx].search(text):   # multi-line, so ^ and $ match at every line as they do line by line
-            return
-        for ln in text.split("\n"):
-            self.line(ln)
+        try:
+            ready = select.select(list(open_), [], [], 0.1)[0]
+        except (OSError, ValueError):
+            break
+        got = []
+        for fd in order:
+            if fd not in ready or fd not in open_:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:   # EIO from a pseudo-terminal once every writer has gone: the end of the output
+                chunk = b""
+            if not chunk or not _write(open_[fd], chunk):
+                finish(fd)
+                continue
+            if not win.pending():
+                lines[fd].buf = b""
+                continue
+            text = lines[fd].add(chunk, win)
+            if text is not None:
+                got.append(text)
+        if got and win.pending():
+            win.feed(got)
+    for fd in list(open_):
+        finish(fd)
 
 
 def _pump(fd: int, dst, win: "Window", state: dict, owned: bool = True) -> None:
-    """Pass a child's output on as it comes (every chunk at once, unchanged) and look for the window's marks in each
-    finished line (ended by \n or \r, so progress bars count). If our own output is closed (e.g. `| head`), stop
-    reading, so the command sees its output closed too, as it would without joules."""
-    out = getattr(dst, "buffer", None)
-    buf = b""
-    stop = state["stop"]
-    while True:
-        if stop.is_set():   # handing over to the copier: everything read so far has been written
-            state[fd] = "stopped"
-            return
-        if os.name == "posix":
-            try:
-                ready = select.select([fd], [], [], 0.1)[0]
-            except (OSError, ValueError):
-                break
-            if not ready:
-                continue
+    """Windows (pipes cannot be polled there): one reader per stream, otherwise as _pump_all."""
+    lines = _Lines()
+    while not state["stop"].is_set():
         try:
             chunk = os.read(fd, 65536)
-        except OSError:   # EIO from a pseudo-terminal once every writer has gone: the end of the output
-            break
-        if not chunk:
-            break
-        try:
-            if out is not None:
-                out.write(chunk); out.flush()
-            else:
-                dst.write(chunk.decode("utf-8", "replace")); dst.flush()
-        except (OSError, ValueError):
-            break
-        if not win.pending():
-            buf = b""
-            continue
-        buf += chunk
-        i = max(buf.rfind(b"\n"), buf.rfind(b"\r"))
-        if i >= 0:
-            win.block(buf[:i].decode("utf-8", "replace"))
-            buf = buf[i + 1:]
-        if len(buf) > 1 << 20:   # one endless line: look in it before keeping only its end
-            win.block(buf.decode("utf-8", "replace"))
-            buf = buf[-65536:]
-    if buf and win.pending():
-        win.block(buf.decode("utf-8", "replace"))
-    state[fd] = "done"
-    if owned:   # on Windows the pipe belongs to the Popen object, which closes it
-        try:
-            os.close(fd)
         except OSError:
-            pass
+            break
+        if not chunk or not _write(dst, chunk):
+            break
+        if win.pending():
+            text = lines.add(chunk, win)
+            if text is not None:
+                win.feed([text])
+    lines.end(win)
+    state[fd] = "done"
+    if owned:
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 COPIER = ("import os, sys\n"
@@ -674,6 +769,38 @@ COPIER = ("import os, sys\n"
           "        os.write(1, b)\n"
           "    except OSError:\n"
           "        break\n")
+
+
+def _follow_resizes(proc):
+    """When the user resizes the terminal, give the command's pseudo-terminals the new size too."""
+    ptys = [fd for fd, dst, _ in proc.joules_streams if _isatty(dst)]
+    if not ptys or not hasattr(signal, "SIGWINCH") or threading.current_thread() is not threading.main_thread():
+        return None
+
+    def resize(*_):
+        try:
+            import fcntl
+            import struct
+            import termios
+            size = shutil.get_terminal_size((80, 24))
+            for fd in ptys:
+                with contextlib.suppress(OSError):
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", size.lines, size.columns, 0, 0))
+        except ImportError:
+            return
+        if proc.poll() is None:   # it may have read its size already on the terminal's own signal: tell it again
+            with contextlib.suppress(OSError):
+                os.kill(proc.pid, signal.SIGWINCH)
+    try:
+        return ("set", signal.signal(signal.SIGWINCH, resize))
+    except (ValueError, OSError):
+        return None
+
+
+def _stop_following(old) -> None:
+    if old and hasattr(signal, "SIGWINCH"):
+        with contextlib.suppress(ValueError, OSError, TypeError):
+            signal.signal(signal.SIGWINCH, old[1] if old[1] is not None else signal.SIG_DFL)
 
 
 def _hand_off(fd: int, dst) -> bool:
@@ -701,6 +828,11 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     if a.window_until is not None and info["found_until"] is False:
         after = "after the --from line" if a.window_from is not None else "in the command's output"
         notes.append(f"--until {a.window_until!r} never appeared {after}, so the window runs to the end of the command.")
+    exit_t = (w.frozen or {}).get("t", s.t1)
+    if begin.get("late") or end.get("late") or (a.window_from is not None and begin["t"] >= exit_t - 0.1):
+        notes.append("The marker lines were only read when the command exited, so the window may be wrong: the command "
+                     "probably held its output (a C program writing into a file or pipe does). Run it with `stdbuf -oL` "
+                     "(Linux), or let joules write to a terminal.")
     live = [m for m in meters if m.kind != "est"]   # the CPU-time estimate is only known once the command has ended
     if len(live) < len(meters):
         notes.append("The CPU-time estimate is only known for the whole run, so it is not in the window.")

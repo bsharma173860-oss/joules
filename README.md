@@ -145,6 +145,9 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     and macOS it keeps its output after joules finishes.
   - The CPU-time estimate (used where there are no energy counters) is only known for the whole run, so it is not
     in the window.
+  - If the marker lines only arrive as the script exits (output held back), joules says so in the report.
+  - Not for full-screen terminal programs (htop, nvtop): they set up joules' terminal, not yours. On Windows a
+    marker pair split between stdout and stderr going to different places can be missed; put both on one stream.
 - **Laptop GPUs:** many have no energy counter. joules then samples their power, every 0.1 s by default
   (`--interval`; `joules doctor` says "power readings (no energy counter)"), so a window shorter than a few seconds
   is less exact. Leave `--subtract-idle` on for a laptop, where the idle draw is a large share.
