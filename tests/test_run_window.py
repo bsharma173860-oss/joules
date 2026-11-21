@@ -205,11 +205,9 @@ class RunWindow(unittest.TestCase):
         q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--out", out, "--from", ">>> running",
                               "--until", ">>> done", "--", "bash", self.script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              env=env, start_new_session=True)
-        for _ in range(100):                                             # wait for the window to open
-            time.sleep(0.1)
-            if os.path.exists(self.power) and Path(self.power).read_text().strip() == "45000":
-                break
-        time.sleep(1.5)
+        while q.stdout.readline().strip() != b">>> running":             # the trap is set and bash is waiting
+            pass
+        time.sleep(1.0)
         os.killpg(q.pid, signal.SIGINT)                                  # Ctrl-C in a terminal reaches the whole group
         q.communicate(timeout=30)
         r = json.loads(Path(out).read_text())
@@ -221,7 +219,8 @@ class RunWindow(unittest.TestCase):
     # ---- found in review round 2
     def run_j(self, args, cmd, lib=None, timeout=60, **kw):
         out = os.path.join(self.d, "r.json")
-        p = subprocess.run([sys.executable, "-m", "joules", "run", "--out", out, *args, "--", *cmd], capture_output=True,
+        streams = {"stdout": subprocess.PIPE, "stderr": kw.pop("stderr", subprocess.PIPE)}
+        p = subprocess.run([sys.executable, "-m", "joules", "run", "--out", out, *args, "--", *cmd], **streams,
                            env=self.env(JOULES_NVML_LIB=lib or self.laptop), timeout=timeout, **kw)
         return p, (json.loads(Path(out).read_text()) if os.path.exists(out) else None)
 
@@ -232,10 +231,85 @@ class RunWindow(unittest.TestCase):
                              'puts("start");sleep(2);puts("end");sleep(1);return 0;}\n')
         exe = os.path.join(self.d, "cbuf")
         subprocess.run(["gcc", "-O2", "-o", exe, src], check=True)
-        p, r = self.run_j(["--no-cpu", "--from", "^start", "--until", "^end"], [exe])
+        shown, r = self.on_terminal(["--no-cpu", "--from", "^start", "--until", "^end"], [exe])
         self.assertTrue(1.8 < r["window_s"] < 2.4, r["window"])
         self.assertTrue(0.8 < r["window"]["starts_at_s"] < 1.5, r["window"])
-        self.assertIn(b"loading\nstart\nend\n", p.stdout)                 # unchanged bytes: no \r added by the terminal
+        self.assertIn(b"loading\r\nstart\r\nend\r\n", shown)           # as on screen: the terminal adds \r once
+
+    def on_terminal(self, args, cmd):
+        """joules with its stdout and stderr on a terminal (a pseudo-terminal), as when run from a shell."""
+        import pty
+        out = os.path.join(self.d, "r.json")
+        m, sl = pty.openpty()
+        q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--out", out, *args, "--", *cmd],
+                             stdout=sl, stderr=sl, env=self.env())
+        os.close(sl)
+        shown = b""
+        while True:
+            try:
+                b = os.read(m, 65536)
+            except OSError:
+                break
+            if not b:
+                break
+            shown += b
+        os.close(m)
+        q.wait(timeout=30)
+        return shown, json.loads(Path(out).read_text())
+
+    def test_the_command_sees_a_terminal_only_where_joules_has_one(self):
+        cmd = ["bash", "-c", "[ -t 1 ] && echo out:TTY || echo out:NOTTY; [ -t 2 ] && echo err:TTY >&2 || echo err:NOTTY >&2; echo go"]
+        p, r = self.run_j(["--no-cpu", "--from", "go"], cmd)
+        self.assertIn(b"out:NOTTY", p.stdout)                             # joules' output is a pipe here
+        self.assertIn(b"err:NOTTY", p.stderr)
+        shown, r = self.on_terminal(["--no-cpu", "--from", "go"], cmd)
+        self.assertIn(b"out:TTY", shown)
+        self.assertIn(b"err:TTY", shown)
+        self.assertTrue(r["window"]["found_from"])
+
+    def test_anchored_markers_in_a_burst_of_lines(self):
+        p, r = self.run_j(["--no-cpu", "--from", "^b$", "--until", "^c$"],
+                          ["bash", "-c", "printf 'a\\nb\\r\\n'; sleep 0.5; printf 'x\\nc\\ny\\n'; sleep 0.2"])
+        self.assertTrue(r["window"]["found_from"] and r["window"]["found_until"], r["notes"])
+        self.assertTrue(0.3 < r["window_s"] < 1.0, r["window_s"])
+
+    def test_stdout_and_stderr_keep_their_order_when_they_go_to_one_place(self):
+        code = ("import sys\nfor i in range(200):\n    sys.stdout.write(f'o{i}\\n'); sys.stdout.flush()\n"
+                "    sys.stderr.write(f'e{i}\\n'); sys.stderr.flush()\nprint('START'); sys.stdout.flush()\n"
+                "sys.stderr.write('STOP\\n'); sys.stderr.flush()\nimport time; time.sleep(0.5)\n")
+        for _ in range(3):
+            p, r = self.run_j(["--no-cpu", "--from", "START", "--until", "STOP"], [sys.executable, "-c", code],
+                              stderr=subprocess.STDOUT)
+            lines = [x for x in p.stdout.decode().splitlines() if x[:1] in "oe" and x[1:].isdigit()]
+            self.assertEqual(lines, [f"{c}{i}" for i in range(200) for c in "oe"])
+            self.assertTrue(r["window"]["found_until"], r["notes"])         # STOP on stderr, right after START
+            self.assertLess(r["window_s"], 0.3)
+
+    def test_a_marker_printed_in_colour(self):
+        p, r = self.run_j(["--no-cpu", "--from", ">>> running trie"],
+                          ["bash", "-c", "printf '\\033[1;32m>>>\\033[0m running trie\\n'; sleep 0.3"])
+        self.assertTrue(r["window"]["found_from"], r["notes"])
+        self.assertEqual(r["window"]["from_line"], ">>> running trie")
+        self.assertIn(b"\x1b[1;32m>>>\x1b[0m running trie", p.stdout)     # passed on with its colours
+
+    def test_nothing_is_lost_when_a_leftover_process_is_handed_over(self):
+        code = ("import os, sys, time\n"            # a writer that outlives the command, writing through the hand-over
+                "if os.fork() == 0:\n"
+                "    for i in range(1, 30001):\n        sys.stdout.write(f'L{i}\\n'); sys.stdout.flush(); time.sleep(0.0002)\n"
+                "    os._exit(0)\n"
+                "time.sleep(0.3)\n")
+        outf = os.path.join(self.d, "stdout")
+        with open(outf, "wb") as so:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "L100", "--until", "L200",
+                                  "--", sys.executable, "-c", code], stdout=so, stderr=subprocess.DEVNULL, env=self.env())
+            self.assertEqual(q.wait(timeout=30), 0)
+        want = [f"L{i}" for i in range(1, 30001)]
+        for _ in range(200):                                             # the copier may still be finishing
+            got = [x for x in Path(outf).read_text().splitlines() if x.startswith("L")]
+            if len(got) >= len(want):
+                break
+            time.sleep(0.1)
+        self.assertEqual(got, want)
 
     def test_a_leftover_process_does_not_lengthen_the_measurement(self):
         p0, r0 = self.run_j(["--no-cpu"], ["bash", "-c", "(sleep 4) & sleep 1"], timeout=30)

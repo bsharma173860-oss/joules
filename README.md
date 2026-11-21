@@ -134,11 +134,15 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
   - If `--until` never appears, the window runs to the end.
   - If `--from` never appears, joules says so and you get the whole run.
 - **Output:** the script's output still reaches you as it is printed, stdout and stderr, unchanged.
-  - On Linux and macOS the script runs on its own terminal (a pseudo-terminal), so programs print line by line and
-    keep their colours and progress bars, as on screen. On Windows it writes into a pipe instead: programs that
-    buffer their output there can show their marker lines late.
-  - Measuring stops when the script exits. A server it leaves running keeps its output after joules finishes, and
-    does not keep joules waiting.
+  - The script sees what it would see without joules. On a terminal it gets a terminal of its own (a
+    pseudo-terminal, on Linux and macOS), so programs print line by line and keep their colours and progress bars.
+    Into a file or a pipe it gets a pipe: Python prints line by line there, but C programs may hold their output
+    until they exit, so their marker lines come late. Run such a program with `stdbuf -oL` (Linux).
+  - When stdout and stderr go to the same place (a terminal, or `2>&1`), they share one stream, so their order is
+    kept and a marker may be on either.
+  - Markers are matched without colour codes, and a marker on a progress-bar line counts when that line is finished.
+  - Measuring stops when the script exits. A server it leaves running does not keep joules waiting, and on Linux
+    and macOS it keeps its output after joules finishes.
   - The CPU-time estimate (used where there are no energy counters) is only known for the whole run, so it is not
     in the window.
 - **Laptop GPUs:** many have no energy counter. joules then samples their power, every 0.1 s by default
