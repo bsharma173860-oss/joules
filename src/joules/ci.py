@@ -70,8 +70,10 @@ def summarize(head: list[dict], base: list[dict] | None, budget: float | None) -
         out.update(base_j=b, base_s=statistics.median(r["duration_s"] for r in base),
                    base_range=[min(r["energy_j"] for r in base), max(r["energy_j"] for r in base)])
         out["change_pct"] = (h - b) / b * 100 if b > 0 else None
-        # The runs overlap: the difference is not bigger than the run-to-run spread.
-        out["within_noise"] = out["head_range"][0] <= out["base_range"][1] and out["base_range"][0] <= out["head_range"][1]
+        # The difference is not bigger than the run-to-run spread: each side's median lies within the other's runs.
+        # (Overlapping ranges are not enough, nor is one median alone: one outlier run would hide any regression.)
+        hr, br = out["head_range"], out["base_range"]
+        out["within_noise"] = br[0] <= h <= br[1] and hr[0] <= b <= hr[1]
         out["over_budget"] = bool(budget is not None and out["change_pct"] is not None and out["change_pct"] > budget
                                   and not out["within_noise"])
     out["budget_pct"] = budget
