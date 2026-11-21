@@ -117,6 +117,30 @@ one side was throttled more, ran at a different clock or started hotter, and `--
 repeats the comparison at fixed GPU power limits so a gain cannot come from the card boosting differently. The
 full method is in [docs/BENCHMARKING.md](https://github.com/bsharma173860-oss/d3-research/blob/main/apps/landauer-gap/docs/BENCHMARKING.md).
 
+## Measuring an agent benchmark
+
+A benchmark script often starts a model server, waits for the model to load, runs the agents, then stops the
+server. To count only the benchmark, give the first line it prints with `--from` and the line it prints at the end
+with `--until` (both are regular expressions):
+
+```bash
+joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --out run.json -- bash run_trie.sh
+```
+
+- **What is reported:** joules reports the whole run and the window between the two lines. The JSON adds
+  `window_s`, `window_energy_j` and `window_above_idle_j` (the last with `--subtract-idle`), plus a `window` object
+  with the lines that matched.
+- **Matching:** the first `--from` line opens the window, and the first `--until` line after it closes it.
+  - If `--until` never appears, the window runs to the end.
+  - If `--from` never appears, joules says so and you get the whole run.
+- **Output:** the script's output still reaches you as it is printed, stdout and stderr, unchanged.
+  - The script now writes into a pipe, not a terminal, so some tools drop their colours or progress bars.
+  - Lines from stdout and stderr may interleave a little differently.
+  - A server the script leaves running does not keep joules waiting.
+- **Laptop GPUs:** many have no energy counter. joules then samples their power every 0.1 s (`joules doctor` says
+  "power readings (no energy counter)"), so a window shorter than a few seconds is less exact. Leave
+  `--subtract-idle` on for a laptop, where the idle draw is a large share.
+
 ## Phases of your own program
 
 Inside a Python program:

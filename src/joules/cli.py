@@ -26,6 +26,7 @@ import datetime as dt
 import json
 import os
 import platform
+import re
 import shlex
 import statistics
 import subprocess
@@ -38,6 +39,7 @@ from .bench import DEFAULT_PROMPT, ensure_model, generate, model_params, parse_t
 from .meters import Discovery, discover
 from .model import (GPUS, GRIDS, calculator_link, calibrate, estimate_accelerator_j, gpu_from_name, gpu_verdict, landauer_floor_j,
                     power_sweep_pick, training_flops)
+from .phases import PhaseClock
 from .sampler import Sampler, idle_baseline
 from . import share as sharing
 from . import telemetry
@@ -171,8 +173,11 @@ def _not_found(cmd: list[str], windows: bool = os.name == "nt") -> int:
     return 127
 
 
-def _start(cmd: list[str]):
+def _start(cmd: list[str], piped: bool = False):
     try:
+        if piped:   # --from/--until: joules reads the output (and passes it on) to find the window's marks
+            env = {**os.environ, "PYTHONUNBUFFERED": "1"}   # Python children print line by line into a pipe too
+            return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=env)
         return subprocess.Popen(cmd)
     except FileNotFoundError:
         return None
@@ -237,6 +242,14 @@ def _gpus_arg(s: str) -> str:
     if not all(t.isascii() and t.isdigit() for t in toks):
         raise argparse.ArgumentTypeError(f"expected GPU indices separated by commas, e.g. 0,1 (got {s!r})")
     return ",".join(toks)
+
+
+def _regex_arg(s: str) -> str:
+    try:
+        re.compile(s)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"not a valid regular expression ({e}): {s!r}") from None
+    return s
 
 
 def _interval_arg(s: str) -> float:
@@ -387,18 +400,35 @@ def cmd_run(a) -> int:
     started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     try:
         with Sampler(d.meters, a.interval, notes=d.notes) as s:
-            proc = _start(cmd)
+            windowed = bool(a.window_from or a.window_until)
+            proc = _start(cmd, piped=windowed)
             if not proc:
                 return 126 if proc is False else _not_found(cmd)
             for m in d.meters:
                 if hasattr(m, "attach"):
                     m.attach(proc)
+            if windowed:
+                win = Window(PhaseClock(d.meters, s.lock), s.t0, d.meters, a.window_from, a.window_until)
+                pumps = [threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, win.line), daemon=True),
+                         threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, win.line), daemon=True)]
+                for t in pumps:
+                    t.start()
             while True:
                 try:
                     code = proc.wait()
                     break
                 except KeyboardInterrupt:
                     continue  # Ctrl-C reaches the child too; wait for it to finish, then report
+            if windowed:
+                deadline = time.monotonic() + 2.0   # the rest of the output; a background process the command left
+                for t in pumps:                     # running may keep the pipe open for ever, so do not wait for it
+                    while t.is_alive() and time.monotonic() < deadline:
+                        try:
+                            t.join(max(0.0, deadline - time.monotonic()))
+                        except KeyboardInterrupt:
+                            continue  # a late Ctrl-C must not lose the report
+                if any(t.is_alive() for t in pumps):
+                    d.notes.append("A process the command left running still holds its output open; joules stopped reading it.")
     finally:
         d.close()
     devices = _devices(d, idle, s.duration_s)
@@ -406,6 +436,10 @@ def cmd_run(a) -> int:
     report = {"schema": "joules/1", "tool": f"joules {__version__}", "kind": "run", "command": cmd, "exit_code": code,
               "started_at": started, "duration_s": s.duration_s, "simulated": d.simulated, "host": _host(),
               "devices": devices, "totals": _totals(a, devices, ops), "notes": d.notes}
+    if windowed:
+        extra, wnotes = _window_report(a, win, s, d.meters, idle)
+        report.update(extra)
+        report["notes"] = [*wnotes, *report["notes"]]
 
     gpu_rows = [m for m in d.meters if m.kind == "gpu"]
     kinds = {a.gpu} if a.gpu else {gpu_from_name(m.name) for m in gpu_rows}
@@ -444,12 +478,90 @@ def cmd_run(a) -> int:
     return code
 
 
+class Window:
+    """--from / --until: the stretch of a run between the first output line matching --from and the first later line
+    matching --until (the whole run before or after it when one of them is not given). Each mark reads every meter
+    at the moment the line arrives, so the window's energy works the same for energy counters and power sampling."""
+
+    def __init__(self, clock: PhaseClock, start_t: float, meters, start_re: str | None, end_re: str | None):
+        self.clock, self.meters = clock, meters
+        self.start_re = re.compile(start_re) if start_re else None
+        self.end_re = re.compile(end_re) if end_re else None
+        self.lock = threading.Lock()
+        self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
+        self.end = None
+
+    def line(self, text: str) -> None:
+        with self.lock:
+            if self.begin is None:
+                if self.start_re.search(text):
+                    self.begin = {**self.clock.snapshot(), "line": text.strip()[:200]}
+            elif self.end is None and self.end_re and self.end_re.search(text):
+                self.end = {**self.clock.snapshot(), "line": text.strip()[:200]}
+
+
+def _pump(src, dst, on_line) -> None:
+    """Pass a child's output on as it comes (every chunk at once, unchanged) and hand each finished line (ended by
+    \n or \r, so progress bars count) to on_line."""
+    fd, out = src.fileno(), getattr(dst, "buffer", None)
+    buf = b""
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        try:
+            if out is not None:
+                out.write(chunk); out.flush()
+            else:
+                dst.write(chunk.decode("utf-8", "replace")); dst.flush()
+        except (OSError, ValueError):
+            pass   # our own output closed: keep reading so the child is not blocked
+        buf += chunk
+        *lines, buf = re.split(rb"[\r\n]", buf)
+        for ln in lines:
+            on_line(ln.decode("utf-8", "replace"))
+        if len(buf) > 1 << 20:   # a single endless line: keep the end of it for matching
+            buf = buf[-65536:]
+    if buf:
+        on_line(buf.decode("utf-8", "replace"))
+
+
+def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, list[str]]:
+    notes = []
+    info = {"from": a.window_from, "until": a.window_until, "found_from": w.begin is not None and bool(a.window_from),
+            "found_until": w.end is not None}
+    if w.begin is None:
+        notes.append(f"--from {a.window_from!r} never appeared in the command's output, so there is no window: "
+                     "the figures above are the whole run.")
+        return {"window": info, "window_s": None, "window_energy_j": None}, notes
+    end = w.end or {"t": s.t1, "j": {m.name: m.energy_j for m in meters}, "line": None}
+    if a.window_until and w.end is None:
+        notes.append(f"--until {a.window_until!r} never appeared after the --from line, so the window runs to the end of the command.")
+    secs = max(0.0, end["t"] - w.begin["t"])
+    per = {m.name: max(0.0, end["j"].get(m.name, 0.0) - w.begin["j"].get(m.name, 0.0)) for m in meters}
+    info.update(from_line=w.begin.get("line"), until_line=end.get("line"),
+                starts_at_s=round(w.begin["t"] - s.t0, 3), ends_at_s=round(end["t"] - s.t0, 3), devices_j=per)
+    out = {"window": info, "window_s": secs, "window_energy_j": sum(per.values())}
+    if idle:   # above idle, per device as for the whole run
+        out["window_above_idle_j"] = sum(max(0.0, j - idle[n] * secs) if n in idle else j for n, j in per.items())
+    return out, notes
+
+
 def render_run(r: dict) -> str:
     t = r["totals"]
     head = f"{bold('joules')} · {short_cmd(r['command'])} · {fmt_s(r['duration_s'])} · exit {r['exit_code']}"
     lines = [head, *_device_lines(r["devices"]), dim("  " + "─" * 58)]
     lines.append(f"  {bold('total')}  {bold(fmt_j(t['devices_j']))} = {fmt_wh(t['devices_j'])}"
                  + (f"   {dim('above idle')} {fmt_j(t['above_idle_j'])}" if "above_idle_j" in t else ""))
+    if r.get("window_energy_j") is not None:
+        w = r["window"]
+        span = f"{w['starts_at_s']:.1f}–{w['ends_at_s']:.1f} s"
+        lines.append(f"  {bold('window')} {bold(fmt_j(r['window_energy_j']))} over {fmt_s(r['window_s'])} ({span} into the run)"
+                     + (f"   {dim('above idle')} {fmt_j(r['window_above_idle_j'])}" if "window_above_idle_j" in r else ""))
+        lines.append(dim(f"    from: {w['from_line'] or 'the start'}") + dim(f"   until: {w['until_line'] or 'the end'}"))
     if t["pue"] != 1.0:
         lines.append(f"  facility (PUE {t['pue']:g})  {fmt_j(t['facility_j'])} = {fmt_wh(t['facility_j'])}")
     lines.append(f"  cost {_money(t['cost']['amount'])} at {t['cost']['price_per_kwh']:g}/kWh · CO₂ {fmt_g(t['co2']['grams'])} g at {t['co2']['g_per_kwh']:g} g/kWh")
@@ -1570,6 +1682,11 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--flops", type=float, help="total operations, if you know them")
     w.add_argument("--gpu", choices=sorted(GPUS), help="GPU model, if it is not detected")
     r.add_argument("--estimate", action="store_true", help=argparse.SUPPRESS)  # the default now: estimate when there are no counters
+    wg = r.add_argument_group("window (optional: count only part of the run, e.g. a benchmark after the model loads)")
+    wg.add_argument("--from", dest="window_from", metavar="REGEX", type=_regex_arg,
+                    help="start counting at the first output line matching REGEX (the output still reaches you unchanged)")
+    wg.add_argument("--until", dest="window_until", metavar="REGEX", type=_regex_arg,
+                    help="stop counting at the first later line matching REGEX (default: the end of the command)")
     sharing_args(r)
     r.add_argument("command", nargs=argparse.REMAINDER, help="the command, after --")
     r.set_defaults(fn=cmd_run)

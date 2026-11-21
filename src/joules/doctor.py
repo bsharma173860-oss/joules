@@ -139,7 +139,8 @@ def check_gpus(r: Report) -> None:
             for i in range(n):
                 h = nv.handle(i)
                 energy, power = nv.energy_mj(h), nv.power_mw(h)
-                how = "energy counter" if energy is not None else "power readings" if power is not None else "no energy or power"
+                how = ("energy counter" if energy is not None else "power readings (no energy counter): sampled every 0.1 s"
+                       if power is not None else "no energy or power")
                 try:
                     procs = "process list available" if nv.processes(h) is not None else ""
                 except (OSError, AttributeError):
