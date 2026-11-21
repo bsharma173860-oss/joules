@@ -154,10 +154,13 @@ class TokenScanner:
         if isinstance(o.get("eval_count"), int):  # Ollama's final object
             self.output = o["eval_count"]
             self.prompt = o.get("prompt_eval_count") if isinstance(o.get("prompt_eval_count"), int) else self.prompt
-        for c in o.get("choices") or []:
-            if isinstance(c, dict) and ((c.get("delta") or {}).get("content") or c.get("text")):
+        choices = o.get("choices")
+        for c in choices if isinstance(choices, list) else []:
+            delta = c.get("delta") if isinstance(c, dict) else None
+            if isinstance(c, dict) and ((delta.get("content") if isinstance(delta, dict) else None) or c.get("text")):
                 self.chunks += 1
-        if isinstance(o.get("response"), str) and o["response"] or isinstance((o.get("message") or {}).get("content"), str) and o["message"]["content"]:
+        msg = o.get("message")  # a chat message, or a plain string in error bodies (vLLM: {"object": "error", "message": "..."})
+        if isinstance(o.get("response"), str) and o["response"] or isinstance(msg, dict) and isinstance(msg.get("content"), str) and msg["content"]:
             self.chunks += 1
 
     def tokens(self) -> tuple[int | None, bool]:
@@ -285,6 +288,15 @@ class Handler(BaseHTTPRequestHandler):
             headers["Content-Length"] = str(len(body))
         rid = s.new_id()
         s.ledger.begin(rid)
+        try:
+            self._forward(rid, model, body, headers, conn)
+        finally:
+            if rid in s.ledger.active:  # anything unexpected must not leave a phantom request taking a share of later energy
+                s.ledger.end(rid)
+                self.close_connection = True
+
+    def _forward(self, rid: str, model: str | None, body: bytes, headers: dict, conn) -> None:
+        s, u = self.server, self.server.upstream
         try:
             conn.request(self.command, (u.path or "") + self.path, body=body or None, headers=headers)
             resp = conn.getresponse()
