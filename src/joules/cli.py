@@ -296,13 +296,27 @@ def _host() -> dict:
 
 
 def _emit(a, report: dict, text: str) -> None:
-    if a.out:
-        with open(a.out, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
     if a.json:
         print(json.dumps(report, indent=2))
     else:
         print(text, file=sys.stderr)
+    if a.out:  # after printing, so a bad path never loses the result of a long run
+        try:
+            with open(a.out, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+        except OSError as e:
+            print(warn(f"joules: could not write {a.out} ({e.strerror or e}); the result is printed above."), file=sys.stderr)
+            a.out_failed = True
+
+
+def _out_problem(path: str) -> str | None:
+    """Why --out cannot be written, found before a long run rather than after it."""
+    folder = os.path.dirname(os.path.abspath(path))
+    if os.path.isdir(path):
+        return f"{path} is a folder; give a file name"
+    if not os.path.isdir(folder):
+        return f"the folder {folder} does not exist"
+    return None
 
 
 def _device_lines(devices: list[dict]) -> list[str]:
@@ -1740,6 +1754,9 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd in ("run", "ci", "calibrate") and a.command and a.command[0] != "--" and a.command[0].startswith("-"):
         p.error("put the command after --, e.g. joules run -- python train.py")
     a.argv = argv
+    if isinstance(getattr(a, "out", None), str) and a.out and (why := _out_problem(a.out)):
+        print(f"joules: cannot write --out {a.out}: {why}.", file=sys.stderr)
+        return 2
     counted = a.cmd not in ("telemetry",)
     if counted:
         try:
@@ -1747,6 +1764,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass  # counting never gets in the way of a measurement
     rc = a.fn(a)
+    if rc == 0 and getattr(a, "out_failed", False):
+        rc = 1  # the result was printed, but the file asked for is missing
     if counted and rc == 0 and a.cmd not in ("agent", "proxy", "connect"):
         try:
             telemetry.maybe_ask()
