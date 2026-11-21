@@ -182,6 +182,7 @@ class ProxyServer(LocalHTTPServer):
         self.by_id: dict[str, dict] = {}
         self.ids = itertools.count(1)
         self.stats = {"requests": 0, "output_tokens": 0, "energy_j": 0.0}
+        self.recorded = 0  # receipts ever recorded, in the order requests finished (ids follow the order they started)
         self.stats_lock = threading.Lock()
         self.measured_by = ", ".join(sorted({m.method for m in meters})) or "nothing"
         self._stop = threading.Event()
@@ -195,6 +196,7 @@ class ProxyServer(LocalHTTPServer):
             if len(self.receipts) == self.receipts.maxlen:
                 self.by_id.pop(self.receipts[0]["id"], None)
             self.receipts.append(receipt)
+            self.recorded += 1
             self.by_id[receipt["id"]] = receipt
             self.stats["requests"] += 1
             self.stats["energy_j"] += receipt["energy_j"]
@@ -412,16 +414,17 @@ class Tracker:
     def __init__(self, server: ProxyServer, project: str, key: str, api_url: str | None, every: float, device: str, count: int, sources: str):
         self.s, self.project, self.key, self.api_url, self.every = server, project, key, api_url, every
         self.device, self.count, self.sources = device[:120], count, sources
-        self.since = 0
+        self.sent = 0  # how many receipts, counted in the order they finished, earlier flushes covered
         self.t0 = time.time()
 
     def flush(self) -> list[str]:
         """Sends what finished since the last flush. Returns error messages, if any."""
-        with self.s.stats_lock:
-            new = [r for r in self.s.receipts if int(r["id"][2:]) > self.since]
+        with self.s.stats_lock:  # by finishing order, not id: a long request finishes after later, shorter ones
+            n = min(self.s.recorded - self.sent, len(self.s.receipts))
+            new = list(self.s.receipts)[len(self.s.receipts) - n:] if n > 0 else []
+            self.sent = self.s.recorded
         if not new:
             return []
-        self.since = max(int(r["id"][2:]) for r in new)
         started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.t0))
         window = max(time.time() - self.t0, 1e-3)
         self.t0 = time.time()
