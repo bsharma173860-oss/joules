@@ -352,7 +352,7 @@ def cmd_run(a) -> int:
                 continue
     started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     try:
-        with Sampler(d.meters, a.interval) as s:
+        with Sampler(d.meters, a.interval, notes=d.notes) as s:
             proc = _start(cmd)
             if not proc:
                 return 126 if proc is False else _not_found(cmd)
@@ -471,7 +471,7 @@ def cmd_bench(a) -> int:
     gen_s = 0.0
     started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     try:
-        with Sampler(d.meters, a.interval) as s:
+        with Sampler(d.meters, a.interval, notes=d.notes) as s:
             for _ in range(a.runs):
                 g = generate(target, a.prompt, a.max_tokens)
                 out_tok += g["output_tokens"]; in_tok += g["prompt_tokens"]; gen_s += g["gen_s"] or 0
@@ -854,6 +854,7 @@ def cmd_compare(a) -> int:
     devices = [m.name for m in d.meters]
     kinds = {m.name: (m.kind, m.method) for m in d.meters}
     d.close()
+    notes += [n for n in d.notes if n not in notes]  # read errors the sampler explained during the runs
     report = {"schema": "joules/1", "tool": f"joules {__version__}", "kind": "compare", "names": names, "commands": cmds,
               "baseline": baseline, "runs": a.runs, "warmup": a.warmup, "order": "A B B A" if a.order == "abba" else "alternating",
               "rest_s": a.rest, "cool_to_c": a.cool_to, "limits_pct": None if limits[0] is None else limits,
@@ -1264,7 +1265,7 @@ def cmd_calibrate(a) -> int:
     t_start = time.time()
     code = 0
     try:
-        with Sampler(d.meters, a.interval) as s:
+        with Sampler(d.meters, a.interval, notes=d.notes) as s:
             if cmd:
                 proc = _start(cmd)
                 if not proc:
@@ -1411,7 +1412,7 @@ def cmd_tune(a) -> int:
                 watts.append(mw / 1000)
             print(dim(f"joules: power limit {pct}% ({', '.join(f'{w:.0f} W' for w in watts)}), {a.runs} run{'s' if a.runs != 1 else ''}…"), file=sys.stderr)
             out_tok, gen_s = 0, 0.0
-            with Sampler(d.meters, a.interval) as s:
+            with Sampler(d.meters, a.interval, notes=d.notes) as s:
                 for _ in range(a.runs):
                     g = generate(target, a.prompt, a.max_tokens)
                     out_tok += g["output_tokens"]; gen_s += g["gen_s"] or 0
