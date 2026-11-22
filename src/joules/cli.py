@@ -630,11 +630,22 @@ def cmd_run(a) -> int:
 
 
 def _searchable(pattern: str) -> str:
-    """The pattern to search with: a leading .* (or ^.*, .*?) changes nothing in a search but makes it slow on long
-    lines (each start tried to the end), so it is dropped."""
-    m = re.match(r"\^?\.\*\??", pattern)
-    rest = pattern[m.end():] if m else pattern
-    return rest if m and rest and rest[0] not in "*+?{" else pattern
+    """The pattern to search with. Leading repeats of any character (.* .+ and their lazy forms, after an optional
+    ^) change nothing in a search but make it slow on long lines (each start tried to the end): .* is dropped and
+    each .+ becomes . (one character at least), e.g. ^.+.*START -> .START."""
+    i, need = (1 if pattern.startswith("^") else 0), 0
+    took = False
+    while True:
+        m = re.match(r"\.([*+])\??", pattern[i:])
+        if not m:
+            break
+        need += m.group(1) == "+"
+        i += m.end()
+        took = True
+    rest = pattern[i:]
+    if not took or not rest or rest[0] in "*+?{":
+        return pattern
+    return "." * need + rest
 
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b[@-Z\\-_]")  # colours, moves, titles, charsets
@@ -897,7 +908,7 @@ class _Out:
             if not isinstance(fd, int):
                 return None
             mode = os.fstat(fd).st_mode
-            self.kind = "pipe" if stat.S_ISFIFO(mode) else "tty" if os.isatty(fd) or stat.S_ISCHR(mode) else "file"
+            self.kind = "pipe" if stat.S_ISFIFO(mode) else "tty" if os.isatty(fd) else "file"   # (/dev/null: a file)
             return fd
         except (OSError, ValueError, AttributeError, io.UnsupportedOperation):
             return None
@@ -924,6 +935,7 @@ class _Out:
             piece = chunk[self.off:self.off + self._piece(fd)]
             with self.cv:
                 self.inflight = len(piece)
+            self.write_t0 = time.monotonic()
             try:
                 n = os.write(fd, piece)
             except BlockingIOError:   # (someone made our terminal non-blocking)
@@ -935,6 +947,10 @@ class _Out:
                 if e.errno == errno.EBADF or (os.name == "nt" and e.errno == errno.EINVAL):   # (Windows: reader gone)
                     return False
                 n = len(chunk) - self.off   # a full disk and the like: this chunk is lost, as the command's own would be
+            t1 = time.monotonic()
+            if t1 - self.write_t0 > 0.05:   # what reads our output made us wait
+                self.last_block = t1
+            self.write_t0 = None
             with self.cv:
                 self.off += n
                 if self.handed:
@@ -942,6 +958,14 @@ class _Out:
         return True
 
     cur, off, kind, inflight, taken_off = b"", 0, "file", 0, 0
+    write_t0 = None   # when the write under way started
+    last_block = 0.0  # when a write last had to wait for the reader
+
+    def slow_reader(self) -> bool:
+        """Is what reads our output holding us up (a write waiting now, or one did lately)? Else a full queue is
+        only joules writing more slowly than a fast command prints, which does not move the marks."""
+        t0, now = self.write_t0, time.monotonic()
+        return (t0 is not None and now - t0 > 0.05) or now - self.last_block < 1.0
 
     def _run(self) -> None:
         fd = self._fd()
@@ -1020,8 +1044,8 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                 elif not room and fd in watched:
                     sel.unregister(fd)
                     watched.discard(fd)
-                    if win.pending():
-                        win.paused = True
+                if not room and win.pending() and outs[fd].slow_reader():
+                    win.paused = True
             if not open_:
                 break
             if owed is None and state["exited"].is_set():   # what the command wrote before it exited
@@ -1075,7 +1099,7 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
     lines = _Lines()
     while not state["stop"].is_set():
         while out.full() and not out.gone and not state["stop"].is_set():
-            if win.pending():
+            if win.pending() and getattr(out, "slow_reader", lambda: True)():
                 win.paused = True
             time.sleep(0.05)
         if win.paused and out.size == 0:   # caught up (this stream; Windows reads each stream apart)
@@ -1395,7 +1419,8 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     if getattr(w, "match_s", 0.0) >= 1.0:
         notes.append(f"Matching --from/--until took {w.match_s:.1f} s of joules' time, which held up the command's "
                      "output (and the command, once its pipe was full), so the run and the window may be off. "
-                     "Use a simpler pattern (no nested repeats; a plain word is fastest).")
+                     "Use a simpler pattern: no leading repeat like \\w* or [^ ]+, no nested repeats (a plain word "
+                     "is fastest).")
     if a.window_until is not None and info["found_until"] is False:
         after = "after the --from line" if a.window_from is not None else "in the command's output"
         notes.append(f"--until {a.window_until!r} never appeared {after}, so the window runs to the end of the command.")
@@ -1428,7 +1453,7 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
             notes.append("The window is under 10 ms, so its marker lines probably arrived together: if the command "
                          "held its output (a C program writing into a file or pipe does), the window is wrong. Run it "
                          "with `stdbuf -oL` (Linux).")
-    if paused and not any("fell behind" in n for n in notes):
+    if paused and not slow and not any("fell behind" in n for n in notes):
         notes.append("What reads joules' output (a pager, a slow pipe) fell more than 16 MB behind before the window's "
                      "markers, so joules paused reading the command's output and the window may be off.")
     live = [m for m in meters if m.kind != "est"]   # the CPU-time estimate is only known once the command has ended

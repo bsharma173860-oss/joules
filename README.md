@@ -144,9 +144,9 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     printed on both at the same moment is not known: an `--until` line that arrives on the other stream together
     with the `--from` line counts only if no later one appears (joules says so).
   - Markers are matched without colour codes, and a marker on a progress-bar line counts when that line is finished.
-    They are Python regular expressions: keep them simple (a plain word is fastest). A pattern that backtracks a
-    lot on long lines (nested repeats such as `(a+)+`) holds up joules and the script; joules says so if it took
-    over a second. In a line longer than 1 MB, joules keeps only its last 64 KB (and 256 bytes before that), so a
+    They are Python regular expressions: keep them simple (a plain word is fastest). A leading `.*` or `.+` is
+    fine (joules drops it), but another leading repeat (`\w*`, `[^ ]+`) or nested repeats (`(a+)+`) can be slow on
+    long lines and hold up joules and the script; joules says so if matching took over a second. In a line longer than 1 MB, joules keeps only its last 64 KB (and 256 bytes before that), so a
     match longer than that, or one that needs to look further back, may be missed.
   - Measuring stops when the script exits. A server it leaves running does not keep joules waiting, and on Linux
     and macOS it keeps its output after joules finishes.

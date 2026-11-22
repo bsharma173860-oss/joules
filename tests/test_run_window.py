@@ -1084,24 +1084,65 @@ class RunWindow(unittest.TestCase):
         sys.path.insert(0, str(ROOT / "src"))
         from joules import cli
         for pattern, want in ((".*START", "START"), ("^.*START", "START"), (".*?START", "START"), (".*A|B", "A|B"),
-                              (".*", ".*"), (".*+x", ".*+x"), ("(?i).*x", "(?i).*x"), ("START", "START")):
+                              (".*", ".*"), (".*+x", ".*+x"), ("(?i).*x", "(?i).*x"), ("START", "START"),
+                              (".+START", ".START"), ("^.+.*START", ".START"), (".*.*START", "START"),
+                              (".+?A|B", ".A|B"), ("^X", "^X"), (r"\.*X", r"\.*X"), (".+", ".+")):
             self.assertEqual(cli._searchable(pattern), want, pattern)
         code = ("import time\nfor i in range(10): print('a' * 30000, flush=True)\n"
-                "print('START', flush=True); time.sleep(1); print('END', flush=True)\n")
-        t0 = time.monotonic()
-        p, r = self.run_j(["--no-cpu", "--from", ".*START", "--until", "END"], [sys.executable, "-c", code])
-        self.assertLess(time.monotonic() - t0, 6)
-        self.assertLess(r["duration_s"], 2.0)
-        self.assertTrue(0.9 < r["window_s"] < 1.3, r["window_s"])
+                "print('x START', flush=True); time.sleep(1); print('END', flush=True)\n")
+        for pattern in (".*START", ".+START", ".*.*START"):
+            p, r = self.run_j(["--no-cpu", "--from", pattern, "--until", "END"], [sys.executable, "-c", code])
+            self.assertLess(r["duration_s"], 2.0, pattern)
+            self.assertTrue(0.9 < r["window_s"] < 1.3, (pattern, r["window_s"]))
 
-    def test_a_slow_pattern_is_said_to_be_slow_and_the_window_never_ends_before_it_starts(self):
-        code = ("import time\nfor i in range(10): print('a' * 30000, flush=True)\n"
-                "print('START', flush=True); time.sleep(1); print('END', flush=True)\n")
-        p, r = self.run_j(["--no-cpu", "--from", "a*START", "--until", "END"], [sys.executable, "-c", code], timeout=120)
-        w = r["window"]
-        self.assertGreaterEqual(w["ends_at_s"], w["starts_at_s"])
-        if any("Matching --from/--until took" in n for n in r["notes"]):   # (on a fast machine it may stay under 1 s)
-            self.assertFalse([n for n in r["notes"] if "held its output" in n or "10 ms" in n], r["notes"])
+    def test_slow_matching_is_said_instead_of_held_back_or_pause_notes(self):
+        import argparse
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class M:
+            name, kind, energy_j = "GPU 0", "gpu", 50.0
+        w = cli.Window.__new__(cli.Window)
+        w.lock, w.frozen, w.first_out, w.ttys, w.behind = threading.Lock(), {"t": 4.0, "j": {"GPU 0": 40}}, {1: 4.0}, {}, False
+        w.begin = {"t": 4.0, "j": {"GPU 0": 40}, "line": "S", "late": True, "src": 1, "after_pause": True}
+        w.end = {"t": 4.0, "j": {"GPU 0": 40}, "line": "E", "late": True, "src": 1, "after_pause": True}
+        w.alt_end, w.match_s = None, 2.0
+
+        class S:
+            t0, t1 = 0.0, 4.0
+        notes = cli._window_report(argparse.Namespace(window_from="S", window_until="E"), w, S(), [M()], {})[1]
+        self.assertTrue([n for n in notes if "Matching --from/--until took 2.0 s" in n], notes)
+        self.assertFalse([n for n in notes if "held its output" in n or "10 ms" in n or "16 MB" in n or "fell behind" in n])
+
+    # ---- found in review round 16
+    def test_a_full_queue_is_a_slow_reader_only_when_writes_wait(self):
+        """A queue that fills because the command prints faster than joules writes (into a file, /dev/null) is not
+        a slow reader; one whose writes wait on a pipe nobody reads is. Only the second may set the pause note."""
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        with open(os.path.join(self.d, "f"), "wb") as f:
+            out = cli._Out(f)
+            for _ in range(40):
+                out.put(b"x" * 65536)
+            out.wait_empty(10)
+            self.assertFalse(out.slow_reader())
+            out.close()
+        with open(os.devnull, "wb") as f:
+            o2 = cli._Out(f)
+            o2._fd()
+            self.assertEqual(o2.kind, "file")   # (/dev/null takes 64 KB at a time, like a file)
+            o2.close()
+        r, w = os.pipe()
+        try:
+            out = cli._Out(os.fdopen(w, "wb", closefd=False))
+            out.put(b"x" * 300_000)   # more than the pipe holds: the write waits
+            time.sleep(0.3)
+            self.assertTrue(out.slow_reader())
+            out.take()
+        finally:
+            os.close(r)
+            os.close(w)
 
     def test_a_mark_set_while_the_command_exits_is_the_end_of_the_run(self):
         """The exit is recorded while a search is under way: the mark it then sets is late, at the exit."""
