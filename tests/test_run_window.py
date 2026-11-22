@@ -851,9 +851,10 @@ class RunWindow(unittest.TestCase):
                     q.send_signal(signal.SIGINT)
                 time.sleep(0.003)
             o, e = q.communicate()
-            self.assertNotIn(b"Traceback", e, e[-800:])
             self.assertEqual(o.count(b"l" * 100), 2000)
             self.assertIn(b"window", e)
+            if b"Traceback" in e:   # only after the whole report (later steps are as in a plain run)
+                self.assertLess(e.index(b"cost "), e.index(b"Traceback"), e[-800:])
 
     def test_an_ignored_sigterm_stays_ignored(self):
         q = subprocess.Popen(["bash", "-c", f"trap '' TERM; exec {shlex.quote(sys.executable)} -m joules run --no-cpu --from=A -- "
@@ -939,16 +940,67 @@ class RunWindow(unittest.TestCase):
             self.assertTrue(0.9 < r["window_s"] < 1.4, r["window_s"])
 
     def test_a_pair_read_together_on_two_streams_says_the_order_is_unknown(self):
-        code = ("import sys, time\ntime.sleep(0.3)\nsys.stdout.write('START\\n'); sys.stdout.flush()\n"
-                "sys.stderr.write('END\\n'); sys.stderr.flush()\ntime.sleep(0.6)\n")
-        out = os.path.join(self.d, "r.json")
-        with open(os.path.join(self.d, "o"), "wb") as o, open(os.path.join(self.d, "e"), "wb") as e:
-            subprocess.run([sys.executable, "-m", "joules", "run", "--no-cpu", "--out", out, "--from", "START",
-                            "--until", "END", "--", sys.executable, "-c", code], stdout=o, stderr=e, env=self.env(), timeout=60)
-        r = json.loads(Path(out).read_text())
-        self.assertTrue(r["window"]["found_until"])
-        if r["window_s"] < 0.01:   # (read together: the usual case)
-            self.assertTrue(any("which came first is not known" in n for n in r["notes"]), r["notes"])
+        """Fed straight to the window (no timing): --until on stderr read together with --from on stdout is kept aside,
+        used only with no later --until, and then said to be of unknown order (and not called held back)."""
+        import argparse
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            t = 1.0
+            def snapshot(self): return {"t": self.t, "j": {"GPU 0": self.t * 10}}
+
+        class M:
+            name, kind, energy_j = "GPU 0", "gpu", 50.0
+        clock = Clock()
+        for later in (False, True):
+            w = cli.Window(clock, 0.0, [M()], "START", "END")
+            clock.t = 1.0
+            w.feed(["START", "END"], [1, 2])
+            self.assertIsNone(w.end)
+            if later:
+                clock.t = 2.0
+                w.feed(["END again"], [1])
+            w.freeze({"t": 5.0, "j": {"GPU 0": 50.0}})
+
+            class S:
+                t0, t1 = 0.0, 5.0
+            out, notes = cli._window_report(argparse.Namespace(window_from="START", window_until="END"), w, S(), [M()], {})
+            if later:
+                self.assertEqual(out["window"]["until_line"], "END again")
+                self.assertFalse([n for n in notes if "not known" in n])
+            else:
+                self.assertEqual(out["window"]["until_line"], "END")
+                self.assertTrue([n for n in notes if "which came first is not known" in n], notes)
+                self.assertFalse([n for n in notes if "10 ms" in n or "held" in n], notes)
+
+    # ---- found in review round 13
+    def test_anchored_markers_do_not_match_where_a_long_line_was_cut(self):
+        code_tpl = ("import sys, time\nprint('A', flush=True)\nsys.stdout.write({line}); sys.stdout.flush()\n"
+                    "time.sleep(0.7)\nprint('By', flush=True)\ntime.sleep(0.2)\n")
+        for until, line in (("y$", "'x' + 'B' * 1000000 + 'y' * 1000000 + 'z\\n'"), ("^B", "'x' + 'B' * 3000000 + '\\n'")):
+            p, r = self.run_j(["--no-cpu", "--from", "^A$", "--until", until],
+                              [sys.executable, "-c", code_tpl.format(line=line)])
+            self.assertEqual(r["window"]["until_line"], "By", until)
+
+    def test_from_alone_read_at_the_exit_is_flagged(self):
+        src = os.path.join(self.d, "late1.c")
+        Path(src).write_text('#include <stdio.h>\n#include <unistd.h>\nint main(void){sleep(1);puts(">>> running");'
+                             'sleep(1);return 0;}\n')
+        exe = os.path.join(self.d, "late1")
+        subprocess.run(["gcc", "-O2", "-o", exe, src], check=True)
+        p, r = self.run_j(["--no-cpu", "--from", ">>> running"], [exe])   # into a pipe: held to exit
+        self.assertTrue(any("only read when the command exited" in n for n in r["notes"]), r["notes"])
+
+    def test_a_pause_with_no_marker_after_it_is_not_noted(self):
+        code = "import sys\nprint('A', flush=True)\nsys.stdout.write(('x' * 99 + '\\n') * 250000)\n"
+        err = os.path.join(self.d, "err")
+        q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu --from A --until NEVER -- "
+                           f"{shlex.quote(sys.executable)} -c {shlex.quote(code)} 2>{err} | (sleep 3; wc -c)", shell=True,
+                           capture_output=True, env=self.env(), timeout=120)
+        self.assertEqual(int(q.stdout.split()[0]), 2 + 25_000_000)
+        self.assertNotIn("16 MB", Path(err).read_text())
 
     def test_a_ctrl_c_while_a_server_holds_the_output_says_so(self):
         q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "A", "--", "sh", "-c",

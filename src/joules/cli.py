@@ -656,7 +656,15 @@ class Window:
 
     def _mark(self, text: str, src=None) -> dict:
         snap = self.frozen or self.clock.snapshot()
-        return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200], "late": self.frozen is not None, "src": src}
+        return {"t": snap["t"], "j": snap["j"], "line": text.replace("\0", "").strip()[:200],
+                "late": self.frozen is not None, "src": src, "after_pause": self.paused}
+
+    def _hit(self, rx, line: str, partial: bool) -> bool:
+        """Does rx match this line? partial: the line is not finished yet, so a match that reaches the end of what
+        has come so far (where $ would match, or a match could still grow) does not count yet."""
+        if not partial:
+            return rx.search(line) is not None
+        return any(m.end() < len(line) for m in rx.finditer(line))
 
     def pending(self) -> bool:
         """Is a mark still to be found? Once not, output is passed on without looking at it."""
@@ -674,7 +682,7 @@ class Window:
             return None
         return text.split("\n")
 
-    def feed(self, texts: list[str], srcs: list | None = None) -> bool:
+    def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
         first, then the --until line after it on its own stream. Which came first of lines that arrived together
         on two streams is not known: an --until line on the other stream is kept aside (alt_end), used only if no
@@ -687,7 +695,7 @@ class Window:
                 for bi, text in enumerate(texts):
                     lines = self._lines(text, self.start_re)
                     for li, ln in enumerate(lines or ()):
-                        if self.start_re.search(ln):
+                        if self._hit(self.start_re, ln, partial):
                             self.begin, where, set_one = self._mark(ln, srcs[bi]), (bi, li), True
                             break
                     if where:
@@ -701,7 +709,7 @@ class Window:
                         continue
                     first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
                     for ln in lines[first:]:
-                        if self.end_re.search(ln):
+                        if self._hit(self.end_re, ln, partial):
                             if where and where[0] != bi:   # arrived with the --from line, on another stream
                                 if self.alt_end is None:
                                     self.alt_end = self._mark(ln, srcs[bi])
@@ -714,8 +722,9 @@ class Window:
 
 
 class _Lines:
-    """The unfinished line of one stream, between reads. A line longer than 1 MB is searched before only its end is
-    kept; once a mark is found in it, the rest of that line is skipped (the next mark must be on a later line)."""
+    """The unfinished line of one stream, between reads. A line longer than 1 MB is searched (as unfinished) before
+    only its end is kept; once a mark is found in it, the rest of that line is skipped (the next mark must be on a
+    later line)."""
 
     def __init__(self):
         self.buf, self.skip = b"", False
@@ -744,10 +753,10 @@ class _Lines:
         if len(data) > 1 << 20:
             if done is not None:
                 win.feed([done], [src]); done = None
-            if win.feed([data.decode("utf-8", "replace")], [src]):
+            if win.feed([data.decode("utf-8", "replace")], [src], partial=True):
                 self.skip, data = True, b""
-            else:
-                data = data[-65536:]
+            else:   # keep the end; \0 marks the cut, so ^ cannot match where the line was cut
+                data = b"\0" + data[-65536:]
         self.buf = data
         return done
 
@@ -1147,7 +1156,7 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> bool:
                 for t in pumps:
                     t.join(0.2)
             except KeyboardInterrupt:
-                break
+                continue   # (no helper on Windows to pass the rest on: keep going)
         if not alive():
             return True
         notes.append("The command's output was still open when it exited (a process it started keeps it open); "
@@ -1319,6 +1328,7 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     with w.lock:
         begin, end = w.begin, w.end
         alt = getattr(w, "alt_end", None) if end is None else None
+        found_end = end
     if alt is not None:
         end = alt
         notes.append("The --until line arrived on the other stream together with the --from line, so which came "
@@ -1340,13 +1350,19 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     first = firsts.get(src) if src in firsts else min(firsts.values(), default=None)
     nothing_before = first is None or first >= exit_t - 0.1   # on the --from line's stream
     tty = getattr(w, "ttys", {}).get(src, False)
-    tiny = a.window_from is not None and info["found_until"] and end["t"] - begin["t"] < 0.01   # no benchmark is that short
-    at_exit = tiny and begin["t"] >= exit_t - 0.1
-    if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny):
-        if (getattr(w, "behind", False) or getattr(w, "paused", False)) and (begin.get("late") or at_exit):
+    # (no benchmark is that short; not when the --until line is one whose order is unknown, said above)
+    tiny = a.window_from is not None and info["found_until"] and alt is None and end["t"] - begin["t"] < 0.01
+    # with --from alone the window ends at the exit: under 10 ms of it, with nothing before on that stream, is held
+    tiny_from = a.window_from is not None and a.window_until is None and exit_t - begin["t"] < 0.01
+    at_exit = (tiny or tiny_from) and begin["t"] >= exit_t - 0.1
+    held = at_exit and nothing_before
+    # did joules pause for a slow reader before a mark it then found?
+    paused = bool(begin.get("after_pause") or (found_end or {}).get("after_pause"))
+    if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny or held):
+        if (getattr(w, "behind", False) or paused) and (begin.get("late") or at_exit):
             notes.append("The marker lines were only read when the command exited, so the window may be wrong: what "
                          "reads joules' output (a pager, a slow pipe) took it so slowly that joules fell behind.")
-        elif begin.get("late") or (at_exit and nothing_before):
+        elif begin.get("late") or held:
             notes.append("The marker lines were only read when the command exited, so the window may be wrong: the "
                          "command probably held its output until it ended" + (
                              "." if tty else " (a C program writing into a file or pipe does). Run it with `stdbuf "
@@ -1355,7 +1371,7 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
             notes.append("The window is under 10 ms, so its marker lines probably arrived together: if the command "
                          "held its output (a C program writing into a file or pipe does), the window is wrong. Run it "
                          "with `stdbuf -oL` (Linux).")
-    if getattr(w, "paused", False) and not any("fell behind" in n for n in notes):
+    if paused and not any("fell behind" in n for n in notes):
         notes.append("What reads joules' output (a pager, a slow pipe) fell more than 16 MB behind before the window's "
                      "markers, so joules paused reading the command's output and the window may be off.")
     live = [m for m in meters if m.kind != "est"]   # the CPU-time estimate is only known once the command has ended
