@@ -576,6 +576,10 @@ def cmd_run(a) -> int:
                 pump_state["exited"].set()
                 if os.name != "posix":   # (POSIX: the reader notes it)
                     win.behind = any(o.full() for o in outs.values())
+                    owed = {fd: _peek_pipe(fd) for fd, _, _ in proc.joules_streams if pump_state.get(fd) != "done"}
+                    pump_state["owed"] = owed   # what waits in the pipes now: once read, later lines came after
+                    if all(v <= 0 for v in owed.values()):
+                        win.caught_up = True
     finally:
         d.close()
     if windowed:   # measuring stopped when the command exited, as without a window; now the rest of its output
@@ -1102,6 +1106,27 @@ class _Out:
                 self.cv.notify_all()
 
 
+def _peek_pipe(fd: int) -> int:
+    """Windows: bytes waiting in a pipe (PeekNamedPipe), 0 if that cannot be told."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        avail = wintypes.DWORD(0)
+        ok = ctypes.windll.kernel32.PeekNamedPipe(wintypes.HANDLE(msvcrt.get_osfhandle(fd)), None, 0, None,
+                                                  ctypes.byref(avail), None)
+        return int(avail.value) if ok else 0
+    except (ImportError, OSError, AttributeError, ValueError):
+        return 0
+
+
+def _readable(fd: int, timeout: float) -> bool:
+    try:
+        return bool(select.select([fd], [], [], timeout)[0])
+    except (OSError, ValueError):   # (fd numbers past select's limit: say yes, and let the other rules decide)
+        return True
+
+
 def _pending(fd: int) -> int:
     """Bytes waiting in a pipe or pseudo-terminal."""
     try:
@@ -1196,8 +1221,8 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                 win.first_out.setdefault(fd, time.monotonic())
                 if owed is not None:
                     owed[fd] = owed.get(fd, 0) - len(chunk)
-                    if fd in pty_wait and owed[fd] <= 0 and len(chunk) < 1024:
-                        pty_wait.discard(fd)   # a short read once the reported part is read: not a held burst
+                    if fd in pty_wait and owed[fd] <= 0 and (len(chunk) < 1024 or not _readable(fd, 0.005)):
+                        pty_wait.discard(fd)   # a short read, or a pause, once the reported part is read: no held burst
                 if win.pending():
                     text = lines[fd].add(chunk, win, fd)
                     if text is not None:
@@ -1244,7 +1269,17 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
             if text is not None:
                 win.feed([text], [fd])
         out.put(chunk)
+        owed = state.get("owed")   # (set at the exit: what was then waiting in the pipes)
+        if owed is not None and fd in owed:
+            owed[fd] -= len(chunk)
+            if all(v <= 0 for v in list(owed.values())):
+                win.caught_up = True
     lines.end(win, fd)
+    owed = state.get("owed")
+    if owed is not None and fd in owed:   # (a stream that ended has nothing more waiting)
+        owed[fd] = 0
+        if all(v <= 0 for v in list(owed.values())):
+            win.caught_up = True
     state[fd] = "done"
     held = win.__dict__.get("paused_streams")
     if held is not None and fd in held:   # (a stream that ended is not behind)
@@ -1534,10 +1569,16 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         alt = getattr(w, "alt_end", None) if end is None else None
         found_end = end
     if getattr(w, "match_s", 0.0) >= 1.0:
+        line_by_line = [n for n, rx in (("--from", getattr(w, "start_re", None)), ("--until", getattr(w, "end_re", None)))
+                        if rx is not None and getattr(w, "pre", {}).get(rx, 0) is None]
+        advice = (f"{' and '.join(line_by_line)} has a lookaround, \\A/\\Z, a possessive or atomic part or a scoped flag, "
+                  "which makes joules search it line by line: drop that if you can (a plain word is fastest)."
+                  if line_by_line else
+                  "Use a simpler pattern: no leading repeat like \\w* or [^ ]+, no nested repeats (a plain word is "
+                  "fastest).")
         notes.append(f"Matching --from/--until took {w.match_s:.1f} s of joules' time, which held up the command's "
                      "output (and the command, once its pipe was full), so the run (and any window) may be off. "
-                     "Use a simpler pattern: no leading repeat like \\w* or [^ ]+, no nested repeats (a plain word "
-                     "is fastest).")
+                     + advice)
     for which, mark in (("--from", begin), ("--until", end)):
         if mark and mark.get("no_line_end"):
             notes.append(f"The {which} line had no line end, so it counted only when the command's output ended.")

@@ -1460,6 +1460,63 @@ class RunWindow(unittest.TestCase):
         self.assertIn(b"printed after the command exited", shown)
         self.assertNotIn(b"held its output", shown)
 
+    # ---- found in review round 22
+    def test_a_marker_after_the_exit_from_a_process_writing_big_lines_to_a_terminal(self):
+        script = os.path.join(self.d, "orph2.sh")
+        Path(script).write_text("( trap '' HUP; line=$(head -c 2000 /dev/zero | tr '\\0' y); i=0; "
+                                "while [ $i -lt 100 ]; do echo \"$line\"; sleep 0.02; i=$((i+1)); "
+                                "[ $i = 60 ] && echo START; done ) &\necho x; sleep .5\n")
+        shown = self._on_own_terminal(["--from", "^START", "--", "bash", script], cols=200)
+        self.assertIn(b"printed after the command exited", shown)
+        self.assertNotIn(b"held its output", shown)
+
+    def test_slow_line_by_line_matching_gets_advice_that_fits(self):
+        import argparse
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+
+        class S:
+            t0, t1 = 0.0, 4.0
+        for pattern, says in (("(?<!x)NEVER", "line by line"), (r"\w*NEVER", "no leading repeat")):
+            w = cli.Window(Clock(), 0.0, [], pattern, None)
+            w.match_s = 2.0
+            w.freeze({"t": 4.0, "j": {}})
+            notes = cli._window_report(argparse.Namespace(window_from=pattern, window_until=None), w, S(), [], {})[1]
+            self.assertTrue([n for n in notes if says in n], (pattern, notes))
+
+    def test_windows_says_a_marker_came_after_the_exit(self):
+        """Windows: what waits in the pipes at the exit (PeekNamedPipe there) is read first; a --from line after that
+        came from a process left running. Simulated with a pipe here."""
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+
+        class Out:
+            gone, size = False, 0
+            def full(self): return False
+            def put(self, c): pass
+        w = cli.Window(Clock(), 0.0, [], "START", None)
+        w.freeze({"t": 1.0, "j": {}})
+        r, wr = os.pipe()
+        os.write(wr, b"held line\n")
+        state = {"stop": threading.Event(), "owed": {r: 10}}
+        t = threading.Thread(target=cli._pump, args=(r, None, w, state, None, Out()), daemon=True)
+        t.start()
+        time.sleep(0.3)
+        os.write(wr, b"START\n")
+        time.sleep(0.3)
+        os.close(wr)
+        t.join(5)
+        os.close(r)
+        self.assertTrue(w.begin and w.begin["after_exit"], w.begin)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
