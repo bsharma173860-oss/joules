@@ -924,6 +924,80 @@ class RunWindow(unittest.TestCase):
         self.assertEqual(rest, "".join("line %06d %s\n" % (i, "x" * 40) for i in range(3000)))   # once, whole, in order
         self.assertNotIn("\nline 0", report)   # the report is in one piece (it may start part-way through a line)
 
+    # ---- found in review round 12
+    def test_an_until_line_printed_earlier_on_the_other_stream_does_not_end_the_window(self):
+        """>out 2>err: an --until line on stdout printed before the --from line on stderr, both read together."""
+        out = os.path.join(self.d, "r.json")
+        for _ in range(3):
+            with open(os.path.join(self.d, "o"), "wb") as o, open(os.path.join(self.d, "e"), "wb") as e:
+                subprocess.run([sys.executable, "-m", "joules", "run", "--no-cpu", "--out", out, "--from", ">>> running",
+                                "--until", "done", "--", "sh", "-c",
+                                "echo 'download done'; echo '>>> running bench' >&2; sleep 1; echo '>>> done'"],
+                               stdout=o, stderr=e, env=self.env(), timeout=60)
+            r = json.loads(Path(out).read_text())
+            self.assertEqual(r["window"]["until_line"], ">>> done")
+            self.assertTrue(0.9 < r["window_s"] < 1.4, r["window_s"])
+
+    def test_a_pair_read_together_on_two_streams_says_the_order_is_unknown(self):
+        code = ("import sys, time\ntime.sleep(0.3)\nsys.stdout.write('START\\n'); sys.stdout.flush()\n"
+                "sys.stderr.write('END\\n'); sys.stderr.flush()\ntime.sleep(0.6)\n")
+        out = os.path.join(self.d, "r.json")
+        with open(os.path.join(self.d, "o"), "wb") as o, open(os.path.join(self.d, "e"), "wb") as e:
+            subprocess.run([sys.executable, "-m", "joules", "run", "--no-cpu", "--out", out, "--from", "START",
+                            "--until", "END", "--", sys.executable, "-c", code], stdout=o, stderr=e, env=self.env(), timeout=60)
+        r = json.loads(Path(out).read_text())
+        self.assertTrue(r["window"]["found_until"])
+        if r["window_s"] < 0.01:   # (read together: the usual case)
+            self.assertTrue(any("which came first is not known" in n for n in r["notes"]), r["notes"])
+
+    def test_a_ctrl_c_while_a_server_holds_the_output_says_so(self):
+        q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "A", "--", "sh", "-c",
+                              "echo A; (sleep 3; echo bg) &"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env())
+        time.sleep(1)
+        q.send_signal(signal.SIGINT)
+        o, e = q.communicate(timeout=20)
+        self.assertIn(b"still open when it exited", e)
+        self.assertIn(b"stopped waiting for the command's output", e)
+        self.assertIn(b"bg", o)   # (the helper outlives joules; communicate waits for the pipe to close)
+
+    def test_windows_sees_a_reader_gone_as_einval_and_notes_a_pause(self):
+        """Windows: writing to a pipe whose reader left fails with EINVAL, not EPIPE; and its reader marks a pause
+        for a slow reader. Windows itself cannot be run here."""
+        import errno
+        import threading
+        from unittest import mock
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        out = cli._Out.__new__(cli._Out)
+        out.cv, out.handed, out.off, out.kind = threading.Condition(), False, 0, "pipe"
+
+        def einval(*a):
+            raise OSError(errno.EINVAL, "invalid argument")
+        with mock.patch.object(cli.os, "name", "nt"), mock.patch.object(cli.os, "write", einval), \
+                mock.patch.object(cli._Out, "_piece", lambda self, fd: 4096):
+            self.assertFalse(out._put(1, b"x" * 10))
+
+        class Full:
+            gone = False
+            def full(self): return True
+            def put(self, c): pass
+
+        class Win:
+            first_out, paused = {}, False
+            def pending(self): return True
+        win, state = Win(), {"stop": threading.Event()}
+        r, w = os.pipe()
+
+        def stop():
+            state["stop"].set()
+            os.close(w)
+        threading.Timer(0.3, stop).start()
+        try:
+            cli._pump(r, None, win, state, None, Full())
+        finally:
+            os.close(r)
+        self.assertTrue(win.paused)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)

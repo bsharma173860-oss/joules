@@ -545,6 +545,8 @@ def cmd_run(a) -> int:
                     except KeyboardInterrupt:
                         continue
                 pump_state["exited"].set()
+                if os.name != "posix":   # (POSIX: the reader notes it)
+                    win.behind = any(o.full() for o in outs.values())
     finally:
         d.close()
     if windowed:   # measuring stopped when the command exited, as without a window; now the rest of its output
@@ -565,9 +567,11 @@ def cmd_run(a) -> int:
                             waited = False
                             break
             if not waited:   # one Ctrl-C: hand everything over and report now
-                _hand_over(proc, pumps, pump_state, outs)
-                d.notes.append("joules stopped waiting for what reads its output (Ctrl-C); a small helper passes on "
-                               "the rest of the command's output after joules finishes.")
+                if _hand_over(proc, pumps, pump_state, outs):
+                    d.notes.append("The command's output was still open when it exited (a process it started keeps "
+                                   "it open).")
+                d.notes.append("joules stopped waiting for the command's output (Ctrl-C); a small helper passes on "
+                               "the rest of it after joules finishes.")
         except _Terminated:
             _end_on_term(proc, pumps, pump_state, outs)
         if term:
@@ -645,6 +649,7 @@ class Window:
         self.ttys = {}        # which streams are terminals
         self.behind = False   # was output still waiting for a slow reader on our side when the command exited?
         self.paused = False   # did joules stop reading for a slow reader while a mark was still to come?
+        self.alt_end = None   # an --until line that arrived with the --from line on another stream (order unknown)
         # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
         self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
                     for rx in (self.start_re, self.end_re) if rx}
@@ -671,8 +676,9 @@ class Window:
 
     def feed(self, texts: list[str], srcs: list | None = None) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
-        first, then the --until line in what follows it, so marks on stdout and stderr that arrive together are
-        both found. Returns True if a mark was set."""
+        first, then the --until line after it on its own stream. Which came first of lines that arrived together
+        on two streams is not known: an --until line on the other stream is kept aside (alt_end), used only if no
+        later --until line appears. Returns True if a mark was set."""
         set_one = False
         srcs = srcs or [None] * len(texts)
         with self.lock:
@@ -696,6 +702,10 @@ class Window:
                     first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
                     for ln in lines[first:]:
                         if self.end_re.search(ln):
+                            if where and where[0] != bi:   # arrived with the --from line, on another stream
+                                if self.alt_end is None:
+                                    self.alt_end = self._mark(ln, srcs[bi])
+                                break
                             self.end, set_one = self._mark(ln, srcs[bi]), True
                             break
                     if self.end is not None:
@@ -765,7 +775,7 @@ def _write(dst, chunk: bytes) -> bool:
     except (BrokenPipeError, ValueError, AttributeError):
         return False
     except OSError as e:   # a full disk and the like: this chunk is lost (as the command's own write would fail)
-        return e.errno != errno.EBADF
+        return not (e.errno == errno.EBADF or (os.name == "nt" and e.errno == errno.EINVAL))
 
 
 class _Out:
@@ -867,7 +877,7 @@ class _Out:
             except BrokenPipeError:
                 return False
             except OSError as e:
-                if e.errno == errno.EBADF:
+                if e.errno == errno.EBADF or (os.name == "nt" and e.errno == errno.EINVAL):   # (Windows: reader gone)
                     return False
                 n = len(chunk) - self.off   # a full disk and the like: this chunk is lost, as the command's own would be
             with self.cv:
@@ -1008,6 +1018,8 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
     lines = _Lines()
     while not state["stop"].is_set():
         while out.full() and not out.gone and not state["stop"].is_set():
+            if win.pending():
+                win.paused = True
             time.sleep(0.05)
         if out.gone:
             break
@@ -1124,7 +1136,20 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> bool:
             return False
     if not alive():
         return True
-    if os.name != "posix":
+    if os.name != "posix":   # (no helper there) a slow reader still emptying our queue is not a process left running
+        quiet = time.monotonic()
+        while alive():
+            if any(o.size for o in outs.values()):
+                quiet = time.monotonic()
+            elif time.monotonic() - quiet > 2.0:
+                break
+            try:
+                for t in pumps:
+                    t.join(0.2)
+            except KeyboardInterrupt:
+                break
+        if not alive():
+            return True
         notes.append("The command's output was still open when it exited (a process it started keeps it open); "
                      "joules stopped reading it.")
         return True
@@ -1154,9 +1179,10 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> bool:
     return True
 
 
-def _hand_over(proc, pumps, state, outs, ending: bool = False) -> None:
+def _hand_over(proc, pumps, state, outs, ending: bool = False) -> bool:
     """POSIX: stop reading and give every stream, with what joules read but has not passed on yet, to helpers.
-    ending: joules ends at once (SIGTERM)."""
+    ending: joules ends at once (SIGTERM). True if a stream was still held open (a process the command started)."""
+    held = False
     state["stop"].set()
     for t in pumps:
         t.join(1.0)   # our reader never waits on a writer, so it stops at once
@@ -1168,9 +1194,11 @@ def _hand_over(proc, pumps, state, outs, ending: bool = False) -> None:
         if src is not None or pre or maybe:
             _hand_off(src, dst, pre, maybe, outs[fd].wrote_stuck)
         if src is not None:
+            held = held or not _hung_up(src)
             state[fd] = "handed"
             with contextlib.suppress(OSError):
                 os.close(fd)
+    return held
 
 
 def _end_on_term(proc, pumps, state, outs) -> None:
@@ -1290,6 +1318,11 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     notes = []
     with w.lock:
         begin, end = w.begin, w.end
+        alt = getattr(w, "alt_end", None) if end is None else None
+    if alt is not None:
+        end = alt
+        notes.append("The --until line arrived on the other stream together with the --from line, so which came "
+                     "first is not known; with no later --until line, joules took it as the end.")
     info = {"from": a.window_from, "until": a.window_until,
             "found_from": begin is not None and a.window_from is not None, "found_until": end is not None}
     if begin is None:

@@ -140,7 +140,9 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     it), but C programs may hold their output until they exit, so their marker lines come late. Run such a
     program with `stdbuf -oL` (Linux).
   - When stdout and stderr go to the same place (a terminal, or `2>&1`), they share one stream, so their order is
-    kept and a marker may be on either.
+    kept and a marker may be on either. When they go to different places (`>out.log 2>err.log`), the order of lines
+    printed on both at the same moment is not known: an `--until` line that arrives on the other stream together
+    with the `--from` line counts only if no later one appears (joules says so).
   - Markers are matched without colour codes, and a marker on a progress-bar line counts when that line is finished.
   - Measuring stops when the script exits. A server it leaves running does not keep joules waiting, and on Linux
     and macOS it keeps its output after joules finishes.
@@ -151,7 +153,7 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     no time is the sign to look for.
   - A slow reader of joules' output (a pager, a slow pipe) does not move the window: joules keeps reading the
     script's output on time, holding up to 16 MB of it for the reader (and says so if it falls further behind).
-  - A Ctrl-C while joules waits for a slow reader stops the waiting: joules reports at once and a small helper
+  - On Linux and macOS, a Ctrl-C while joules waits for a slow reader stops the waiting: joules reports at once and a small helper
     passes on the rest of the output after it (the report may then start part-way through a line).
   - The script writes to joules, not to your file, so if your disk fills up the script does not see the error;
     the output that did not fit is lost, as it would be anyway.
