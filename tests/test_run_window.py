@@ -1679,6 +1679,39 @@ class RunWindow(unittest.TestCase):
         time.sleep(2)
         self.assertEqual(Path(out).read_text().count("TAIL "), 100)
 
+    def test_a_search_cut_short_by_a_hand_over_says_so(self):
+        """The --from line was read but not yet searched when Ctrl-C handed over: not "never appeared"."""
+        code = "import sys\nprint('A')\nfor i in range(300): print('x' * 18)\nprint('B'); sys.stdout.flush()\n"
+        err = os.path.join(self.d, "err")
+        with open(err, "wb") as e:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "(?=B)B|(x+x+)+y", "--",
+                                  sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=e, env=self.env(),
+                                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            time.sleep(1.5)
+            q.send_signal(signal.SIGINT)
+            q.wait(timeout=30)
+        text = Path(err).read_text()
+        self.assertNotIn("never appeared", text)
+        self.assertTrue("stopped looking" in text or "window" in text, text[-500:])
+
+    def test_the_quick_search_in_pieces_handles_empty_and_split_blocks(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "zz", None)
+        self.assertFalse(w.feed([""], [1]))                       # (an empty block, no match: must not loop)
+        self.assertTrue(cli.Window(Clock(), 0.0, [], "^$", None).feed([""], [1]))
+        w = cli.Window(Clock(), 0.0, [], "needle", None)
+        self.assertTrue(w.feed([("x" * 79 + "\n") * 3000 + "a needle\n"], [1]))   # found in a later piece
+
+    def test_a_slow_pre_search_does_not_stretch_the_run(self):
+        """One search over a whole read holds up every other thread: a slow one makes joules go line by line."""
+        code = "import sys\nprint('A')\nfor i in range(300): print('x' * 18)\nprint('B')\n"
+        p, r = self.run_j(["--no-cpu", "--from", "A", "--until", "(x+x+)+y|B"], [sys.executable, "-c", code], timeout=120)
+        self.assertLess(r["duration_s"], 2.0, r["duration_s"])
+
     def test_colour_codes_are_not_counted_as_slow_matching(self):
         sys.path.insert(0, str(ROOT / "src"))
         from joules import cli

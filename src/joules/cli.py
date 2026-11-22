@@ -738,6 +738,7 @@ class Window:
         # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
         # (not with lookarounds or \A \Z \z, which could see past a line end there and so miss a line)
         # (nor with possessive repeats, atomic groups or scoped flags like (?-m:...), which can fail across lines)
+        self.pre_size = {}   # how much the quick search takes at once, per pattern (see _lines)
         self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?<?[=!]|\(\?>|[*+?}]\+|\(\?[a-zA-Z]*-", rx.pattern)
                          else re.compile(rx.pattern, rx.flags | re.M))
                     for rx in (self.start_re, self.end_re) if rx}
@@ -793,8 +794,23 @@ class Window:
     def _lines(self, text: str, rx) -> list[str] | None:
         """text: already cleaned (see _feed)."""
         pre = self.pre.get(rx)
-        if pre is not None and not pre.search(text):
-            return None
+        if pre is not None:
+            found, i = False, 0
+            while not found:   # in pieces of whole lines (other threads run between), small at first and doubling
+                size = self.pre_size.get(rx, 256)   # while the search stays fast, up to 64 KB
+                j = text.find("\n", i + size)
+                j = len(text) if j < 0 else j + 1
+                t0 = time.thread_time()
+                found = pre.search(text, i, j) is not None
+                if time.thread_time() - t0 > 0.005:   # slow even so (it holds up every other thread while it runs):
+                    self.pre[rx] = None                # search this pattern line by line from now on
+                    return text.split("\n")
+                self.pre_size[rx] = min(65536, size * 2)
+                i = j
+                if i >= len(text):
+                    break
+            if not found:
+                return None
         return text.split("\n")
 
     def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
@@ -836,6 +852,7 @@ class Window:
                     lines = self._lines(text, self.start_re)
                     for li, ln in enumerate(lines or ()):
                         if not eof and self._stopping():   # (the last unfinished line is still looked at)
+                            self.cut_short = True
                             break
                         if self._hit(self.start_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
                             self.begin, where, set_one = self._mark(ln, srcs[bi], eof), (bi, li), True
@@ -865,6 +882,7 @@ class Window:
             first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
             for li in range(first, len(lines)):
                 if not eof and self._stopping():
+                    self.cut_short = True
                     return
                 ln = lines[li]
                 if self._hit(self.end_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
@@ -900,6 +918,8 @@ class _Lines:
         if not ctx:
             return text
         t = _Text(text)
+        # (where the kept part starts, in cleaned terms; a cut inside an escape code or a character can shift it by a
+        # few characters, within the long-line limits)
         t.start = len(Window.clean(data[:ctx].decode("utf-8", "replace")))
         return t
 
@@ -1668,9 +1688,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
             else:
                 tips.append(f"Make {k} simpler: no leading repeat like \\w* or [^ ]+, no nested repeats.")
         advice = " ".join(tips) + " (A plain word is fastest.)"
-        notes.append(f"Matching --from/--until took {w.match_s:.1f} s of joules' time, which held up the command's "
-                     "output (and the command, once its pipe was full), so the run (and any window) may be off. "
-                     + advice)
+        notes.append(f"Matching --from/--until took {w.match_s:.1f} s of joules' time, which held up joules (passing "
+                     "the output on, measuring, even Ctrl-C) and so the command once its pipe was full: the run (and "
+                     "any window) may be off. " + advice)
     for which, mark in (("--from", begin), ("--until", end)):
         if mark and mark.get("no_line_end"):
             notes.append(f"The {which} line had no line end, so it counted only when joules finished reading the "
@@ -1684,6 +1704,12 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
                      "first is not known; with no later --until line, joules took it as the end.")
     info = {"from": a.window_from, "until": a.window_until,
             "found_from": begin is not None and a.window_from is not None, "found_until": end is not None}
+    cut = getattr(w, "cut_short", False)
+    if begin is None and cut:
+        notes.append(f"--from {a.window_from!r} was not found before joules stopped looking (it handed the output "
+                     "over while still searching a slow pattern), so there is no window: the figures above are the "
+                     "whole run.")
+        return {"window": info, "window_s": None, "window_energy_j": None}, notes
     if begin is None:
         notes.append(f"--from {a.window_from!r} never appeared in the command's output, so there is no window: "
                      "the figures above are the whole run.")
@@ -1693,7 +1719,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         end = {**end, "t": begin["t"], "j": begin["j"]}
     if a.window_until is not None and info["found_until"] is False:
         after = "after the --from line" if a.window_from is not None else "in the command's output"
-        notes.append(f"--until {a.window_until!r} never appeared {after}, so the window runs to the end of the command.")
+        notes.append(f"--until {a.window_until!r} " + (
+            "was not found before joules stopped looking (it handed the output over while still searching a slow "
+            "pattern)" if cut else f"never appeared {after}") + ", so the window runs to the end of the command.")
     exit_t = (w.frozen or {}).get("t", s.t1)
     # Held back: the --from line read only after the exit, or a window of no time at the exit (a late --until alone
     # is just the command's last line, read a moment after it exited). Not for a run too short for it to matter.
