@@ -689,7 +689,8 @@ class Window:
         self.clock, self.meters = clock, meters
         self.start_re = re.compile(_searchable(start_re)) if start_re is not None else None
         self.end_re = re.compile(_searchable(end_re)) if end_re is not None else None
-        self.match_s = 0.0    # time spent matching (it holds up the rest of joules)
+        self.match_s = 0.0    # time spent matching beyond a plain search (it holds up the rest of joules)
+        self._cpu = self._budget = 0.0
         self.lock = threading.Lock()
         self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
         self.end = None
@@ -701,10 +702,12 @@ class Window:
         self.alt_end = None   # an --until line that arrived with the --from line on another stream (order unknown)
         # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
         # (not with lookarounds or \A \Z \z, which could see past a line end there and so miss a line)
-        self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?<?[=!]", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
+        # (nor with possessive repeats, atomic groups or scoped flags like (?-m:...), which can fail across lines)
+        self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?<?[=!]|\(\?>|[*+?}]\+|\(\?[a-zA-Z]*-", rx.pattern)
+                         else re.compile(rx.pattern, rx.flags | re.M))
                     for rx in (self.start_re, self.end_re) if rx}
 
-    def _mark(self, text: str, src=None) -> dict:
+    def _mark(self, text: str, src=None, eof: bool = False) -> dict:
         snap, late = self.frozen, True
         if snap is None:
             snap, late = self.clock.snapshot(), False
@@ -713,7 +716,7 @@ class Window:
                 snap, late = exited, True
         return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200], "late": late, "src": src,
                 "after_pause": self.paused, "after_exit": late and getattr(self, "caught_up", False),
-                "no_line_end": getattr(self, "at_eof", False)}
+                "no_line_end": eof}
 
     @staticmethod
     def clean(text: str) -> str:
@@ -744,17 +747,23 @@ class Window:
             return None
         return text.split("\n")
 
-    def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
+    def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
+             eof: bool = False) -> bool:
         t0 = time.thread_time()   # this thread's own CPU time: a busy machine does not count
         try:
-            return self._feed(texts, srcs, partial, keep_from)
+            return self._feed(texts, srcs, partial, keep_from, eof)
         finally:
             # only what goes beyond a plain search of this much text counts (a plain word never adds up, however
             # much output; a slow pattern does, in big reads or small, e.g. 4 KB from a terminal)
+            # (totals, not each read clamped: Windows' CPU clock moves in 15.6 ms steps)
             n = sum(len(t) for t in texts)
-            self.match_s += max(0.0, time.thread_time() - t0 - 0.0002 - n / 50e6)
+            with self.lock:
+                self._cpu += time.thread_time() - t0
+                self._budget += 0.0002 + n / 50e6
+                self.match_s = max(0.0, self._cpu - self._budget)
 
-    def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
+    def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
+              eof: bool = False) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
         first, then the --until line after it on its own stream. Which came first of lines that arrived together
         on two streams is not known: an --until line on the other stream is kept aside (alt_end), used only if no
@@ -768,7 +777,7 @@ class Window:
                     lines = self._lines(text, self.start_re)
                     for li, ln in enumerate(lines or ()):
                         if self._hit(self.start_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
-                            self.begin, where, set_one = self._mark(ln, srcs[bi]), (bi, li), True
+                            self.begin, where, set_one = self._mark(ln, srcs[bi], eof), (bi, li), True
                             break
                     if where:
                         break
@@ -785,9 +794,9 @@ class Window:
                         if self._hit(self.end_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
                             if where and where[0] != bi:   # arrived with the --from line, on another stream
                                 if self.alt_end is None:
-                                    self.alt_end = self._mark(ln, srcs[bi])
+                                    self.alt_end = self._mark(ln, srcs[bi], eof)
                                 break
-                            self.end, set_one = self._mark(ln, srcs[bi]), True
+                            self.end, set_one = self._mark(ln, srcs[bi], eof), True
                             break
                     if self.end is not None:
                         break
@@ -853,11 +862,8 @@ class _Lines:
 
     def end(self, win: "Window", src=None) -> None:
         if self.buf and not self.skip and win.pending():
-            win.at_eof = True   # (a last line with no line end: it counts only now, when the output ends)
-            try:
-                win.feed([self._text(self.buf, self.ctx)], [src])
-            finally:
-                win.at_eof = False
+            # (a last line with no line end: it counts only now, when the output ends)
+            win.feed([self._text(self.buf, self.ctx)], [src], eof=True)
         self.buf, self.ctx = b"", 0
 
 
@@ -1135,6 +1141,7 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
             if owed is None and state["exited"].is_set():   # what the command wrote before it exited
                 # (a pseudo-terminal reports only part of what waits in it: there, until a read finds nothing)
                 owed = {fd: (None if getattr(win, "ttys", {}).get(fd) else _pending(fd)) for fd in open_}
+                owed_t = time.monotonic()
                 win.behind = any(outs[fd].full() for fd in open_)
             if owed is not None and all(owed.get(fd, 0) is not None and owed.get(fd, 0) <= 0 for fd in open_):
                 state["caught_up"].set()
@@ -1143,7 +1150,8 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                 if watched:
                     ready = {k.fd for k, _ in sel.select(0.1)}
                     if owed is not None:   # a watched pseudo-terminal with nothing to read: what was in it is read
-                        for fd in [f for f, v in owed.items() if v is None and f in watched and f not in ready]:
+                        late = time.monotonic() - owed_t > 2.0   # (or still readable 2 s on: a process left writing)
+                        for fd in [f for f, v in owed.items() if v is None and f in watched and (late or f not in ready)]:
                             owed[fd] = 0
                 else:
                     ready = set()

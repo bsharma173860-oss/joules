@@ -1371,6 +1371,71 @@ class RunWindow(unittest.TestCase):
         p, r = self.run_j(["--no-cpu", "--from", "START"], ["bash", "-c", 'sleep 0.3; printf "x\\nSTART"; sleep 0.5'])
         self.assertTrue(any("had no line end" in n for n in r["notes"]), r["notes"])
 
+    # ---- found in review round 20
+    def test_a_server_writing_to_a_terminal_does_not_keep_joules_waiting(self):
+        import fcntl
+        import pty
+        import termios
+        import threading
+        m, sl = pty.openpty()
+
+        def own_session():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        cmd = ("(for i in $(seq 1 300); do echo 'server: request served'; sleep 0.05; done) & "
+               "echo START; sleep 1; echo bye")
+        t0 = time.monotonic()
+        q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "START", "--", "bash", "-c", cmd],
+                             stdin=sl, stdout=sl, stderr=sl, env=self.env(), preexec_fn=own_session)
+        os.close(sl)
+        shown = []
+
+        def drain():
+            while True:
+                b = select_read(m)
+                if b is None:
+                    return
+                shown.append(b)
+        t = threading.Thread(target=drain, daemon=True)
+        t.start()
+        try:
+            q.wait(timeout=30)
+        finally:
+            if q.poll() is None:
+                q.kill()
+        took = time.monotonic() - t0
+        self.assertLess(took, 12, took)
+        time.sleep(0.5)
+        os.close(m)
+        self.assertIn(b"still open", b"".join(shown))
+
+    def test_the_pre_search_is_off_where_it_could_miss_a_line(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        for pattern, text in ((r"START\s*+$", "START\n  x"), ("START[^#]*+$", "START foo\nbar#"),
+                              ("(?-m:START$)", "START\nother"), (r"(?s)START(?>.*)\b", "START\n-")):
+            w = cli.Window(Clock(), 0.0, [], pattern, None)
+            self.assertTrue(w.feed([text], [1]), pattern)
+
+    def test_a_coarse_cpu_clock_does_not_add_up_to_a_false_note(self):
+        """Windows' thread CPU clock moves in 15.6 ms steps: a plain word must still not add up."""
+        from unittest import mock
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        real = time.thread_time
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "NEVERSEEN", None)
+        block = ("2026-11-22 12:00:00 INFO step done loss=0.123 " + "x" * 50 + "\n") * 40   # ~4 KB
+        with mock.patch.object(cli.time, "thread_time", lambda: (real() // 0.015625) * 0.015625):
+            for _ in range(75000):   # ~300 MB
+                w.feed([block], [1])
+        self.assertLess(w.match_s, 0.5)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
