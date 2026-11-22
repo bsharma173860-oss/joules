@@ -1976,7 +1976,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
             "of it)" if cut else open_why if left_open else f"never appeared {after}") + ", so the window runs to "
             "the end of the command.")
     exit_t = (w.frozen or {}).get("t", s.t1)
-    if (found_end or {}).get("after_exit") and not begin.get("after_exit") and exit_t - s.t0 >= 0.2:
+    # (not when joules fell behind a slow reader: then the line may only have been read late, see below)
+    behind = getattr(w, "behind", False) or begin.get("after_pause") or (found_end or {}).get("after_pause")
+    if (found_end or {}).get("after_exit") and not begin.get("after_exit") and exit_t - s.t0 >= 0.2 and not behind:
         notes.append("The --until line was printed after the command exited (by a process it left running), and "
                      "measuring stops when the command exits, so the window ends at the exit and misses the rest.")
     # Held back: the --from line read only after the exit, or a window of no time at the exit (a late --until alone

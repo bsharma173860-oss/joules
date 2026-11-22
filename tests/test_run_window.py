@@ -1996,6 +1996,33 @@ class RunWindow(unittest.TestCase):
         q.wait(timeout=20)
         self.assertEqual(len(got), len(data))
 
+    # ---- found in review round 36
+    def test_an_until_line_read_late_behind_a_stalled_reader_is_not_blamed_on_a_process_left_running(self):
+        """A terminal stalled (Ctrl-S) while 16 MB behind: the command's own last line is read only after it exited.
+        That is the pause note, not "printed by a process it left running"."""
+        import argparse
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class M:
+            name, kind, energy_j = "GPU 0", "gpu", 50.0
+
+        class S:
+            t0, t1 = 0.0, 4.0
+        for behind, pause in ((True, False), (False, True)):
+            w = cli.Window.__new__(cli.Window)
+            w.lock, w.frozen, w.first_out, w.ttys = threading.Lock(), {"t": 4.0, "j": {"GPU 0": 40}}, {1: 0.1}, {1: True}
+            w.behind, w.alt_end, w.match_s = behind, None, 0.0
+            w.begin = {"t": 0.5, "j": {"GPU 0": 5}, "line": "S", "src": 1}
+            w.end = {"t": 4.0, "j": {"GPU 0": 40}, "line": "E", "src": 1, "after_exit": True, "late": True,
+                     "after_pause": pause}
+            notes = cli._window_report(argparse.Namespace(window_from="S", window_until="E"), w, S(), [M()], {})[1]
+            self.assertFalse([n for n in notes if "left running" in n], notes)
+        w.behind, w.end = False, {**w.end, "after_pause": False}   # (not behind: the note is right)
+        notes = cli._window_report(argparse.Namespace(window_from="S", window_until="E"), w, S(), [M()], {})[1]
+        self.assertTrue([n for n in notes if "left running" in n], notes)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
