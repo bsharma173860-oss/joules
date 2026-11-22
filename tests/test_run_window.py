@@ -1911,8 +1911,35 @@ class RunWindow(unittest.TestCase):
     def test_a_marker_after_the_output_was_handed_over_is_not_said_to_never_appear(self):
         p, r = self.run_j(["--no-cpu", "--from", "^start", "--until", "^done"],
                           ["bash", "-c", "sleep 0.3; echo start; sleep 0.3; (sleep 4; echo done) & echo launched"])
-        self.assertTrue(any("not found before joules stopped looking" in n for n in r["notes"]), r["notes"])
+        self.assertTrue(any("was not found in what joules read" in n for n in r["notes"]), r["notes"])
         self.assertFalse(any("never appeared" in n for n in r["notes"]), r["notes"])
+
+    # ---- found in review round 35
+    def test_a_writer_that_goes_while_a_slow_reader_drains_still_counts_as_open(self):
+        """The left-running process prints its line and exits after joules stopped reading, while joules still
+        passes on output to a slow reader: the line was not looked at, so it is not said never to appear."""
+        cmd = ("echo start; head -c 4000000 /dev/zero | tr '\\0' 'x' | fold -w 99; echo; (sleep 2.6; echo done) &")
+        out = os.path.join(self.d, "r.json")
+        q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--out", out, "--from", "^start",
+                              "--until", "^done", "--", "bash", "-c", cmd], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, env=self.env(JOULES_NVML_LIB=self.laptop))
+        got = b""
+        while True:
+            b = q.stdout.read1(65536)
+            if not b:
+                break
+            got += b
+            time.sleep(0.06)   # (a reader at ~1 MB/s)
+        q.wait(timeout=60)
+        self.assertIn(b"\ndone\n", got)
+        notes = json.loads(Path(out).read_text())["notes"]
+        self.assertFalse(any("never appeared" in n for n in notes), notes)
+        self.assertTrue(any("was not found in what joules read" in n for n in notes), notes)
+
+    def test_a_silent_process_left_running_does_not_make_joules_claim_it_handed_over_unread_output(self):
+        p, r = self.run_j(["--no-cpu", "--from", "^begin"], ["bash", "-c", "echo start; sleep 0.5; echo done; sleep 4 &"])
+        self.assertTrue(any("was not found in what joules read" in n for n in r["notes"]), r["notes"])
+        self.assertFalse(any("before it had looked at all of it" in n for n in r["notes"]), r["notes"])
 
     def test_a_sighup_to_joules_alone_leaves_the_command_running(self):
         """A closed ssh terminal while the output goes to a file: as without a window, the command keeps its output."""

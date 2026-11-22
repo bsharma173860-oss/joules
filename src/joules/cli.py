@@ -618,8 +618,9 @@ def cmd_run(a) -> int:
                             waited = False
                             break
             if not waited:   # one Ctrl-C: hand everything over and report now
-                if _hand_over(proc, pumps, pump_state, outs):
-                    win.left_open = True
+                held = _hand_over(proc, pumps, pump_state, outs)
+                win.left_open = pump_state.get("left_open", False)
+                if held:
                     d.notes.append("The command's output was still open when it exited (a process it started keeps "
                                    "it open).")
                 d.notes.append("joules stopped waiting for the command's output (Ctrl-C); a small helper passes on "
@@ -1739,6 +1740,7 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> bool:
                      "joules stopped reading it.")
         state["left_open"] = True
         return True
+    _note_open(proc, state)   # (as joules stops reading: a writer may still print, and go, while a slow reader drains)
     state["stop"].set()
     while alive():   # our reader never waits on a writer, so it stops at once
         try:
@@ -1760,16 +1762,23 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> bool:
         with contextlib.suppress(OSError):
             os.close(fd)
     if held:
-        state["left_open"] = True
         notes.append("The command's output was still open when it exited (a process it started keeps it open); " + (
             "a small helper keeps passing it on after joules finishes." if moved else "joules stopped reading it."))
     return True
 
 
+def _note_open(proc, state) -> bool:
+    """Right as joules stops reading: is a stream still open (a process the command left running may print more)?
+    Sets state["left_open"]."""
+    left = any(state.get(fd) not in ("done", "handed") and not _hung_up(fd) for fd, _, _ in proc.joules_streams)
+    state["left_open"] = state.get("left_open", False) or left
+    return left
+
+
 def _hand_over(proc, pumps, state, outs, ending: bool = False) -> bool:
     """POSIX: stop reading and give every stream, with what joules read but has not passed on yet, to helpers.
     ending: joules ends at once (SIGTERM). True if a stream was still held open (a process the command started)."""
-    held = False
+    held = _note_open(proc, state)
     state["stop"].set()
     for t in pumps:   # our reader never waits on a writer, and a search stops between lines: it stops at once
         t.join()
@@ -1943,11 +1952,15 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
                      "first is not known; with no later --until line, joules took it as the end.")
     info = {"from": a.window_from, "until": a.window_until,
             "found_from": begin is not None and a.window_from is not None, "found_until": end is not None}
-    cut = getattr(w, "cut_short", False) or getattr(w, "left_open", False)
-    if begin is None and cut:
-        notes.append(f"--from {a.window_from!r} was not found before joules stopped looking (it handed the output "
-                     "over before it had looked at all of it), so there is no window: the figures above are the "
-                     "whole run.")
+    cut = getattr(w, "cut_short", False)
+    # (a process the command left running kept its output open: joules read all written until it stopped reading)
+    left_open = not cut and getattr(w, "left_open", False)
+    open_why = ("was not found in what joules read (a process the command left running kept its output open, and "
+                "joules stopped reading it after the command exited)")
+    if begin is None and (cut or left_open):
+        notes.append(f"--from {a.window_from!r} " + ("was not found before joules stopped looking (it handed the "
+                     "output over before it had looked at all of it)" if cut else open_why) + ", so there is no "
+                     "window: the figures above are the whole run.")
         return {"window": info, "window_s": None, "window_energy_j": None}, notes
     if begin is None:
         notes.append(f"--from {a.window_from!r} never appeared in the command's output, so there is no window: "
@@ -1960,7 +1973,8 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         after = "after the --from line" if a.window_from is not None else "in the command's output"
         notes.append(f"--until {a.window_until!r} " + (
             "was not found before joules stopped looking (it handed the output over before it had looked at all "
-            "of it)" if cut else f"never appeared {after}") + ", so the window runs to the end of the command.")
+            "of it)" if cut else open_why if left_open else f"never appeared {after}") + ", so the window runs to "
+            "the end of the command.")
     exit_t = (w.frozen or {}).get("t", s.t1)
     if (found_end or {}).get("after_exit") and not begin.get("after_exit") and exit_t - s.t0 >= 0.2:
         notes.append("The --until line was printed after the command exited (by a process it left running), and "
