@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import collections
 import contextlib
 import datetime as dt
 import functools
@@ -28,7 +29,7 @@ import json
 import os
 import platform
 import re
-import select
+import selectors
 import shlex
 import shutil
 import signal
@@ -246,7 +247,7 @@ def _start(cmd: list[str], piped: bool = False):
             outs = [f for f in (sys.stdout, sys.stderr) if _usable(f)]
             same = len(outs) == 2 and _same_place()
             env = dict(os.environ)
-            if any(not _isatty(f) for f in outs):   # into a pipe Python would hold its output until it exits
+            if os.name != "posix" or any(not _isatty(f) for f in outs):   # a pipe (always, on Windows): Python would hold its output
                 env["PYTHONUNBUFFERED"] = "1"
             if os.name == "posix":
                 made, ends = [], {}
@@ -504,30 +505,48 @@ def cmd_run(a) -> int:
             for m in d.meters:
                 if hasattr(m, "attach"):
                     m.attach(proc)
+            terminated, old_term = False, None
             if windowed:
                 clock = PhaseClock(d.meters, s.lock)
                 win = Window(clock, s.t0, d.meters, a.window_from, a.window_until)
-                pump_state = {"stop": threading.Event()}
+                win.ttys = {fd: _isatty(dst) for fd, dst, _ in proc.joules_streams}
+                outs = {fd: _Out(dst) for fd, dst, _ in proc.joules_streams}   # written on by their own threads
+                pump_state = {"stop": threading.Event(), "exited": threading.Event(), "caught_up": threading.Event()}
                 if os.name == "posix":
-                    pumps = [threading.Thread(target=_pump_all, args=(proc.joules_streams, win, pump_state), daemon=True)]
+                    pumps = [threading.Thread(target=_pump_all, args=(proc.joules_streams, win, pump_state, outs), daemon=True)]
                     old_winch = _follow_resizes(proc)
+                    old_term = _catch_term()
                 else:
-                    pumps = [threading.Thread(target=_pump, args=(fd, dst, win, pump_state, close), daemon=True)
+                    pumps = [threading.Thread(target=_pump, args=(fd, dst, win, pump_state, close, outs[fd]), daemon=True)
                              for fd, dst, close in proc.joules_streams]
                 for t in pumps:
                     t.start()
-            while True:
-                try:
-                    code = proc.wait()
-                    break
-                except KeyboardInterrupt:
-                    continue  # Ctrl-C reaches the child too; wait for it to finish, then report
-            if windowed:
+            try:
+                while True:
+                    try:
+                        code = proc.wait()
+                        break
+                    except KeyboardInterrupt:
+                        continue  # Ctrl-C reaches the child too; wait for it to finish, then report
+                    except _Terminated:   # joules alone was told to stop: see below
+                        terminated = True
+                        break
+            finally:
+                if old_term is not None:
+                    signal.signal(signal.SIGTERM, old_term)
+            if windowed and not terminated:
                 win.freeze(clock.snapshot())   # the run ends here; marks read from now on are its end
+                pump_state["exited"].set()
     finally:
         d.close()
     if windowed:   # measuring stopped when the command exited, as without a window; now the rest of its output
-        deadline = time.monotonic() + 2.0   # a process the command left running may hold the output for ever
+        if os.name == "posix" and not terminated:
+            try:   # first all the command wrote before it exited (a slow reader on our side may make that take a while)
+                while not pump_state["caught_up"].wait(0.2) and any(t.is_alive() for t in pumps):
+                    pass
+            except KeyboardInterrupt:
+                pass   # a Ctrl-C here means: stop now
+        deadline = time.monotonic() + (0.0 if terminated else 2.0)   # a process the command left running may hold it for ever
         for t in pumps:
             while t.is_alive() and time.monotonic() < deadline:
                 try:
@@ -536,26 +555,40 @@ def cmd_run(a) -> int:
                     continue  # a late Ctrl-C must not lose the report
         if any(t.is_alive() for t in pumps):
             moved, left = False, []
-            if os.name == "posix":   # stop our reader (all it read is written), then hand the streams over
+            if os.name == "posix":   # stop our reader, pass on all it read, then hand the streams over
                 pump_state["stop"].set()
-                try:   # it stops after the write it is in (a slow reader on our side may hold it): never drop output
+                try:
                     for t in pumps:
                         t.join()
+                    left = [(fd, dst) for fd, dst, _ in proc.joules_streams if pump_state.get(fd) == "stopped"]
+                    for fd, _ in left:
+                        outs[fd].wait_empty()   # never drop output, however slow the reader on our side
                 except KeyboardInterrupt:
                     pass   # a Ctrl-C here means: stop now
-                left = [(fd, dst) for fd, dst, _ in proc.joules_streams if pump_state.get(fd) == "stopped"]
-                moved = bool(left) and not any(t.is_alive() for t in pumps) and all(_hand_off(fd, dst) for fd, dst in left)
+                moved = bool(left) and not any(t.is_alive() for t in pumps) and \
+                    all(outs[fd].wait_empty(0) for fd, _ in left) and all(_hand_off(fd, dst) for fd, dst in left)
                 for fd, _ in left:
                     with contextlib.suppress(OSError):
                         os.close(fd)
             if moved:
-                d.notes.append("The command's output was still open when it exited (a process it started, or output "
-                               "not yet passed on); a small helper keeps passing it on after joules finishes.")
+                d.notes.append("The command's output was still open when it exited (a process it started keeps it "
+                               "open); a small helper keeps passing it on after joules finishes.")
             elif left or os.name != "posix":   # (POSIX: nothing left open once the reader drained it all)
                 d.notes.append("The command's output was still open when it exited (a process it started keeps it "
                                "open); joules stopped reading it.")
+        for o in outs.values():
+            o.close()
+        try:   # all the command's output is passed on before the report
+            for o in outs.values():
+                o.thread.join()
+        except KeyboardInterrupt:
+            pass
         if os.name == "posix":
             _stop_following(old_winch)
+        if terminated:   # as without a window: joules ends at once, and the command keeps its output (the helper)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return 128 + signal.SIGTERM
     devices = _devices(d, idle, s.duration_s)
     ops = a.flops or (training_flops(a.params, a.tokens) if a.params and a.tokens else None)
     report = {"schema": "joules/1", "tool": f"joules {__version__}", "kind": "run", "command": cmd, "exit_code": code,
@@ -619,14 +652,16 @@ class Window:
         self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
         self.end = None
         self.frozen = None   # set when the command has exited: a mark read after that is the end of the run
-        self.first_out = None   # when the command's first output was read
+        self.first_out = {}   # when the command's first output was read, per stream
+        self.ttys = {}        # which streams are terminals
+        self.behind = False   # was output still waiting for a slow reader on our side when the command exited?
         # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
         self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
                     for rx in (self.start_re, self.end_re) if rx}
 
-    def _mark(self, text: str) -> dict:
+    def _mark(self, text: str, src=None) -> dict:
         snap = self.frozen or self.clock.snapshot()
-        return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200], "late": self.frozen is not None}
+        return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200], "late": self.frozen is not None, "src": src}
 
     def pending(self) -> bool:
         """Is a mark still to be found? Once not, output is passed on without looking at it."""
@@ -644,11 +679,12 @@ class Window:
             return None
         return text.split("\n")
 
-    def feed(self, texts: list[str]) -> bool:
+    def feed(self, texts: list[str], srcs: list | None = None) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
         first, then the --until line in what follows it, so marks on stdout and stderr that arrive together are
         both found. Returns True if a mark was set."""
         set_one = False
+        srcs = srcs or [None] * len(texts)
         with self.lock:
             where = None   # (block, line) of a --from line found now
             if self.begin is None:
@@ -656,7 +692,7 @@ class Window:
                     lines = self._lines(text, self.start_re)
                     for li, ln in enumerate(lines or ()):
                         if self.start_re.search(ln):
-                            self.begin, where, set_one = self._mark(ln), (bi, li), True
+                            self.begin, where, set_one = self._mark(ln, srcs[bi]), (bi, li), True
                             break
                     if where:
                         break
@@ -670,7 +706,7 @@ class Window:
                     first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
                     for ln in lines[first:]:
                         if self.end_re.search(ln):
-                            self.end, set_one = self._mark(ln), True
+                            self.end, set_one = self._mark(ln, srcs[bi]), True
                             break
                     if self.end is not None:
                         break
@@ -684,7 +720,7 @@ class _Lines:
     def __init__(self):
         self.buf, self.skip = b"", False
 
-    def add(self, chunk: bytes, win: "Window") -> str | None:
+    def add(self, chunk: bytes, win: "Window", src=None) -> str | None:
         data = self.buf + chunk
         if self.skip:
             k = min((x for x in (data.find(b"\n"), data.find(b"\r")) if x >= 0), default=-1)
@@ -699,23 +735,29 @@ class _Lines:
             done, data = data[:j].decode("utf-8", "replace"), data[i + 1:]
         if len(data) > 1 << 20:
             if done is not None:
-                win.feed([done]); done = None
-            if win.feed([data.decode("utf-8", "replace")]):
+                win.feed([done], [src]); done = None
+            if win.feed([data.decode("utf-8", "replace")], [src]):
                 self.skip, data = True, b""
             else:
                 data = data[-65536:]
         self.buf = data
         return done
 
-    def end(self, win: "Window") -> None:
+    def end(self, win: "Window", src=None) -> None:
         if self.buf and not self.skip and win.pending():
-            win.feed([self.buf.decode("utf-8", "replace")])
+            win.feed([self.buf.decode("utf-8", "replace")], [src])
         self.buf = b""
 
 
 def _write(dst, chunk: bytes) -> bool:
     """Pass a chunk on unchanged. False if our own output is gone (closed, or a pipe whose reader left)."""
     try:
+        if os.name == "nt" and _isatty(dst):   # a console: the bytes as the command wrote them (its code page), not UTF-8
+            dst.flush()
+            fd, view = dst.fileno(), memoryview(chunk)
+            while view:
+                view = view[os.write(fd, view):]
+            return True
         out = getattr(dst, "buffer", None)
         if out is not None:
             out.write(chunk); out.flush()
@@ -726,78 +768,197 @@ def _write(dst, chunk: bytes) -> bool:
         return False
 
 
-def _pump_all(streams: list, win: "Window", state: dict) -> None:
+class _Out:
+    """Where one of the command's streams goes, written by a thread of its own, so a slow reader on our side (a
+    pager, a slow pipe, Ctrl-S) does not hold up reading the command's output: marks keep the time each line was
+    printed. Up to LIMIT bytes wait here; past that, joules stops reading until there is room."""
+    LIMIT = 16 << 20
+
+    def __init__(self, dst):
+        self.dst, self.q, self.size = dst, collections.deque(), 0
+        self.gone = self.closed = False   # gone: our own output went away (e.g. `| head`)
+        self.cv = threading.Condition()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def put(self, chunk: bytes) -> None:
+        with self.cv:
+            if not self.gone:
+                self.q.append(chunk)
+                self.size += len(chunk)
+                self.cv.notify_all()
+
+    def full(self) -> bool:
+        return self.size >= self.LIMIT
+
+    def wait_empty(self, timeout=None) -> bool:
+        with self.cv:
+            return self.cv.wait_for(lambda: self.size == 0 or self.gone, timeout)
+
+    def close(self) -> None:
+        with self.cv:
+            self.closed = True
+            self.cv.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self.cv:
+                while not self.q and not self.closed:
+                    self.cv.wait()
+                if not self.q:
+                    return
+                chunk = self.q.popleft()
+            ok = _write(self.dst, chunk)
+            with self.cv:
+                self.size -= len(chunk)
+                if not ok:
+                    self.gone, self.size = True, 0
+                    self.q.clear()
+                self.cv.notify_all()
+
+
+def _pending(fd: int) -> int:
+    """Bytes waiting in a pipe or pseudo-terminal."""
+    try:
+        import array
+        import fcntl
+        import termios
+        n = array.array("i", [0])
+        fcntl.ioctl(fd, termios.FIONREAD, n, True)
+        return n[0]
+    except (ImportError, OSError, AttributeError, ValueError):
+        return 0
+
+
+def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
     """POSIX: one loop over all the command's streams, so marks on stdout and stderr are seen in the order they come.
-    Each chunk is passed on at once, unchanged; marks are looked for in each finished line (ended by \n or \r, so
-    progress bars count). If our own output is closed (e.g. `| head`), that stream is closed too, so the command
-    sees it closed, as it would without joules. Stops (leaving the streams open) when state["stop"] is set."""
+    Each chunk is looked at as it is read (marks in each finished line, ended by \n or \r, so progress bars count)
+    and handed, unchanged, to its _Out. If our own output is closed (e.g. `| head`), that stream is closed too, so
+    the command sees it closed, as it would without joules. Once the command has exited, sets state["caught_up"]
+    when all it wrote before exiting has been read. Stops (leaving the streams open) when state["stop"] is set."""
     open_ = {fd: dst for fd, dst, _ in streams}
     closers = {fd: close for fd, _, close in streams}
     order = [fd for fd, _, _ in streams]
     lines = {fd: _Lines() for fd in order}
+    sel, watched, owed = selectors.DefaultSelector(), set(), None   # (selectors: no limit on fd numbers)
 
     def finish(fd):
-        lines[fd].end(win)
+        lines[fd].end(win, fd)
         state[fd] = "done"
         del open_[fd]
+        if fd in watched:
+            sel.unregister(fd)
+            watched.discard(fd)
         with contextlib.suppress(OSError):
             closers[fd]()
-    while open_:
-        if state["stop"].is_set():   # handing over to the copier: everything read so far has been written
-            for fd in open_:
-                state[fd] = "stopped"
-            return
-        try:
-            ready = select.select(list(open_), [], [], 0.1)[0]
-        except (OSError, ValueError):
-            break
-        got = []
-        for fd in order:
-            if fd not in ready or fd not in open_:
-                continue
+    try:
+        while open_:
+            if state["stop"].is_set():   # handing over to the copier: everything read so far is with its _Out
+                for fd in open_:
+                    state[fd] = "stopped"
+                return
+            for fd in list(open_):
+                if outs[fd].gone:
+                    finish(fd)
+                    continue
+                room = not outs[fd].full()
+                if room and fd not in watched:
+                    sel.register(fd, selectors.EVENT_READ)
+                    watched.add(fd)
+                elif not room and fd in watched:
+                    sel.unregister(fd)
+                    watched.discard(fd)
+            if not open_:
+                break
+            if owed is None and state["exited"].is_set():   # what the command wrote before it exited
+                owed = {fd: _pending(fd) for fd in open_}
+                win.behind = any(outs[fd].full() for fd in open_)
+            if owed is not None and all(owed.get(fd, 0) <= 0 for fd in open_):
+                state["caught_up"].set()
             try:
-                chunk = os.read(fd, 65536)
-            except OSError:   # EIO from a pseudo-terminal once every writer has gone: the end of the output
-                chunk = b""
-            if chunk and win.first_out is None:
-                win.first_out = time.monotonic()
-            if not chunk or not _write(open_[fd], chunk):
-                finish(fd)
-                continue
-            if not win.pending():
-                lines[fd].buf = b""
-                continue
-            text = lines[fd].add(chunk, win)
-            if text is not None:
-                got.append(text)
-        if got and win.pending():
-            win.feed(got)
-    for fd in list(open_):
-        finish(fd)
+                if watched:
+                    ready = {k.fd for k, _ in sel.select(0.1)}
+                else:
+                    ready = set()
+                    time.sleep(0.05)
+            except (OSError, ValueError):
+                break
+            got, srcs = [], []
+            for fd in order:
+                if fd not in ready or fd not in open_:
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:   # EIO from a pseudo-terminal once every writer has gone: the end of the output
+                    chunk = b""
+                if not chunk:
+                    finish(fd)
+                    continue
+                win.first_out.setdefault(fd, time.monotonic())
+                if owed is not None:
+                    owed[fd] = owed.get(fd, 0) - len(chunk)
+                if win.pending():
+                    text = lines[fd].add(chunk, win, fd)
+                    if text is not None:
+                        got.append(text)
+                        srcs.append(fd)
+                else:
+                    lines[fd].buf = b""
+                outs[fd].put(chunk)
+            if got and win.pending():
+                win.feed(got, srcs)
+        for fd in list(open_):
+            finish(fd)
+    finally:
+        sel.close()
+        state["caught_up"].set()
 
 
-def _pump(fd: int, dst, win: "Window", state: dict, close=None) -> None:
+def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> None:
     """Windows (pipes cannot be polled there): one reader per stream, otherwise as _pump_all. The command's pipe is
     closed at the end, also when our own output went away, so the command sees a broken pipe instead of blocking."""
+    out = out or _Out(dst)
     lines = _Lines()
     while not state["stop"].is_set():
+        while out.full() and not out.gone and not state["stop"].is_set():
+            time.sleep(0.05)
+        if out.gone:
+            break
         try:
             chunk = os.read(fd, 65536)
         except OSError:
             break
-        if chunk and win.first_out is None:
-            win.first_out = time.monotonic()
-        if not chunk or not _write(dst, chunk):
+        if not chunk:
             break
+        win.first_out.setdefault(fd, time.monotonic())
         if win.pending():
-            text = lines.add(chunk, win)
+            text = lines.add(chunk, win, fd)
             if text is not None:
-                win.feed([text])
-    lines.end(win)
+                win.feed([text], [fd])
+        out.put(chunk)
+    lines.end(win, fd)
     state[fd] = "done"
     if close is not None:
         with contextlib.suppress(OSError, ValueError):
             close()
+
+
+class _Terminated(Exception):
+    pass
+
+
+def _catch_term():
+    """While the command runs, a SIGTERM to joules alone ends joules as it would without a window, but first hands
+    the command's streams to a helper, so the command is not killed by a broken pipe."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    def term(*_):
+        raise _Terminated
+    try:
+        return signal.signal(signal.SIGTERM, term)
+    except (ValueError, OSError):
+        return None
 
 
 COPIER = ("import os, sys\n"
@@ -877,14 +1038,27 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         after = "after the --from line" if a.window_from is not None else "in the command's output"
         notes.append(f"--until {a.window_until!r} never appeared {after}, so the window runs to the end of the command.")
     exit_t = (w.frozen or {}).get("t", s.t1)
-    # Held back: the --from line read only after the exit, or a window of no time at the exit with nothing at all
-    # read before it (a late --until alone is just the command's last line, read a moment after it exited).
-    nothing_before = w.first_out is None or w.first_out >= exit_t - 0.1
-    at_exit = a.window_from is not None and end["t"] - begin["t"] < 0.01 and begin["t"] >= exit_t - 0.1 and nothing_before
-    if begin.get("late") or at_exit:
-        notes.append("The marker lines were only read when the command exited, so the window may be wrong: the command "
-                     "probably held its output (a C program writing into a file or pipe does). Run it with `stdbuf -oL` "
-                     "(Linux), or let joules write to a terminal.")
+    # Held back: the --from line read only after the exit, or a window of no time at the exit (a late --until alone
+    # is just the command's last line, read a moment after it exited). Not for a run too short for it to matter.
+    src, firsts = begin.get("src"), getattr(w, "first_out", None) or {}
+    first = firsts.get(src) if src in firsts else min(firsts.values(), default=None)
+    nothing_before = first is None or first >= exit_t - 0.1   # on the --from line's stream
+    tty = getattr(w, "ttys", {}).get(src, False)
+    tiny = a.window_from is not None and end["t"] - begin["t"] < 0.01   # no real benchmark is that short
+    at_exit = tiny and begin["t"] >= exit_t - 0.1
+    if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny):
+        if getattr(w, "behind", False):
+            notes.append("The marker lines were only read when the command exited, so the window may be wrong: what "
+                         "reads joules' output (a pager, a slow pipe) took it so slowly that joules fell behind.")
+        elif begin.get("late") or (at_exit and nothing_before):
+            notes.append("The marker lines were only read when the command exited, so the window may be wrong: the "
+                         "command probably held its output until it ended" + (
+                             "." if tty else " (a C program writing into a file or pipe does). Run it with `stdbuf "
+                             "-oL` (Linux), or let joules write to a terminal."))
+        elif not tty:
+            notes.append("The window is under 10 ms, so its marker lines probably arrived together: if the command "
+                         "held its output (a C program writing into a file or pipe does), the window is wrong. Run it "
+                         "with `stdbuf -oL` (Linux).")
     live = [m for m in meters if m.kind != "est"]   # the CPU-time estimate is only known once the command has ended
     if len(live) < len(meters):
         notes.append("The CPU-time estimate is only known for the whole run, so it is not in the window.")

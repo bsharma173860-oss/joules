@@ -146,7 +146,11 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     and macOS it keeps its output after joules finishes.
   - The CPU-time estimate (used where there are no energy counters) is only known for the whole run, so it is not
     in the window.
-  - If the marker lines only arrive as the script exits (output held back), joules says so in the report.
+  - If the marker lines only arrive as the script exits, or the window is under 10 ms (both markers arrived
+    together), joules notes that the output may have been held back. It cannot always tell, so a window of almost
+    no time is the sign to look for.
+  - A slow reader of joules' output (a pager, a slow pipe) does not move the window: joules keeps reading the
+    script's output on time, holding up to 16 MB of it for the reader.
   - Not for full-screen terminal programs (htop, nvtop): they set up joules' terminal, not yours.
   - On Windows stdout and stderr are always read separately (unless both go to the same file), so on a console
     their order can change and a marker pair split between them can be missed; put both markers on one stream.

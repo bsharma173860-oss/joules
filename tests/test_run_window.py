@@ -3,6 +3,7 @@ model server has loaded. Tested end to end on a stand-in laptop GPU that reports
 with a script shaped like a typical benchmark runner: a server started in the background and killed by a trap, a
 model-loading phase, then the benchmark between two marker lines, each phase at its own power."""
 import contextlib
+import functools
 import json
 import shlex
 import os
@@ -146,6 +147,8 @@ class RunWindow(unittest.TestCase):
         e = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "HOME": self.d, "JOULES_NO_PROMPT": "1", "JOULES_TELEMETRY": "0",
              "JOULES_NVML_LIB": self.laptop, "FAKE_NVML_POWER_FILE": self.power, "NO_COLOR": "1", **extra}
         e.pop("JOULES_SIMULATE", None)
+        if "PYTHONUNBUFFERED" not in extra:
+            e.pop("PYTHONUNBUFFERED", None)   # (often set in CI): the tests see what joules sets
         return e
 
     def test_a_background_process_left_running_does_not_hang_joules(self):
@@ -533,7 +536,6 @@ class RunWindow(unittest.TestCase):
         code = "import os; print('go'); print('PU', os.environ.get('PYTHONUNBUFFERED'))"
         p, r = self.run_j(["--no-cpu", "--from", "go"], [sys.executable, "-c", code])
         self.assertIn(b"PU 1", p.stdout)                                  # into a pipe: set, so lines are not held
-        os.environ.pop("PYTHONUNBUFFERED", None)
         shown = self._on_own_terminal(["--from", "go", "--", sys.executable, "-c", code])
         self.assertIn(b"PU None", shown)                                  # on a terminal: left alone
 
@@ -559,7 +561,7 @@ class RunWindow(unittest.TestCase):
             def flush(self): pass
 
         class Win:
-            first_out = None
+            first_out = {}
             def pending(self): return False
         cmd = [sys.executable, "-c", "import sys\nwhile True: sys.stdout.write('y' * 4096)"]
         with open(os.devnull, "w") as quiet, mock.patch.object(cli.os, "name", "nt"), \
@@ -577,6 +579,115 @@ class RunWindow(unittest.TestCase):
                     with contextlib.suppress(OSError, ValueError):
                         f.close()
         self.assertIsNotNone(q.returncode)
+
+    # ---- found in review round 7
+    def test_a_slow_reader_does_not_move_the_window_or_the_report(self):
+        """A pager or slow pipe on joules' output: marks keep the time each line was printed, no false notes, and
+        the report comes after all of the command's output."""
+        code = ("import sys, time\nfor i in range(1000): sys.stdout.write('y' * 99 + '\\n')\n"
+                "print('>>> running', flush=True); time.sleep(2); print('>>> done', flush=True); time.sleep(0.5)\n")
+        out = os.path.join(self.d, "r.json")
+        q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu --from running --until done --out {out} -- "
+                           f"{shlex.quote(sys.executable)} -c {shlex.quote(code)} 2>&1 | (sleep 4; cat)", shell=True,
+                           capture_output=True, env=self.env(), timeout=90)
+        r = json.loads(Path(out).read_text())
+        self.assertTrue(1.9 < r["window_s"] < 2.3, r["window_s"])
+        self.assertEqual(r["notes"], [])
+        text = q.stdout.decode()
+        self.assertEqual(text.count("y" * 99), 1000)
+        self.assertGreater(text.index("joules ·"), text.index(">>> done"))
+
+    def test_held_output_after_an_earlier_log_line_is_flagged(self):
+        src = os.path.join(self.d, "held.c")
+        Path(src).write_text('#include <stdio.h>\n#include <unistd.h>\nint main(void){fprintf(stderr,"loading\\n");'
+                             'sleep(1);puts(">>> running");sleep(1);puts(">>> done");sleep(1);return 0;}\n')
+        exe = os.path.join(self.d, "held")
+        subprocess.run(["gcc", "-O2", "-o", exe, src], check=True)
+        p, r = self.run_j(["--no-cpu", "--from", ">>> running", "--until", ">>> done"], [exe], stderr=subprocess.STDOUT)
+        self.assertTrue(any("under 10 ms" in n for n in r["notes"]), r["notes"])     # one shared stream
+        err = open(os.path.join(self.d, "err"), "wb")
+        p, r = self.run_j(["--no-cpu", "--from", ">>> running", "--until", ">>> done"], [exe], stderr=err)
+        err.close()
+        self.assertTrue(any("only read when" in n for n in r["notes"]), r["notes"])  # the log line was on stderr
+        p, r = self.run_j(["--no-cpu", "--from", "go", "--until", "end"], ["sh", "-c", "echo go; echo end"])
+        self.assertEqual([n for n in r["notes"] if "10 ms" in n or "only read" in n], [])   # too short to matter
+
+    def test_a_sigterm_to_joules_alone_leaves_the_command_running(self):
+        """As without a window: joules ends, the command carries on and its output still arrives."""
+        out = os.path.join(self.d, "out")
+        with open(out, "wb") as f:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "tick", "--", "bash", "-c",
+                                  "for i in 1 2 3 4 5 6; do echo tick $i; sleep 0.3; done"], stdout=f,
+                                 stderr=subprocess.DEVNULL, env=self.env())
+            time.sleep(0.8)
+            q.terminate()
+            self.assertEqual(q.wait(timeout=20), -15)
+        deadline = time.monotonic() + 10
+        while "tick 6" not in Path(out).read_text() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertIn("tick 6", Path(out).read_text())
+
+    def test_the_reader_handles_file_descriptors_past_1024(self):
+        import resource
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 2100:
+            self.skipTest("cannot open that many files here")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 2100), hard))
+        r, w = os.pipe()
+        high = os.dup2(r, 2000)
+        os.close(r)
+
+        class Sink:
+            buffer, got = None, []
+            def write(self, t): self.got.append(t)
+            def flush(self): pass
+
+        class Win:
+            first_out, behind = {}, False
+            def pending(self): return False
+        os.write(w, b"hello\n")
+        os.close(w)
+        sink = Sink()
+        outs = {high: cli._Out(sink)}
+        state = {"stop": threading.Event(), "exited": threading.Event(), "caught_up": threading.Event()}
+        cli._pump_all([(high, sink, functools.partial(os.close, high))], Win(), state, outs)
+        outs[high].close()
+        outs[high].thread.join(5)
+        self.assertEqual("".join(sink.got), "hello\n")
+        self.assertEqual(state[high], "done")
+
+    def test_windows_children_get_unbuffered_python_and_consoles_get_the_bytes_as_written(self):
+        """On Windows the command always gets pipes, so Python there must not hold its output; and a console gets
+        the command's own bytes (its code page), not bytes reread as UTF-8. Windows itself cannot be run here."""
+        from unittest import mock
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        code = "import os; print(os.environ.get('PYTHONUNBUFFERED'))"
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+        with open(os.devnull, "w") as quiet, mock.patch.object(cli.os, "name", "nt"), \
+                mock.patch.object(cli, "_isatty", lambda f: True), mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(sys, "stdout", quiet), mock.patch.object(sys, "stderr", quiet):
+            q = cli._start([sys.executable, "-c", code], piped=True)
+        got = q.stdout.read()
+        q.wait(timeout=20)
+        for f in (q.stdout, q.stderr):
+            if f:
+                f.close()
+        self.assertEqual(got.strip(), b"1")
+        r, w = os.pipe()
+
+        class Console:
+            def fileno(self): return w
+            def flush(self): pass
+            buffer = None   # (a UTF-8 layer would be used if os.write were not)
+        with mock.patch.object(cli.os, "name", "nt"), mock.patch.object(cli, "_isatty", lambda f: True):
+            self.assertTrue(cli._write(Console(), b"caf\x82\n"))   # cp437 é
+        os.close(w)
+        self.assertEqual(os.read(r, 100), b"caf\x82\n")
+        os.close(r)
 
 
     def test_window_with_an_energy_counter(self):
@@ -601,7 +712,7 @@ class RunWindow(unittest.TestCase):
 class LateNote(unittest.TestCase):
     """The "markers only read at exit" note: given when output was held back, not for a last line read late."""
 
-    def report(self, begin, end, exit_t, first_out, until="done"):
+    def report(self, begin, end, exit_t, first_out, until="done", tty=False, which="only read when"):
         import argparse
         sys.path.insert(0, str(ROOT / "src"))
         from joules import cli
@@ -610,14 +721,15 @@ class LateNote(unittest.TestCase):
             name, kind, energy_j = "GPU 0", "gpu", 10.0
         w = cli.Window.__new__(cli.Window)
         import threading
-        w.lock, w.frozen, w.first_out = threading.Lock(), {"t": exit_t, "j": {"GPU 0": 10.0}}, first_out
-        w.begin = {"t": begin[0], "j": {"GPU 0": 1.0}, "line": "start", "late": begin[1]}
+        w.lock, w.frozen, w.first_out = threading.Lock(), {"t": exit_t, "j": {"GPU 0": 10.0}}, {1: first_out}
+        w.ttys, w.behind = {1: tty}, False
+        w.begin = {"t": begin[0], "j": {"GPU 0": 1.0}, "line": "start", "late": begin[1], "src": 1}
         w.end = {"t": end[0], "j": {"GPU 0": 2.0}, "line": "done", "late": end[1]}
 
         class S:
             t0, t1 = 0.0, exit_t
         a = argparse.Namespace(window_from="start", window_until=until)
-        return [n for n in cli._window_report(a, w, S(), [M()], {})[1] if "only read when" in n]
+        return [n for n in cli._window_report(a, w, S(), [M()], {})[1] if which in n]
 
     def test_a_last_line_read_just_after_exit_gets_no_note(self):
         self.assertEqual(self.report(begin=(1.0, False), end=(1.51, True), exit_t=1.5, first_out=0.9), [])
@@ -626,8 +738,20 @@ class LateNote(unittest.TestCase):
         self.assertTrue(self.report(begin=(4.0, False), end=(4.0, False), exit_t=4.0, first_out=4.0))
         self.assertTrue(self.report(begin=(4.01, True), end=(4.01, True), exit_t=4.0, first_out=4.01))
 
-    def test_a_quick_pair_after_earlier_output_gets_no_note(self):
+    def test_a_quick_pair_after_earlier_output_gets_a_softer_note(self):
+        """Earlier output on the same stream (a log line on stderr with 2>&1) does not prove the markers were on time."""
         self.assertEqual(self.report(begin=(2.0, False), end=(2.0, False), exit_t=2.05, first_out=0.3), [])
+        self.assertTrue(self.report(begin=(2.0, False), end=(2.0, False), exit_t=2.05, first_out=0.3, which="under 10 ms"))
+        self.assertTrue(self.report(begin=(1.0, False), end=(1.001, False), exit_t=3.0, first_out=0.3, which="under 10 ms"))
+        self.assertEqual(self.report(begin=(2.0, False), end=(2.0, False), exit_t=2.05, first_out=0.3, tty=True,
+                                     which="under 10 ms"), [])   # on a terminal programs do not hold their output
+
+    def test_a_very_short_run_gets_no_note(self):
+        self.assertEqual(self.report(begin=(0.05, True), end=(0.05, True), exit_t=0.05, first_out=0.05, which=""), [])
+
+    def test_held_output_on_a_terminal_gets_no_terminal_advice(self):
+        n = self.report(begin=(4.0, False), end=(4.0, False), exit_t=4.0, first_out=4.0, tty=True)
+        self.assertTrue(n and "terminal" not in n[0], n)
 
 
 if __name__ == "__main__":
