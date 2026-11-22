@@ -656,15 +656,21 @@ class Window:
 
     def _mark(self, text: str, src=None) -> dict:
         snap = self.frozen or self.clock.snapshot()
-        return {"t": snap["t"], "j": snap["j"], "line": text.replace("\0", "").strip()[:200],
+        return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200],
                 "late": self.frozen is not None, "src": src, "after_pause": self.paused}
 
-    def _hit(self, rx, line: str, partial: bool) -> bool:
-        """Does rx match this line? partial: the line is not finished yet, so a match that reaches the end of what
-        has come so far (where $ would match, or a match could still grow) does not count yet."""
+    @staticmethod
+    def clean(text: str) -> str:
+        return ANSI.sub("", text).replace("\r\n", "\n").replace("\r", "\n")   # colour codes off; \r\n is one line end
+
+    def _hit(self, rx, line: str, partial: bool, pos: int = 0, keep_from=None) -> bool:
+        """Does rx match this line, starting at pos (before it: only context, where the line was cut)? partial: the
+        line is not finished yet, so a match that reaches the end of what has come so far (where $ would match, or a
+        match could still grow) does not count yet, unless it starts before keep_from (that part is not kept)."""
         if not partial:
-            return rx.search(line) is not None
-        return any(m.end() < len(line) for m in rx.finditer(line))
+            return rx.search(line, pos) is not None
+        return any(m.end() < len(line) or (keep_from is not None and m.start() < keep_from)
+                   for m in rx.finditer(line, pos))
 
     def pending(self) -> bool:
         """Is a mark still to be found? Once not, output is passed on without looking at it."""
@@ -676,13 +682,13 @@ class Window:
             self.frozen = {"t": snap["t"], "j": dict(snap["j"])}
 
     def _lines(self, text: str, rx) -> list[str] | None:
-        text = ANSI.sub("", text).replace("\r\n", "\n").replace("\r", "\n")   # colour codes off; \r\n is one line end
+        text = self.clean(text)
         pre = self.pre.get(rx)
         if pre is not None and not pre.search(text):
             return None
         return text.split("\n")
 
-    def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False) -> bool:
+    def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
         first, then the --until line after it on its own stream. Which came first of lines that arrived together
         on two streams is not known: an --until line on the other stream is kept aside (alt_end), used only if no
@@ -695,7 +701,7 @@ class Window:
                 for bi, text in enumerate(texts):
                     lines = self._lines(text, self.start_re)
                     for li, ln in enumerate(lines or ()):
-                        if self._hit(self.start_re, ln, partial):
+                        if self._hit(self.start_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
                             self.begin, where, set_one = self._mark(ln, srcs[bi]), (bi, li), True
                             break
                     if where:
@@ -708,8 +714,9 @@ class Window:
                     if not lines:
                         continue
                     first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
-                    for ln in lines[first:]:
-                        if self._hit(self.end_re, ln, partial):
+                    for li in range(first, len(lines)):
+                        ln = lines[li]
+                        if self._hit(self.end_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
                             if where and where[0] != bi:   # arrived with the --from line, on another stream
                                 if self.alt_end is None:
                                     self.alt_end = self._mark(ln, srcs[bi])
@@ -721,49 +728,67 @@ class Window:
         return set_one
 
 
+class _Text(str):
+    """A block of lines whose first line was cut: matches in it start at .start (what is before is only context)."""
+    start = 0
+
+
 class _Lines:
     """The unfinished line of one stream, between reads. A line longer than 1 MB is searched (as unfinished) before
-    only its end is kept; once a mark is found in it, the rest of that line is skipped (the next mark must be on a
-    later line)."""
+    only its end is kept, with a little of what came before as context (so \\b, lookbehinds and ^ see the real
+    text, but no match starts there); once a mark is found in it, the rest of that line is skipped (the next mark
+    must be on a later line)."""
+    KEEP, CONTEXT = 65536, 256
 
     def __init__(self):
         self.buf, self.skip = b"", False
         self.cr = False   # the last line ended with \r at the very end of a read: a \n next belongs to it
+        self.ctx = 0      # bytes at the start of buf that are only context (the line was cut after them)
+
+    def _text(self, data: bytes, ctx: int) -> str:
+        text = data.decode("utf-8", "replace")
+        if not ctx:
+            return text
+        t = _Text(text)
+        t.start = len(Window.clean(data[:ctx].decode("utf-8", "replace")))
+        return t
 
     def add(self, chunk: bytes, win: "Window", src=None) -> str | None:
-        data = self.buf + chunk
+        data, ctx = self.buf + chunk, self.ctx
         if self.cr and not self.buf and data[:1] == b"\n":   # \r\n split between two reads is one line end
             data = data[1:]
         self.cr = False
         if self.skip:
             k = min((x for x in (data.find(b"\n"), data.find(b"\r")) if x >= 0), default=-1)
             if k < 0:
-                self.buf = b""
+                self.buf, self.ctx = b"", 0
                 return None
             if data[k:k + 2] == b"\r\n":
                 k += 1
             self.cr = data[k:k + 1] == b"\r" and k == len(data) - 1
-            data, self.skip = data[k + 1:], False
+            data, self.skip, ctx = data[k + 1:], False, 0
         i = max(data.rfind(b"\n"), data.rfind(b"\r"))
         done = None
         if i >= 0:
             j = i - 1 if data[i:i + 1] == b"\n" and data[i - 1:i] == b"\r" else i   # \r\n is one line end
             self.cr = data[i:i + 1] == b"\r" and i == len(data) - 1
-            done, data = data[:j].decode("utf-8", "replace"), data[i + 1:]
+            done, data, ctx = self._text(data[:j], ctx), data[i + 1:], 0
         if len(data) > 1 << 20:
             if done is not None:
                 win.feed([done], [src]); done = None
-            if win.feed([data.decode("utf-8", "replace")], [src], partial=True):
-                self.skip, data = True, b""
-            else:   # keep the end; \0 marks the cut, so ^ cannot match where the line was cut
-                data = b"\0" + data[-65536:]
-        self.buf = data
+            text = self._text(data, ctx)
+            keep_from = len(Window.clean(text)) - len(Window.clean(data[-self.KEEP:].decode("utf-8", "replace")))
+            if win.feed([text], [src], partial=True, keep_from=keep_from):
+                self.skip, data, ctx = True, b"", 0
+            else:   # keep the end, after a little context
+                data, ctx = data[-(self.KEEP + self.CONTEXT):], self.CONTEXT
+        self.buf, self.ctx = data, ctx
         return done
 
     def end(self, win: "Window", src=None) -> None:
         if self.buf and not self.skip and win.pending():
-            win.feed([self.buf.decode("utf-8", "replace")], [src])
-        self.buf = b""
+            win.feed([self._text(self.buf, self.ctx)], [src])
+        self.buf, self.ctx = b"", 0
 
 
 def _write(dst, chunk: bytes) -> bool:
@@ -957,6 +982,8 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
             closers[fd]()
     try:
         while open_:
+            if win.paused and all(o.size == 0 for o in outs.values()) and not any(_pending(fd) for fd in open_):
+                win.paused = False   # caught up (nothing queued, nothing waiting in the pipes): later marks are on time
             if state["stop"].is_set():   # handing over to the copier: everything read so far is with its _Out
                 for fd in open_:
                     state[fd] = "stopped"
@@ -1030,6 +1057,8 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
             if win.pending():
                 win.paused = True
             time.sleep(0.05)
+        if win.paused and out.size == 0:   # caught up (this stream; Windows reads each stream apart)
+            win.paused = False
         if out.gone:
             break
         try:

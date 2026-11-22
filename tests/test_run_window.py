@@ -563,7 +563,7 @@ class RunWindow(unittest.TestCase):
             def flush(self): pass
 
         class Win:
-            first_out = {}
+            first_out, paused = {}, False
             def pending(self): return False
         cmd = [sys.executable, "-c", "import sys\nwhile True: sys.stdout.write('y' * 4096)"]
         with open(os.devnull, "w") as quiet, mock.patch.object(cli.os, "name", "nt"), \
@@ -649,7 +649,7 @@ class RunWindow(unittest.TestCase):
             def flush(self): pass
 
         class Win:
-            first_out, behind = {}, False
+            first_out, behind, paused = {}, False, False
             def pending(self): return False
         os.write(w, b"hello\n")
         os.close(w)
@@ -1030,7 +1030,7 @@ class RunWindow(unittest.TestCase):
             self.assertFalse(out._put(1, b"x" * 10))
 
         class Full:
-            gone = False
+            gone, size = False, 1 << 30
             def full(self): return True
             def put(self, c): pass
 
@@ -1049,6 +1049,35 @@ class RunWindow(unittest.TestCase):
         finally:
             os.close(r)
         self.assertTrue(win.paused)
+
+    # ---- found in review round 14
+    def test_a_greedy_marker_early_in_a_long_line_is_found(self):
+        code = ("import sys, time\nsys.stdout.write('Starting run id=42 ' + 'x' * 2000000); sys.stdout.flush()\n"
+                "time.sleep(0.5)\nprint(flush=True)\ntime.sleep(0.5)\nprint('Finished', flush=True)\n")
+        for pattern in ("Starting.*", "Starting run|WARN.*"):
+            p, r = self.run_j(["--no-cpu", "--from", pattern, "--until", "Finished"], [sys.executable, "-c", code])
+            self.assertTrue(r["window"]["found_from"], (pattern, r["notes"]))
+            self.assertTrue(0.8 < r["window_s"] < 1.4, r["window_s"])
+
+    def test_word_boundaries_and_lookbehinds_see_the_text_before_a_cut(self):
+        """A long line written in 64 KB pieces, 'bar' ending one piece and 'foo' starting the next: no \\bfoo there."""
+        code = ("import sys, time\nw = sys.stdout.buffer\nprint('A', flush=True); time.sleep(0.3)\n"
+                "for i in range(40):\n    piece = bytearray(b'y' * 65536)\n    if i == 15: piece[-3:] = b'bar'\n"
+                "    if i == 16: piece[:3] = b'foo'\n    w.write(piece); w.flush(); time.sleep(0.02)\n"
+                "w.write(b'\\n'); w.flush(); time.sleep(0.5)\nprint('foo real', flush=True); time.sleep(0.3)\n")
+        for until in (r"\bfoo", "(?<!bar)foo"):
+            p, r = self.run_j(["--no-cpu", "--from", "^A$", "--until", until], [sys.executable, "-c", code])
+            self.assertEqual(r["window"]["until_line"], "foo real", until)
+
+    def test_a_burst_long_before_the_markers_is_not_noted(self):
+        code = ("import sys, time\nsys.stdout.write(('x' * 99 + '\\n') * 250000); sys.stdout.flush()\n"
+                "time.sleep(4)\nprint('A', flush=True); time.sleep(1); print('B', flush=True)\n")
+        err = os.path.join(self.d, "err")
+        q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu --from ^A$ --until ^B$ -- "
+                           f"{shlex.quote(sys.executable)} -c {shlex.quote(code)} 2>{err} | (sleep 1.5; wc -c)", shell=True,
+                           capture_output=True, env=self.env(), timeout=120)
+        self.assertEqual(int(q.stdout.split()[0]), 25_000_000 + 4)
+        self.assertNotIn("16 MB", Path(err).read_text())
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
