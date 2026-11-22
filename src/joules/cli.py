@@ -719,7 +719,7 @@ class Window:
         self.start_re = re.compile(_searchable(start_re)) if start_re is not None else None
         self.end_re = re.compile(_searchable(end_re)) if end_re is not None else None
         self.match_s = 0.0    # time spent matching beyond a plain search (it holds up the rest of joules)
-        self._grp, self._sec = {}, {}   # per pattern: [CPU, budget] of the group being added up
+        self._grp = {}   # per pattern: [CPU, budget] of the group being added up
         self.match_by = {}    # the same, per pattern
         global _GROUP
         if _GROUP is None:
@@ -749,7 +749,7 @@ class Window:
             if exited is not None and snap["t"] >= exited["t"]:   # the command exited meanwhile
                 snap, late = exited, True
         return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200], "late": late, "src": src,
-                "after_pause": self.paused, "after_exit": late and getattr(self, "caught_up", False),
+                "after_pause": self.paused, "after_exit": late and getattr(self, "caught_up", False) and not eof,
                 "no_line_end": eof}
 
     @staticmethod
@@ -783,9 +783,9 @@ class Window:
 
     def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
              eof: bool = False) -> bool:
-        self._sec = {}   # this thread's own CPU time per pattern searched (a busy machine does not count)
-        try:
-            return self._feed(texts, srcs, partial, keep_from, eof)
+        sec = {}   # this call's own CPU time per pattern searched (a busy machine does not count; Windows feeds
+        try:       # from two threads at once, so it is not kept on the window)
+            return self._feed(texts, srcs, partial, keep_from, eof, sec)
         finally:
             # only what goes beyond a plain search of this much text counts (a plain word never adds up, however
             # much output; a slow pattern does, in big reads or small, e.g. 4 KB from a terminal)
@@ -793,7 +793,7 @@ class Window:
             # even out within a group, and unused budget is not carried over to hide a slow search later.
             n = sum(len(t) for t in texts)
             with self.lock:
-                for key, cpu in self._sec.items():   # each pattern searched, with its own budget
+                for key, cpu in sec.items():   # each pattern searched, with its own budget
                     g = self._grp.setdefault(key, [0.0, 0.0])
                     g[0] += cpu
                     g[1] += 0.0002 + n / 50e6
@@ -804,7 +804,7 @@ class Window:
                         g[0] = g[1] = 0.0
 
     def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
-              eof: bool = False) -> bool:
+              eof: bool = False, sec: dict | None = None) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
         first, then the --until line after it on its own stream. Which came first of lines that arrived together
         on two streams is not known: an --until line on the other stream is kept aside (alt_end), used only if no
@@ -823,7 +823,8 @@ class Window:
                             break
                     if where:
                         break
-                self._sec["--from"] = time.thread_time() - t0
+                if sec is not None:
+                    sec["--from"] = time.thread_time() - t0
                 if self.begin is None:
                     return False
             if self.end is None and self.end_re is not None:
@@ -831,7 +832,8 @@ class Window:
                 try:
                     self._search_end(texts, srcs, where, partial, keep_from, eof)
                 finally:
-                    self._sec["--until"] = time.thread_time() - t0
+                    if sec is not None:
+                        sec["--until"] = time.thread_time() - t0
                 set_one = set_one or self.end is not None
         return set_one
 
@@ -1219,6 +1221,7 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                 win.paused = False   # caught up (nothing queued, nothing waiting in the pipes): later marks are on time
             if state["stop"].is_set():   # handing over to the copier: everything read so far is with its _Out
                 for fd in open_:
+                    lines[fd].end(win, fd)   # (an unfinished last line counts now, as at the end of the output)
                     state[fd] = "stopped"
                 return
             for fd in list(open_):
@@ -1649,7 +1652,8 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
                      + advice)
     for which, mark in (("--from", begin), ("--until", end)):
         if mark and mark.get("no_line_end"):
-            notes.append(f"The {which} line had no line end, so it counted only when the command's output ended.")
+            notes.append(f"The {which} line had no line end, so it counted only when joules finished reading the "
+                         "command's output.")
     for name in getattr(w, "untouched", ()):
         notes.append(f"Your {name} is a message socket (datagram or seqpacket), so the command writes to it directly "
                      "(passing it through joules would merge its messages); markers on it are not seen.")

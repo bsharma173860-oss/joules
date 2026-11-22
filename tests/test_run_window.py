@@ -1630,6 +1630,37 @@ class RunWindow(unittest.TestCase):
         cli._win_caught_up(state, w)
         self.assertTrue(w.caught_up)
 
+    # ---- found in review round 26
+    def test_a_marker_on_an_unfinished_line_still_counts_when_the_stream_is_handed_over(self):
+        p, r = self.run_j(["--no-cpu", "--from", "START", "--until", "END"],
+                          ["bash", "-c", "echo START; sleep 0.5; printf END; sleep 4 &"], timeout=60)
+        self.assertTrue(r["window"]["found_until"], r["notes"])
+        self.assertTrue(any("had no line end" in n for n in r["notes"]), r["notes"])
+        p, r = self.run_j(["--no-cpu", "--from", "START"], ["bash", "-c", "sleep 0.3; printf START; sleep 4 &"], timeout=60)
+        self.assertTrue(r["window"]["found_from"], r["notes"])
+        self.assertFalse([n for n in r["notes"] if "printed after the command exited" in n], r["notes"])
+
+    def test_each_search_keeps_its_own_cpu_times(self):
+        """Windows feeds from two threads at once: each call's per-pattern times must be its own."""
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "START", None)
+        seen = []
+        real = w._feed
+
+        def spy(*a, **k):
+            seen.append(a[-1] if a and isinstance(a[-1], dict) else k.get("sec"))
+            return real(*a, **k)
+        w._feed = spy
+        w.feed(["x"], [1])
+        w.feed(["y"], [1])
+        self.assertIsInstance(seen[0], dict)
+        self.assertIsNot(seen[0], seen[1])
+        self.assertFalse(hasattr(w, "_sec"))
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
