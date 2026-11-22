@@ -39,6 +39,7 @@ from .meters import Discovery, discover
 from .model import (GPUS, GRIDS, calculator_link, calibrate, estimate_accelerator_j, gpu_from_name, gpu_verdict, landauer_floor_j,
                     power_sweep_pick, training_flops)
 from .sampler import Sampler, idle_baseline
+from .samples import SampleLog, parse_time, read_samples, window as samples_window
 from . import share as sharing
 from . import telemetry
 
@@ -385,8 +386,16 @@ def cmd_run(a) -> int:
             except KeyboardInterrupt:
                 continue
     started = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    log = None
+    if a.samples:
+        try:
+            log = SampleLog(a.samples, d.notes)
+        except OSError as e:
+            print(f"joules run: cannot write {a.samples} ({e.strerror or e})", file=sys.stderr)
+            d.close()
+            return 2
     try:
-        with Sampler(d.meters, a.interval, notes=d.notes) as s:
+        with Sampler(d.meters, a.interval, notes=d.notes, on_poll=log.write if log else None) as s:
             proc = _start(cmd)
             if not proc:
                 return 126 if proc is False else _not_found(cmd)
@@ -401,11 +410,15 @@ def cmd_run(a) -> int:
                     continue  # Ctrl-C reaches the child too; wait for it to finish, then report
     finally:
         d.close()
+        if log:
+            log.close()
     devices = _devices(d, idle, s.duration_s)
     ops = a.flops or (training_flops(a.params, a.tokens) if a.params and a.tokens else None)
     report = {"schema": "joules/1", "tool": f"joules {__version__}", "kind": "run", "command": cmd, "exit_code": code,
               "started_at": started, "duration_s": s.duration_s, "simulated": d.simulated, "host": _host(),
               "devices": devices, "totals": _totals(a, devices, ops), "notes": d.notes}
+    if a.samples:
+        report["samples"] = a.samples
 
     gpu_rows = [m for m in d.meters if m.kind == "gpu"]
     kinds = {a.gpu} if a.gpu else {gpu_from_name(m.name) for m in gpu_rows}
@@ -442,6 +455,39 @@ def cmd_run(a) -> int:
         _track(a, report)  # a tracking problem is reported but never changes the command's exit code
     _website_hint(a, cmd)
     return code
+
+
+def cmd_window(a) -> int:
+    """Energy between two times, from a `joules run --samples` file."""
+    try:
+        start, end = parse_time(a.start), parse_time(a.end)
+        samples = read_samples(a.file)
+        idle = None
+        if a.run:
+            with open(a.run, encoding="utf-8") as f:
+                run = json.load(f)
+            idle = {d["name"]: d["idle_w"] for d in run.get("devices", []) if "idle_w" in d}
+        r = samples_window(samples, start, end, idle)
+    except OSError as e:
+        print(f"joules window: cannot read {e.filename} ({e.strerror or e})", file=sys.stderr)
+        return 2
+    except (ValueError, KeyError) as e:   # (json.JSONDecodeError is a ValueError)
+        print(f"joules window: {e}", file=sys.stderr)
+        return 2
+    if a.run and idle is not None and not idle:
+        r["notes"] = ["The run has no idle figures (it was not run with --subtract-idle), so no energy above idle."]
+    t = r["totals"]
+    lines = [f"{bold('joules window')} · {fmt_s(r['duration_s'])} · "
+             f"{dt.datetime.fromtimestamp(start).isoformat(timespec='milliseconds')} → "
+             f"{dt.datetime.fromtimestamp(end).isoformat(timespec='milliseconds')}"]
+    for d in r["devices"]:
+        extra = f"   {dim('above idle')} {fmt_j(d['above_idle_j'])}" if "above_idle_j" in d else ""
+        lines.append(f"  {d['name']:<36} {fmt_j(d['energy_j']):>10}{extra}")
+    lines.append(f"  {bold('total')}  {bold(fmt_j(t['energy_j']))} = {fmt_wh(t['energy_j'])}"
+                 + (f"   {dim('above idle')} {fmt_j(t['above_idle_j'])}" if "above_idle_j" in t else ""))
+    lines += [warn("  ! " + n) for n in r.get("notes", [])]
+    _emit(a, r, "\n".join(lines))
+    return 1 if getattr(a, "out_failed", False) else 0
 
 
 def render_run(r: dict) -> str:
@@ -1569,10 +1615,24 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--tokens", type=float, help="training tokens in billions")
     w.add_argument("--flops", type=float, help="total operations, if you know them")
     w.add_argument("--gpu", choices=sorted(GPUS), help="GPU model, if it is not detected")
+    r.add_argument("--samples", metavar="FILE.csv", help="also write each device's energy over time to FILE.csv, "
+                   "for `joules window` (energy between two times taken afterwards, e.g. from a log)")
     r.add_argument("--estimate", action="store_true", help=argparse.SUPPRESS)  # the default now: estimate when there are no counters
     sharing_args(r)
     r.add_argument("command", nargs=argparse.REMAINDER, help="the command, after --")
     r.set_defaults(fn=cmd_run)
+
+    wi = sub.add_parser("window", help="energy between two times, from a `joules run --samples` file",
+                        description="Energy per device between two times, from a file written by joules run --samples "
+                                    "(interpolated between the readings either side of each time).")
+    wi.add_argument("file", help="the samples file (CSV)")
+    wi.add_argument("--start", required=True, help="unix seconds, or an ISO date and time (no zone: local time)")
+    wi.add_argument("--end", required=True, help="the same")
+    wi.add_argument("--run", metavar="RUN.json", help="the run's JSON (joules run --out); with --subtract-idle in "
+                    "it, energy above idle too")
+    wi.add_argument("--json", action="store_true", help="print the result as JSON")
+    wi.add_argument("--out", metavar="FILE", help="also write the JSON result to FILE")
+    wi.set_defaults(fn=cmd_window)
 
     b = sub.add_parser("bench", help="energy per token of a local model server")
     b.add_argument("target", help="ollama:<model> or openai:<model>, or gpu: the same one-minute test on any GPU, for the GPU leaderboard")

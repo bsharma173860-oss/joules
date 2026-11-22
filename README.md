@@ -68,6 +68,7 @@ pipx: `pipx install landauer-gap` (update: `pipx upgrade landauer-gap`).
 | `joules -- CMD …` / `joules run -- CMD …` | Measure a command. Its exit code passes through, so it works in CI. |
 | `joules bench ollama:MODEL` | Energy per token of a model served by Ollama. joules starts Ollama if it is installed but not running, and downloads the model the first time. |
 | `joules bench openai:MODEL --url http://host:8000/v1` | Same for any OpenAI-compatible server: vLLM, llama.cpp, LM Studio, TGI. |
+| `joules run --samples s.csv -- CMD …` / `joules window s.csv --start T --end T` | Measure a command and keep each device's energy over time, then get the energy between any two times afterwards. See [Measuring part of a run](#measuring-part-of-a-run). |
 | `joules run --track PROJECT -- CMD …` | Measure and save the run to your private [Tracking page](https://wattops.dev/#/track). Also on `bench`. |
 | `joules bench … --share` | Add the result to the public [leaderboard](https://wattops.dev/leaderboard). It measures the idle machine for 5 seconds first. |
 | `joules bench gpu --share` | The same one-minute test on any GPU (8192 × 8192 matrix multiplications in fp16 and fp32, through the PyTorch already installed) for the GPU leaderboard. |
@@ -101,6 +102,28 @@ and totals for the project. joules sends the energy, time, cost, CO₂, hardware
 and a short label: the program and script name (`python train.py`) or your `--label`. It never sends
 arguments, inline code, outputs or file contents. A tracking problem is reported but never changes
 the command's exit code, so it is safe in CI.
+
+## Measuring part of a run
+
+To count only part of a run (the benchmark, not loading the model), keep each device's energy over time and pick
+the two times afterwards, for example from the log of your model server. joules does not read or change the
+command's output.
+
+```bash
+joules run --subtract-idle 10 --samples run.csv --out run.json -- bash run_bench.sh
+joules window run.csv --start 2026-11-22T14:03:07.250 --end 2026-11-22T14:09:41.900 --run run.json
+```
+
+- `run.csv` has one row per reading of each device: `unix_time,device,energy_j,power_w`. Energy is from the start
+  of the run: the GPU's energy counter, or its power readings added up over time where it has no counter (many
+  laptop GPUs). Power is the reading, or the average since the last row for a counter. The file is written as the
+  command runs (flushed about every second), so a crash keeps what came before. A reading that fails has no row.
+- `joules window` gives each device's energy between the two times, interpolated between the readings either side
+  of each, and the energy above idle when the run's JSON (`--run`) has idle figures (`--subtract-idle`). Times are
+  unix seconds or an ISO date and time; without a time zone they are local time. Times outside the samples are
+  refused. `--json` and `--out` work as for `joules run`.
+- The readings are `--interval` apart (0.1 s by default). A device with an energy counter is exact at each reading;
+  one with only power readings is exact for power that holds steady between them.
 
 ## Comparing two ways of doing the same work
 

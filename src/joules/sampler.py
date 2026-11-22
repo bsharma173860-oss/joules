@@ -9,8 +9,9 @@ from .meters import Meter
 
 class Sampler:
     def __init__(self, meters: list[Meter], interval: float = 0.1, lock: threading.Lock | None = None,
-                 notes: list[str] | None = None):
+                 notes: list[str] | None = None, on_poll=None):
         self.meters = meters
+        self.on_poll = on_poll  # called with (meters, unstarted) after each round of readings, under the lock
         self.notes = notes if notes is not None else []  # read errors at start or stop are explained here
         self.interval = interval
         self.lock = lock or threading.Lock()  # shared with a PhaseClock, which reads the meters between polls
@@ -26,6 +27,7 @@ class Sampler:
                 m.start(self.t0)
             except (OSError, ValueError):
                 self._unstarted.append(m)  # retried on every poll until a reading works
+        self._polled()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
@@ -45,6 +47,7 @@ class Sampler:
                             m.poll(now)
                     except (OSError, ValueError):
                         pass  # a transient read error loses one interval, not the run
+                self._polled()
 
     def __exit__(self, *exc) -> None:
         self._stop.set()
@@ -62,6 +65,11 @@ class Sampler:
                     last = m._t_last if m._t_last is not None else self.t0
                     self._note(f"{m.name}: the last reading failed, so its energy runs to the last good reading, "
                                f"{self.t1 - last:.1f} s before the end.")
+            self._polled()
+
+    def _polled(self) -> None:
+        if self.on_poll:
+            self.on_poll(self.meters, self._unstarted)
 
     def _note(self, text: str) -> None:
         if text not in self.notes:
