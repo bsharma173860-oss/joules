@@ -1509,7 +1509,7 @@ class RunWindow(unittest.TestCase):
             w._feed = lambda *a, **k: (time.sleep(slow), real(*a, **k))[1]
         r, wr = os.pipe()
         state = {"stop": threading.Event(), "exited": threading.Event(), "fds": [r], "owed": {}, "blocked": {},
-                 "wlock": threading.Lock()}
+                 "reads": {}, "wlock": threading.Lock()}
         with mock.patch.object(cli, "_peek_pipe", cli._pending):
             t = threading.Thread(target=cli._pump, args=(r, None, w, state, None, Out()), daemon=True)
             t.start()
@@ -1520,8 +1520,13 @@ class RunWindow(unittest.TestCase):
                 os.write(wr, at_exit)
             w.freeze({"t": 1.0, "j": {}})
             state["exited"].set()
+            with state["wlock"]:   # (as cmd_run does at the exit)
+                state["reads_at_exit"] = dict(state["reads"])
+                state["exit_t"] = time.monotonic()
             cli._win_caught_up(state, w)
-            time.sleep(0.2)
+            time.sleep(0.06)
+            cli._win_caught_up(state, w)
+            time.sleep(0.14)
             if after:
                 os.write(wr, after)
             time.sleep(0.3 + 2 * slow)
@@ -1583,6 +1588,28 @@ class RunWindow(unittest.TestCase):
         finally:
             for f in (r, w, high):
                 os.close(f)
+
+    # ---- found in review round 24
+    def test_windows_a_line_written_at_the_exit_is_not_taken_for_one_after_it(self):
+        """The reader's read returns the --from line written just before the exit, at the same moment as the exit
+        is recorded: that read was not 'still waiting with nothing'."""
+        for _ in range(5):
+            b = self._win_reader(b"", b"START\n", b"")
+            self.assertTrue(b and not b["after_exit"], b)
+
+    def test_slow_matching_is_charged_to_the_pattern_that_was_slow_in_one_read(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "START", "(x+x+)+y")
+        w.feed(["START\n" + "x" * 22 + "\nEND"], [1])   # the --from line and slow lines in one read
+        self.assertGreater(w.match_by.get("--until", 0), 10 * w.match_by.get("--from", 0) + 0.01)
+
+    def test_a_line_from_a_process_left_running_just_after_the_exit_on_a_terminal(self):
+        shown = self._on_own_terminal(["--from", "^GO", "--", "bash", "-c", "(sleep 0.45; echo GO) & sleep 0.3; echo hi"])
+        self.assertIn(b"printed after the command exited", shown)
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""

@@ -547,7 +547,7 @@ def cmd_run(a) -> int:
                 outs = {fd: _Out(dst) for fd, dst, _ in proc.joules_streams}   # written on by their own threads
                 pump_state = {"stop": threading.Event(), "exited": threading.Event(), "caught_up": threading.Event(),
                               "fds": [fd for fd, _, _ in proc.joules_streams], "owed": {}, "blocked": {},
-                              "wlock": threading.Lock()}
+                              "reads": {}, "wlock": threading.Lock(), "wake": os.pipe() if os.name == "posix" else None}
                 if os.name == "posix":
                     pumps = [threading.Thread(target=_pump_all, args=(proc.joules_streams, win, pump_state, outs), daemon=True)]
                     old_winch = _follow_resizes(proc)
@@ -576,9 +576,16 @@ def cmd_run(a) -> int:
                     except KeyboardInterrupt:
                         continue
                 pump_state["exited"].set()
+                if pump_state.get("wake"):
+                    with contextlib.suppress(OSError):
+                        os.write(pump_state["wake"][1], b"x")
                 if os.name != "posix":   # (POSIX: the reader notes it)
                     win.behind = any(o.full() for o in outs.values())
-                    _win_caught_up(pump_state, win)   # (each reader looks at its own pipe: see _pump)
+                    with pump_state["wlock"]:
+                        pump_state["reads_at_exit"] = dict(pump_state["reads"])
+                        pump_state["exit_t"] = time.monotonic()
+                    # (each reader looks at its own pipe, see _pump; a reader still in its read after 50 ms got nothing)
+                    threading.Timer(0.06, _win_caught_up, (pump_state, win)).start()
     finally:
         d.close()
     if windowed:   # measuring stopped when the command exited, as without a window; now the rest of its output
@@ -606,6 +613,10 @@ def cmd_run(a) -> int:
                                "the rest of it after joules finishes.")
         except _Terminated:
             _end_on_term(proc, pumps, pump_state, outs)
+        if not any(t.is_alive() for t in pumps):
+            for f in pump_state.get("wake") or ():
+                with contextlib.suppress(OSError):
+                    os.close(f)
         if term:
             term.restore(ctrl_c=False)
         if os.name == "posix":
@@ -707,7 +718,7 @@ class Window:
         self.start_re = re.compile(_searchable(start_re)) if start_re is not None else None
         self.end_re = re.compile(_searchable(end_re)) if end_re is not None else None
         self.match_s = 0.0    # time spent matching beyond a plain search (it holds up the rest of joules)
-        self._cpu = self._budget = 0.0
+        self._grp, self._sec = {}, {}   # per pattern: [CPU, budget] of the group being added up
         self.match_by = {}    # the same, per pattern
         global _GROUP
         if _GROUP is None:
@@ -771,8 +782,7 @@ class Window:
 
     def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
              eof: bool = False) -> bool:
-        key = "--from" if self.begin is None else "--until"   # (the pattern being searched for)
-        t0 = time.thread_time()   # this thread's own CPU time: a busy machine does not count
+        self._sec = {}   # this thread's own CPU time per pattern searched (a busy machine does not count)
         try:
             return self._feed(texts, srcs, partial, keep_from, eof)
         finally:
@@ -782,13 +792,15 @@ class Window:
             # even out within a group, and unused budget is not carried over to hide a slow search later.
             n = sum(len(t) for t in texts)
             with self.lock:
-                self._cpu += time.thread_time() - t0
-                self._budget += 0.0002 + n / 50e6
-                if self._cpu >= self.group or self._budget >= self.group:
-                    extra = max(0.0, self._cpu - self._budget)
-                    self.match_s += extra
-                    self.match_by[key] = self.match_by.get(key, 0.0) + extra
-                    self._cpu = self._budget = 0.0
+                for key, cpu in self._sec.items():   # each pattern searched, with its own budget
+                    g = self._grp.setdefault(key, [0.0, 0.0])
+                    g[0] += cpu
+                    g[1] += 0.0002 + n / 50e6
+                    if g[0] >= self.group or g[1] >= self.group:
+                        extra = max(0.0, g[0] - g[1])
+                        self.match_s += extra
+                        self.match_by[key] = self.match_by.get(key, 0.0) + extra
+                        g[0] = g[1] = 0.0
 
     def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
               eof: bool = False) -> bool:
@@ -801,6 +813,7 @@ class Window:
         with self.lock:
             where = None   # (block, line) of a --from line found now
             if self.begin is None:
+                t0 = time.thread_time()
                 for bi, text in enumerate(texts):
                     lines = self._lines(text, self.start_re)
                     for li, ln in enumerate(lines or ()):
@@ -809,26 +822,36 @@ class Window:
                             break
                     if where:
                         break
+                self._sec["--from"] = time.thread_time() - t0
                 if self.begin is None:
                     return False
             if self.end is None and self.end_re is not None:
-                for bi, text in enumerate(texts):
-                    lines = self._lines(text, self.end_re)
-                    if not lines:
-                        continue
-                    first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
-                    for li in range(first, len(lines)):
-                        ln = lines[li]
-                        if self._hit(self.end_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
-                            if where and where[0] != bi:   # arrived with the --from line, on another stream
-                                if self.alt_end is None:
-                                    self.alt_end = self._mark(ln, srcs[bi], eof)
-                                break
-                            self.end, set_one = self._mark(ln, srcs[bi], eof), True
-                            break
-                    if self.end is not None:
-                        break
+                t0 = time.thread_time()
+                try:
+                    self._search_end(texts, srcs, where, partial, keep_from, eof)
+                finally:
+                    self._sec["--until"] = time.thread_time() - t0
+                set_one = set_one or self.end is not None
         return set_one
+
+    def _search_end(self, texts, srcs, where, partial, keep_from, eof) -> None:
+        """The --until line in what follows a --from line found now (on its stream), or in all of it."""
+        for bi, text in enumerate(texts):
+            lines = self._lines(text, self.end_re)
+            if not lines:
+                continue
+            first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
+            for li in range(first, len(lines)):
+                ln = lines[li]
+                if self._hit(self.end_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
+                    if where and where[0] != bi:   # arrived with the --from line, on another stream
+                        if self.alt_end is None:
+                            self.alt_end = self._mark(ln, srcs[bi], eof)
+                        break
+                    self.end = self._mark(ln, srcs[bi], eof)
+                    break
+            if self.end is not None:
+                break
 
 
 class _Text(str):
@@ -1116,8 +1139,12 @@ def _win_caught_up(state: dict, win) -> None:
     if wl is None or not exited.is_set():
         return
     with wl:
+        settled = time.monotonic() - state.get("exit_t", 0.0) >= 0.05
+        at_exit, reads = state.get("reads_at_exit", {}), state.get("reads", {})
         ok = all(state.get(fd) == "done" or state["owed"].get(fd, 1) <= 0
-                 or (fd not in state["owed"] and state["blocked"].get(fd)) for fd in state["fds"])
+                 or (fd not in state["owed"] and state["blocked"].get(fd) and settled
+                     and reads.get(fd, 0) == at_exit.get(fd, 0))   # (still in the read it was in at the exit)
+                 for fd in state["fds"])
     if ok:
         win.caught_up = True
 
@@ -1170,6 +1197,9 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
     lines = {fd: _Lines() for fd in order}
     sel, watched, owed = selectors.DefaultSelector(), set(), None   # (selectors: no limit on fd numbers)
     pty_wait = set()
+    wake = state.get("wake")   # (written when the command exits)
+    if wake:
+        sel.register(wake[0], selectors.EVENT_READ)
 
     def finish(fd):
         lines[fd].end(win, fd)
@@ -1209,14 +1239,18 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                 # nothing or a short one shows a process writing a little at a time, or 2 s on)
                 owed = {fd: _pending(fd) for fd in open_}
                 pty_wait = {fd for fd in open_ if getattr(win, "ttys", {}).get(fd)}
+                pty_wait -= {f for f in pty_wait if owed[f] <= 0 and not _readable(f, 0)}   # empty now: read
                 owed_t = time.monotonic()
                 win.behind = any(outs[fd].full() for fd in open_)
             if owed is not None and all(owed.get(fd, 0) <= 0 and fd not in pty_wait for fd in open_):
                 state["caught_up"].set()
                 win.caught_up = True   # all the command wrote before exiting is read: later lines came after
             try:
-                if watched:
+                if watched or wake:
                     ready = {k.fd for k, _ in sel.select(0.1)}
+                    if wake and wake[0] in ready:   # the command exited: look at once
+                        with contextlib.suppress(OSError):
+                            os.read(wake[0], 64)
                     if owed is not None and pty_wait:   # a watched pseudo-terminal with nothing to read, or 2 s on
                         late = time.monotonic() - owed_t > 2.0
                         pty_wait -= {f for f in pty_wait if owed.get(f, 0) <= 0 and f in watched and (late or f not in ready)}
@@ -1290,6 +1324,7 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
             if wl is not None:
                 with wl:
                     state["blocked"][fd] = False
+                    state.setdefault("reads", {})[fd] = state.get("reads", {}).get(fd, 0) + 1
         if not chunk:
             break
         win.first_out.setdefault(fd, time.monotonic())
