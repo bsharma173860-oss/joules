@@ -1726,9 +1726,12 @@ class RunWindow(unittest.TestCase):
 
         class Clock:
             def snapshot(self): return {"t": 1.0, "j": {}}
-        w = cli.Window(Clock(), 0.0, [], "needle", None)
+        w = cli.Window(Clock(), 0.0, [], "(?<!x)needle", None)   # (line by line: the lines with the word)
         self.assertEqual(w._lines("aaa\na needle\nccc", w.start_re), [None, "a needle", None])
         self.assertIsNone(w._lines("aaa\nbbb", w.start_re))
+        w = cli.Window(Clock(), 0.0, [], "needle", None)          # (a block search: from the first that can match)
+        self.assertEqual(w._lines("aaa\na needle\nccc", w.start_re), [None, "a needle", "ccc"])
+        self.assertIsNone(w._lines("aaa\nbbb needl", w.start_re))
         self.assertTrue(cli.Window(Clock(), 0.0, [], "(?i)NEVER", None).feed(["x\nsay never\ny"], [1]))
 
     def test_a_pattern_fast_line_by_line_is_fast_over_many_lines(self):
@@ -1755,6 +1758,59 @@ class RunWindow(unittest.TestCase):
             rd.wait(timeout=30)
         text = Path(err).read_text()
         self.assertNotIn("never appeared", text)
+
+    # ---- found in review round 31
+    def test_case_insensitive_words_allow_for_dotless_i_and_long_s(self):
+        """(?i) matches ı and ſ to i and s, and İ to i, which lower() does not: no real marker may be skipped."""
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        for line in ("TASK BEGIN", "TAſK BEGIN", "TASK BEGıN", "TASK BEGİN"):
+            w = cli.Window(Clock(), 0.0, [], "(?i)task begin", None)
+            self.assertTrue(w.feed(["warmup\n" + line], [1]), line)
+
+    def test_a_common_word_that_rarely_matches_is_searched_in_c(self):
+        """'ok$' over many 'token ok 1234' lines: one search of the whole block (it cannot cross lines)."""
+        import re as re_
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        for pattern, bound in (("ok$", True), (r"\d+:\d+", True), (r"(\w+\s?)+X", False), ("[^x]+", False),
+                               ("(?s)a.b", False), ("a.b", True), ("(?<=a)b", False), (r"\Afoo", False),
+                               (r"[\x00-\x20]", False), (r"a\nb", False), ("(?m:^a)", False)):
+            self.assertEqual(cli._line_bound(re_.compile(pattern)), bound, pattern)
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "^ok$", None)
+        block = "token ok 1234\n" * 4600   # ~64 KB
+        t0 = time.process_time()
+        for _ in range(600):              # ~39 MB
+            w.feed([block], [1])
+        self.assertLess(time.process_time() - t0, 0.8)
+        self.assertTrue(w.feed(["token ok 1\nok\n"], [1]))
+
+    def test_lines_without_the_word_left_after_a_hand_over_do_not_cut_the_search_short(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        import threading
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "START", "ENDX(?!q)")
+        w.begin = {"t": 0.0, "j": {}, "line": "START"}
+        w.stop = threading.Event()
+        real = w._hit
+
+        def hit(*a, **k):   # the hand-over starts right after the one line that has the word is searched
+            r = real(*a, **k)
+            w.stop.set()
+            return r
+        w._hit = hit
+        w.feed(["ENDXq is not it\nfoo\nbar"], [1])
+        self.assertIsNone(w.end)
+        self.assertFalse(getattr(w, "cut_short", False))
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""

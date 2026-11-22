@@ -674,6 +674,77 @@ def cmd_run(a) -> int:
     return code
 
 
+_FOLD = {0x131: "i", 0x17F: "s", 0x307: None}   # ı ſ (and İ's dot): what (?i) matches to i/s but lower() keeps
+
+
+def _fold(text: str) -> str:
+    """Lower case as (?i) compares ASCII words: ı, ſ and İ count as i, s and i (only ever lets more lines through)."""
+    return text.lower().translate(_FOLD)
+
+
+def _line_bound(rx) -> bool:
+    """Can no match of rx take in a line end, or look across one? Then searching many lines at once cannot run
+    across lines (no blow-up between lines) and finds a line only where a line-by-line search would. Read from the
+    parsed pattern; anything unsure says no."""
+    try:
+        try:
+            from re import _parser as sp, _constants as sc
+        except ImportError:
+            import sre_parse as sp
+            import sre_constants as sc
+        tree = sp.parse(rx.pattern, rx.flags)
+    except Exception:
+        return False
+    safe_cats = {getattr(sc, n) for n in ("CATEGORY_DIGIT", "CATEGORY_WORD", "CATEGORY_NOT_SPACE",
+                                          "CATEGORY_NOT_LINEBREAK", "CATEGORY_UNI_DIGIT", "CATEGORY_UNI_WORD",
+                                          "CATEGORY_UNI_NOT_SPACE", "CATEGORY_UNI_NOT_LINEBREAK", "CATEGORY_LOC_WORD")
+                 if hasattr(sc, n)}
+    reps = {sc.MAX_REPEAT, sc.MIN_REPEAT, getattr(sc, "POSSESSIVE_REPEAT", None)} - {None}
+    atomic = getattr(sc, "ATOMIC_GROUP", None)
+    nl = ord("\n")
+
+    def ok(items, dotall) -> bool:
+        for op, av in items:
+            if op is sc.LITERAL:
+                if av == nl:
+                    return False
+            elif op is sc.ANY:
+                if dotall:
+                    return False
+            elif op is sc.IN:
+                for iop, iav in av:
+                    if iop is sc.NEGATE or (iop is sc.LITERAL and iav == nl) or \
+                            (iop is sc.RANGE and iav[0] <= nl <= iav[1]) or (iop is sc.CATEGORY and iav not in safe_cats):
+                        return False
+                    if iop not in (sc.LITERAL, sc.RANGE, sc.CATEGORY):
+                        return False
+            elif op is sc.AT:
+                if av in (sc.AT_BEGINNING_STRING, sc.AT_END_STRING):
+                    return False
+            elif op is sc.SUBPATTERN:
+                add, dele = av[1] or 0, av[2] or 0
+                if (add | dele) & (re.MULTILINE | re.DOTALL) or not ok(av[-1], dotall):
+                    return False
+            elif op in reps:
+                if not ok(av[2], dotall):
+                    return False
+            elif op is sc.BRANCH:
+                if not all(ok(b, dotall) for b in av[1]):
+                    return False
+            elif atomic is not None and op is atomic:
+                if not ok(av, dotall):
+                    return False
+            elif op is sc.GROUPREF:
+                pass   # (the group it repeats is checked where it is)
+            elif op is sc.GROUPREF_EXISTS:
+                if not ok(av[1], dotall) or (av[2] is not None and not ok(av[2], dotall)):
+                    return False
+            else:   # (lookarounds, and anything not known here)
+                return False
+        return True
+    return ok(list(tree), bool(rx.flags & re.DOTALL))
+
+
 def _must_contain(rx):
     """(words, fold): one of `words` is in every string rx matches (`fold`: compare in lower case), or None if no
     such plain text can be told. Read from the parsed pattern: literal runs that every match passes through."""
@@ -721,7 +792,7 @@ def _must_contain(rx):
     if fold:
         if not all(w.isascii() for w in words):   # (case folding beyond ASCII: no shortcut)
             return None
-        words = [w.lower() for w in words]
+        words = [_fold(w) for w in words]
     if any("\n" in w for w in words):   # (cannot be on one line: let the search say so)
         return None
     return words, fold
@@ -781,6 +852,7 @@ class Window:
             _STEP = _cpu_step()
             _GROUP = max(0.001, 10 * _STEP)
         self.group = _GROUP
+        self.slow_piece = max(0.005, 2 * _STEP)   # a block piece slower than this: that pattern goes line by line
         self.lock = threading.Lock()
         self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
         self.end = None
@@ -793,6 +865,9 @@ class Window:
         # the plain text every match must contain, looked for first with a plain (linear) substring search; the
         # pattern itself only ever runs on single lines that contain it (all lines, for a pattern without any)
         self.must = {rx: _must_contain(rx) for rx in (self.start_re, self.end_re) if rx}
+        self.block = {rx: (re.compile(rx.pattern, rx.flags | re.M) if _line_bound(rx) else None)
+                      for rx in (self.start_re, self.end_re) if rx}
+        self.block_size = {}   # how much of a block is searched at once, per pattern (see _lines)
 
     def _mark(self, text: str, src=None, eof: bool = False) -> dict:
         snap, late = self.frozen, True
@@ -844,15 +919,44 @@ class Window:
 
     def _lines(self, text: str, rx) -> list[str] | None:
         """The lines of a block (already cleaned, see _feed) to search with rx: None if no line can match; lines
-        that cannot match (they lack the text every match must contain) are None in the list (keeping the numbering)."""
+        that cannot match are None in the list (keeping the numbering). First the text every match must contain
+        (a plain substring search); then, for a pattern that cannot match a line end, one search of the whole block
+        (it cannot run across lines, so it costs no more than line by line, but in C), else the lines with the text."""
         must = getattr(self, "must", {}).get(rx)
-        if not must:
-            return text.split("\n")
-        words, fold = must
-        hay = text.lower() if fold else text
-        if not any(w in hay for w in words):
-            return None
-        return [ln if any(w in (ln.lower() if fold else ln) for w in words) else None for ln in text.split("\n")]
+        if must:
+            words, fold = must
+            hay = _fold(text) if fold else text
+            if not any(w in hay for w in words):
+                return None
+        block = getattr(self, "block", {}).get(rx)
+        i = 0
+        if block is not None:   # in pieces of whole lines, small at first and doubling while fast (up to 64 KB): a
+            while True:         # search holds up every other thread while it runs
+                size = self.block_size.get(rx, 256)
+                j = text.find("\n", i + size)
+                j = len(text) if j < 0 else j + 1
+                t0 = time.thread_time()
+                m = block.search(text, i, j)
+                if time.thread_time() - t0 > self.slow_piece:   # slow in itself: line by line from now on
+                    self.block[rx] = None
+                    if m is not None:
+                        i = m.start()
+                    break
+                self.block_size[rx] = min(65536, size * 2)
+                if m is not None:
+                    lines = text.split("\n")
+                    k = text.count("\n", 0, m.start())   # (lines before the first that can match)
+                    lines[:k] = [None] * k
+                    return lines
+                i = j
+                if i >= len(text):
+                    return None
+        lines = text.split("\n")
+        if must:
+            lines = [ln if any(w in (_fold(ln) if fold else ln) for w in words) else None for ln in lines]
+        k = text.count("\n", 0, i)   # (lines already searched as a block, with nothing)
+        lines[:k] = [None] * k
+        return lines
 
     def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
              eof: bool = False) -> bool:
@@ -924,12 +1028,12 @@ class Window:
                 continue
             first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
             for li in range(first, len(lines)):
-                if not eof and self._stopping():
-                    self.cut_short = True
-                    return
                 ln = lines[li]
                 if ln is None:
                     continue
+                if not eof and self._stopping():
+                    self.cut_short = True
+                    return
                 if self._hit(self.end_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
                     if where and where[0] != bi:   # arrived with the --from line, on another stream
                         if self.alt_end is None:

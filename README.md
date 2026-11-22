@@ -145,7 +145,7 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     with the `--from` line counts only if no later one appears (joules says so).
   - Markers are matched without colour codes, and a marker on a progress-bar line counts when that line is finished.
     They are Python regular expressions: keep them simple (a plain word is fastest). joules first looks for the
-    plain text every match must contain (`done` in `^step \d+ done$`) and tries the pattern only on lines that have
+    plain text every match must contain (`steps done` in `^\d+ steps done$`) and tries the pattern only on lines that have
     it, so put a word in it. A leading `.*` or `.+` is fine (joules drops it), but another leading repeat (`\w*`,
     `[^ ]+`) or nested repeats (`(a+)+`) can be slow on the lines it is tried on and hold up joules (passing output
     on, measuring, even Ctrl-C) and so the script, and stretch the measured run; joules says so if matching took
