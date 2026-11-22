@@ -548,6 +548,7 @@ def cmd_run(a) -> int:
                 pump_state = {"stop": threading.Event(), "exited": threading.Event(), "caught_up": threading.Event(),
                               "fds": [fd for fd, _, _ in proc.joules_streams], "owed": {}, "blocked": {},
                               "reads": {}, "wlock": threading.Lock(), "wake": os.pipe() if os.name == "posix" else None}
+                win.stop = pump_state["stop"]   # (a search stops between lines when joules hands the output over)
                 if os.name == "posix":
                     pumps = [threading.Thread(target=_pump_all, args=(proc.joules_streams, win, pump_state, outs), daemon=True)]
                     old_winch = _follow_resizes(proc)
@@ -754,7 +755,22 @@ class Window:
 
     @staticmethod
     def clean(text: str) -> str:
+        if "\x1b" not in text and "\r" not in text:
+            return text
         return ANSI.sub("", text).replace("\r\n", "\n").replace("\r", "\n")   # colour codes off; \r\n is one line end
+
+    @classmethod
+    def _cleaned(cls, text: str) -> str:
+        out = cls.clean(text)
+        if hasattr(text, "start"):   # (a cut line: where matches may start, already in cleaned terms)
+            out = _Text(out)
+            out.start = text.start
+        return out
+
+    def _stopping(self) -> bool:
+        """Handing over (Ctrl-C, SIGTERM, a stream still open): stop searching between lines."""
+        stop = getattr(self, "stop", None)
+        return stop is not None and stop.is_set()
 
     def _hit(self, rx, line: str, partial: bool, pos: int = 0, keep_from=None) -> bool:
         """Does rx match this line, starting at pos (before it: only context, where the line was cut)? partial: the
@@ -775,7 +791,7 @@ class Window:
         self.frozen = {"t": snap["t"], "j": dict(snap["j"])}
 
     def _lines(self, text: str, rx) -> list[str] | None:
-        text = self.clean(text)
+        """text: already cleaned (see _feed)."""
         pre = self.pre.get(rx)
         if pre is not None and not pre.search(text):
             return None
@@ -811,6 +827,7 @@ class Window:
         later --until line appears. Returns True if a mark was set."""
         set_one = False
         srcs = srcs or [None] * len(texts)
+        texts = [self._cleaned(t) for t in texts]   # once, outside the timed searches (it is not matching)
         with self.lock:
             where = None   # (block, line) of a --from line found now
             if self.begin is None:
@@ -818,6 +835,8 @@ class Window:
                 for bi, text in enumerate(texts):
                     lines = self._lines(text, self.start_re)
                     for li, ln in enumerate(lines or ()):
+                        if not eof and self._stopping():   # (the last unfinished line is still looked at)
+                            break
                         if self._hit(self.start_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
                             self.begin, where, set_one = self._mark(ln, srcs[bi], eof), (bi, li), True
                             break
@@ -845,6 +864,8 @@ class Window:
                 continue
             first = (where[1] + 1) if where and where[0] == bi else 0   # only lines after the --from line
             for li in range(first, len(lines)):
+                if not eof and self._stopping():
+                    return
                 ln = lines[li]
                 if self._hit(self.end_re, ln, partial, getattr(text, "start", 0) if li == 0 else 0, keep_from):
                     if where and where[0] != bi:   # arrived with the --from line, on another stream
@@ -1498,8 +1519,8 @@ def _hand_over(proc, pumps, state, outs, ending: bool = False) -> bool:
     ending: joules ends at once (SIGTERM). True if a stream was still held open (a process the command started)."""
     held = False
     state["stop"].set()
-    for t in pumps:
-        t.join(1.0)   # our reader never waits on a writer, so it stops at once
+    for t in pumps:   # our reader never waits on a writer, and a search stops between lines: it stops at once
+        t.join()
     for fd, dst, _ in proc.joules_streams:
         if state.get(fd) == "handed":
             continue
@@ -1689,7 +1710,7 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     # did joules pause for a slow reader before a mark it then found?
     paused = bool(begin.get("after_pause") or (found_end or {}).get("after_pause"))
     slow = getattr(w, "match_s", 0.0) >= 1.0   # (said above: that, not held output, is why marks came late)
-    if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny or held) and not slow:
+    if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny or held) and not slow and not begin.get("no_line_end"):
         if (getattr(w, "behind", False) or paused) and (begin.get("late") or at_exit):
             notes.append("The marker lines were only read when the command exited, so the window may be wrong: what "
                          "reads joules' output (a pager, a slow pipe) took it so slowly that joules fell behind.")

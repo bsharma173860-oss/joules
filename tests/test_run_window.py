@@ -1639,6 +1639,7 @@ class RunWindow(unittest.TestCase):
         p, r = self.run_j(["--no-cpu", "--from", "START"], ["bash", "-c", "sleep 0.3; printf START; sleep 4 &"], timeout=60)
         self.assertTrue(r["window"]["found_from"], r["notes"])
         self.assertFalse([n for n in r["notes"] if "printed after the command exited" in n], r["notes"])
+        self.assertFalse([n for n in r["notes"] if "held its output" in n], r["notes"])   # (its own note says why)
 
     def test_each_search_keeps_its_own_cpu_times(self):
         """Windows feeds from two threads at once: each call's per-pattern times must be its own."""
@@ -1660,6 +1661,35 @@ class RunWindow(unittest.TestCase):
         self.assertIsInstance(seen[0], dict)
         self.assertIsNot(seen[0], seen[1])
         self.assertFalse(hasattr(w, "_sec"))
+
+    # ---- found in review round 27
+    def test_a_hand_over_during_a_slow_search_loses_nothing(self):
+        """Ctrl-C while joules is still busy with a slow pattern: the search stops between lines, and all the
+        command's output (some still in the pipe) is passed on."""
+        code = ("import sys, time\nsys.stdout.write(('a' * 24 + 'b\\n') * 250); sys.stdout.flush(); time.sleep(0.3)\n"
+                "sys.stdout.write(''.join('TAIL %d\\n' % i for i in range(100))); sys.stdout.flush()\n")
+        out = os.path.join(self.d, "out")
+        with open(out, "wb") as f:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "(?=a)(a|aa)+$", "--",
+                                  sys.executable, "-c", code], stdout=f, stderr=subprocess.DEVNULL, env=self.env(),
+                                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            time.sleep(1.5)
+            q.send_signal(signal.SIGINT)
+            q.wait(timeout=30)
+        time.sleep(2)
+        self.assertEqual(Path(out).read_text().count("TAIL "), 100)
+
+    def test_colour_codes_are_not_counted_as_slow_matching(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "NEVERSEEN", None)
+        block = ("\x1b[m\x1b[1m.\x1b[0m" * 6 + "\n") * 2000   # ~64 KB of lines thick with escape codes
+        for _ in range(600):                                     # ~40 MB
+            w.feed([block], [1])
+        self.assertLess(w.match_s, 0.5)
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
