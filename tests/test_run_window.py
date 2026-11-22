@@ -1178,7 +1178,7 @@ class RunWindow(unittest.TestCase):
         block = ("x" * 99 + "\n") * 650   # 64 KB, as one read brings
         for _ in range(3000):              # ~200 MB of output before the markers
             w.feed([block], [1])
-        self.assertEqual(w.match_s, 0.0)
+        self.assertLess(w.match_s, 0.5)
         w2 = cli.Window(Clock(), 0.0, [], "a*START", "END")
         w2.feed([("a" * 30000 + "\n") * 3], [1])   # slow in itself
         self.assertGreater(w2.match_s, 0.0)
@@ -1324,13 +1324,52 @@ class RunWindow(unittest.TestCase):
         b.close()
         self.assertEqual(len(got), 300)
         self.assertEqual(got[7], b"00007 " + b"x" * 94 + b"\n")
-        self.assertIn("datagram socket", Path(err).read_text())
+        self.assertIn("message socket", Path(err).read_text())
 
     def test_a_marker_from_a_process_left_running_is_said_to_come_after_the_exit(self):
         p, r = self.run_j(["--no-cpu", "--from", "A", "--until", "B"],
                           ["sh", "-c", "sleep 0.5; (sleep 0.3; echo A; sleep 0.5; echo B) & echo started"], timeout=60)
         self.assertTrue(any("printed after the command exited" in n for n in r["notes"]), r["notes"])
         self.assertFalse([n for n in r["notes"] if "held its output" in n])
+
+    # ---- found in review round 19
+    def test_a_slow_pattern_in_terminal_sized_reads_adds_up(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], r"\w+X", None)
+        block = ("a" * 399 + "\n") * 10   # 4 KB, as a terminal gives
+        for _ in range(300):
+            w.feed([block], [1])
+        self.assertGreater(w.match_s, 0.2)
+
+    def test_flags_keep_the_quick_pre_search(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        for pattern, quick in (("(?i)never", True), ("(?:a|b)c", True), ("(?P<x>a)", True), ("(?<!x)foo", False),
+                               ("foo(?=x)", False), (r"\Afoo", False), ("(?i)never(?!x)", False)):
+            w = cli.Window(Clock(), 0.0, [], pattern, None)
+            self.assertEqual(w.pre[w.start_re] is not None, quick, pattern)
+        w = cli.Window(Clock(), 0.0, [], "(?i)NEVER", None)
+        self.assertTrue(w.feed(["x\nsay never\ny"], [1]))   # and it still finds the line
+
+    def test_held_output_on_a_terminal_is_not_called_a_process_left_running(self):
+        """A pseudo-terminal reports only part of what waits in it: what the command wrote before exiting must not
+        be taken for output of a process it left running."""
+        code = ("import os, time\ntime.sleep(0.3)\n"
+                "os.write(1, (b'a' * 1000 + b'\\n') * 300 + b'START\\nEND\\n')\n")
+        shown = self._on_own_terminal(["--from", r"\w*START", "--until", r"\w*END", "--", sys.executable, "-c", code],
+                                      cols=200)
+        self.assertNotIn(b"printed after the command exited", shown)
+
+    def test_a_marker_on_a_last_line_without_a_line_end_says_so(self):
+        p, r = self.run_j(["--no-cpu", "--from", "START"], ["bash", "-c", 'sleep 0.3; printf "x\\nSTART"; sleep 0.5'])
+        self.assertTrue(any("had no line end" in n for n in r["notes"]), r["notes"])
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""

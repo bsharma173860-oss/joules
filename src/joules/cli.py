@@ -700,7 +700,8 @@ class Window:
         self.paused = False   # did joules stop reading for a slow reader while a mark was still to come?
         self.alt_end = None   # an --until line that arrived with the --from line on another stream (order unknown)
         # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
-        self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
+        # (not with lookarounds or \A \Z \z, which could see past a line end there and so miss a line)
+        self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?<?[=!]", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
                     for rx in (self.start_re, self.end_re) if rx}
 
     def _mark(self, text: str, src=None) -> dict:
@@ -711,7 +712,8 @@ class Window:
             if exited is not None and snap["t"] >= exited["t"]:   # the command exited meanwhile
                 snap, late = exited, True
         return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200], "late": late, "src": src,
-                "after_pause": self.paused, "after_exit": late and getattr(self, "caught_up", False)}
+                "after_pause": self.paused, "after_exit": late and getattr(self, "caught_up", False),
+                "no_line_end": getattr(self, "at_eof", False)}
 
     @staticmethod
     def clean(text: str) -> str:
@@ -743,14 +745,14 @@ class Window:
         return text.split("\n")
 
     def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
-        t0 = time.perf_counter()
+        t0 = time.thread_time()   # this thread's own CPU time: a busy machine does not count
         try:
             return self._feed(texts, srcs, partial, keep_from)
         finally:
-            # only time beyond what a plain search of this much text takes counts (a plain word never adds up,
-            # however much output; a slow pattern does, in big reads or small, e.g. 4 KB from a terminal)
+            # only what goes beyond a plain search of this much text counts (a plain word never adds up, however
+            # much output; a slow pattern does, in big reads or small, e.g. 4 KB from a terminal)
             n = sum(len(t) for t in texts)
-            self.match_s += max(0.0, time.perf_counter() - t0 - 0.005 - n / 50e6)
+            self.match_s += max(0.0, time.thread_time() - t0 - 0.0002 - n / 50e6)
 
     def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
@@ -851,7 +853,11 @@ class _Lines:
 
     def end(self, win: "Window", src=None) -> None:
         if self.buf and not self.skip and win.pending():
-            win.feed([self._text(self.buf, self.ctx)], [src])
+            win.at_eof = True   # (a last line with no line end: it counts only now, when the output ends)
+            try:
+                win.feed([self._text(self.buf, self.ctx)], [src])
+            finally:
+                win.at_eof = False
         self.buf, self.ctx = b"", 0
 
 
@@ -1127,14 +1133,18 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
             if not open_:
                 break
             if owed is None and state["exited"].is_set():   # what the command wrote before it exited
-                owed = {fd: _pending(fd) for fd in open_}
+                # (a pseudo-terminal reports only part of what waits in it: there, until a read finds nothing)
+                owed = {fd: (None if getattr(win, "ttys", {}).get(fd) else _pending(fd)) for fd in open_}
                 win.behind = any(outs[fd].full() for fd in open_)
-            if owed is not None and all(owed.get(fd, 0) <= 0 for fd in open_):
+            if owed is not None and all(owed.get(fd, 0) is not None and owed.get(fd, 0) <= 0 for fd in open_):
                 state["caught_up"].set()
                 win.caught_up = True   # all the command wrote before exiting is read: later lines came after
             try:
                 if watched:
                     ready = {k.fd for k, _ in sel.select(0.1)}
+                    if owed is not None:   # a watched pseudo-terminal with nothing to read: what was in it is read
+                        for fd in [f for f, v in owed.items() if v is None and f in watched and f not in ready]:
+                            owed[fd] = 0
                 else:
                     ready = set()
                     time.sleep(0.05)
@@ -1152,7 +1162,7 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                     finish(fd)
                     continue
                 win.first_out.setdefault(fd, time.monotonic())
-                if owed is not None:
+                if owed is not None and owed.get(fd, 0) is not None:
                     owed[fd] = owed.get(fd, 0) - len(chunk)
                 if win.pending():
                     text = lines[fd].add(chunk, win, fd)
@@ -1489,9 +1499,17 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         begin, end = w.begin, w.end
         alt = getattr(w, "alt_end", None) if end is None else None
         found_end = end
+    if getattr(w, "match_s", 0.0) >= 1.0:
+        notes.append(f"Matching --from/--until took {w.match_s:.1f} s of joules' time, which held up the command's "
+                     "output (and the command, once its pipe was full), so the run (and any window) may be off. "
+                     "Use a simpler pattern: no leading repeat like \\w* or [^ ]+, no nested repeats (a plain word "
+                     "is fastest).")
+    for which, mark in (("--from", begin), ("--until", end)):
+        if mark and mark.get("no_line_end"):
+            notes.append(f"The {which} line had no line end, so it counted only when the command's output ended.")
     for name in getattr(w, "untouched", ()):
-        notes.append(f"Your {name} is a datagram socket, so the command writes to it directly (passing it through "
-                     "joules would merge its messages); markers on it are not seen.")
+        notes.append(f"Your {name} is a message socket (datagram or seqpacket), so the command writes to it directly "
+                     "(passing it through joules would merge its messages); markers on it are not seen.")
     if alt is not None:
         end = alt
         notes.append("The --until line arrived on the other stream together with the --from line, so which came "
@@ -1505,11 +1523,6 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     end = end or {**(w.frozen or {"t": s.t1, "j": {m.name: m.energy_j for m in meters}}), "line": None}
     if end["t"] < begin["t"]:   # (cannot end before it starts)
         end = {**end, "t": begin["t"], "j": begin["j"]}
-    if getattr(w, "match_s", 0.0) >= 1.0:
-        notes.append(f"Matching --from/--until took {w.match_s:.1f} s of joules' time, which held up the command's "
-                     "output (and the command, once its pipe was full), so the run and the window may be off. "
-                     "Use a simpler pattern: no leading repeat like \\w* or [^ ]+, no nested repeats (a plain word "
-                     "is fastest).")
     if a.window_until is not None and info["found_until"] is False:
         after = "after the --from line" if a.window_from is not None else "in the command's output"
         notes.append(f"--until {a.window_until!r} never appeared {after}, so the window runs to the end of the command.")
