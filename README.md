@@ -136,8 +136,9 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
 - **Output:** the script's output still reaches you as it is printed, stdout and stderr, unchanged.
   - The script sees what it would see without joules. On a terminal it gets a terminal of its own (a
     pseudo-terminal, on Linux and macOS), so programs print line by line and keep their colours and progress bars.
-    Into a file or a pipe it gets a pipe: Python prints line by line there, but C programs may hold their output
-    until they exit, so their marker lines come late. Run such a program with `stdbuf -oL` (Linux).
+    Into a file or a pipe it gets a pipe: Python prints line by line there (joules sets `PYTHONUNBUFFERED=1` for
+    it), but C programs may hold their output until they exit, so their marker lines come late. Run such a
+    program with `stdbuf -oL` (Linux).
   - When stdout and stderr go to the same place (a terminal, or `2>&1`), they share one stream, so their order is
     kept and a marker may be on either.
   - Markers are matched without colour codes, and a marker on a progress-bar line counts when that line is finished.
@@ -146,8 +147,9 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
   - The CPU-time estimate (used where there are no energy counters) is only known for the whole run, so it is not
     in the window.
   - If the marker lines only arrive as the script exits (output held back), joules says so in the report.
-  - Not for full-screen terminal programs (htop, nvtop): they set up joules' terminal, not yours. On Windows a
-    marker pair split between stdout and stderr going to different places can be missed; put both on one stream.
+  - Not for full-screen terminal programs (htop, nvtop): they set up joules' terminal, not yours.
+  - On Windows stdout and stderr are always read separately (unless both go to the same file), so on a console
+    their order can change and a marker pair split between them can be missed; put both markers on one stream.
 - **Laptop GPUs:** many have no energy counter. joules then samples their power, every 0.1 s by default
   (`--interval`; `joules doctor` says "power readings (no energy counter)"), so a window shorter than a few seconds
   is less exact. Leave `--subtract-idle` on for a laptop, where the idle draw is a large share.

@@ -23,6 +23,7 @@ import argparse
 import codecs
 import contextlib
 import datetime as dt
+import functools
 import json
 import os
 import platform
@@ -225,26 +226,39 @@ def _isatty(f) -> bool:
         return False
 
 
+def _usable(f) -> bool:
+    """Is this stream of ours open? (With `>&-` it is not: the command then inherits it closed, as without joules.)"""
+    try:
+        os.fstat(f.fileno())
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _start(cmd: list[str], piped: bool = False):
     """piped (--from/--until): joules reads the command's output, passes it on and looks for the window's marks.
     Each stream is what it would be without joules: a terminal (a pseudo-terminal, POSIX) where ours is a terminal,
-    a pipe where ours is a file or a pipe; and one shared stream where our stdout and stderr go to the same place,
-    so their order is kept. Sets p.joules_streams = [(fd we read, where it goes, do we close it)]."""
+    a pipe where ours is a file or a pipe, ours as it is where ours is closed; and one shared stream where our
+    stdout and stderr go to the same place, so their order is kept. Sets p.joules_streams = [(fd we read, where it
+    goes, how to close it)]."""
     try:
         if piped:
-            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-            same = _same_place()
+            outs = [f for f in (sys.stdout, sys.stderr) if _usable(f)]
+            same = len(outs) == 2 and _same_place()
+            env = dict(os.environ)
+            if any(not _isatty(f) for f in outs):   # into a pipe Python would hold its output until it exits
+                env["PYTHONUNBUFFERED"] = "1"
             if os.name == "posix":
-                made = []
-
-                def stream(dst):
-                    pair = _pty_pair(dst) if _isatty(dst) else os.pipe()
-                    made.append(pair)
-                    return pair
-                out = stream(sys.stdout)
-                err = out if same else stream(sys.stderr)
+                made, ends = [], {}
+                for f in outs:
+                    if f is sys.stderr and same:
+                        ends[f] = ends[sys.stdout]
+                        continue
+                    pair = _pty_pair(f) if _isatty(f) else os.pipe()
+                    made.append(pair); ends[f] = pair
                 try:
-                    p = subprocess.Popen(cmd, stdout=out[1], stderr=err[1], env=env)
+                    p = subprocess.Popen(cmd, stdout=ends[sys.stdout][1] if sys.stdout in ends else None,
+                                         stderr=ends[sys.stderr][1] if sys.stderr in ends else None, env=env)
                 except BaseException:
                     for r, _ in made:
                         os.close(r)
@@ -252,11 +266,14 @@ def _start(cmd: list[str], piped: bool = False):
                 finally:
                     for _, w in made:
                         os.close(w)
-                p.joules_streams = [(out[0], sys.stdout, True)] + ([] if same else [(err[0], sys.stderr, True)])
+                p.joules_streams = [(pair[0], f, functools.partial(os.close, pair[0]))
+                                    for f, pair in ends.items() if not (f is sys.stderr and same)]
                 return p
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if same else subprocess.PIPE,
-                                 bufsize=0, env=env)
-            p.joules_streams = [(p.stdout.fileno(), sys.stdout, False)] + ([] if same else [(p.stderr.fileno(), sys.stderr, False)])
+            out = subprocess.PIPE if sys.stdout in outs else None
+            err = (subprocess.STDOUT if same else subprocess.PIPE) if sys.stderr in outs else None
+            p = subprocess.Popen(cmd, stdout=out, stderr=err, bufsize=0, env=env)
+            p.joules_streams = ([(p.stdout.fileno(), sys.stdout, p.stdout.close)] if p.stdout else []) + \
+                               ([(p.stderr.fileno(), sys.stderr, p.stderr.close)] if p.stderr else [])
             return p
         return subprocess.Popen(cmd)
     except FileNotFoundError:
@@ -495,8 +512,8 @@ def cmd_run(a) -> int:
                     pumps = [threading.Thread(target=_pump_all, args=(proc.joules_streams, win, pump_state), daemon=True)]
                     old_winch = _follow_resizes(proc)
                 else:
-                    pumps = [threading.Thread(target=_pump, args=(fd, dst, win, pump_state, owned), daemon=True)
-                             for fd, dst, owned in proc.joules_streams]
+                    pumps = [threading.Thread(target=_pump, args=(fd, dst, win, pump_state, close), daemon=True)
+                             for fd, dst, close in proc.joules_streams]
                 for t in pumps:
                     t.start()
             while True:
@@ -602,8 +619,9 @@ class Window:
         self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
         self.end = None
         self.frozen = None   # set when the command has exited: a mark read after that is the end of the run
+        self.first_out = None   # when the command's first output was read
         # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
-        self.pre = {rx: (None if re.search(r"\\[AZ]|\(\?", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
+        self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
                     for rx in (self.start_re, self.end_re) if rx}
 
     def _mark(self, text: str) -> dict:
@@ -714,6 +732,7 @@ def _pump_all(streams: list, win: "Window", state: dict) -> None:
     progress bars count). If our own output is closed (e.g. `| head`), that stream is closed too, so the command
     sees it closed, as it would without joules. Stops (leaving the streams open) when state["stop"] is set."""
     open_ = {fd: dst for fd, dst, _ in streams}
+    closers = {fd: close for fd, _, close in streams}
     order = [fd for fd, _, _ in streams]
     lines = {fd: _Lines() for fd in order}
 
@@ -722,7 +741,7 @@ def _pump_all(streams: list, win: "Window", state: dict) -> None:
         state[fd] = "done"
         del open_[fd]
         with contextlib.suppress(OSError):
-            os.close(fd)
+            closers[fd]()
     while open_:
         if state["stop"].is_set():   # handing over to the copier: everything read so far has been written
             for fd in open_:
@@ -740,6 +759,8 @@ def _pump_all(streams: list, win: "Window", state: dict) -> None:
                 chunk = os.read(fd, 65536)
             except OSError:   # EIO from a pseudo-terminal once every writer has gone: the end of the output
                 chunk = b""
+            if chunk and win.first_out is None:
+                win.first_out = time.monotonic()
             if not chunk or not _write(open_[fd], chunk):
                 finish(fd)
                 continue
@@ -755,14 +776,17 @@ def _pump_all(streams: list, win: "Window", state: dict) -> None:
         finish(fd)
 
 
-def _pump(fd: int, dst, win: "Window", state: dict, owned: bool = True) -> None:
-    """Windows (pipes cannot be polled there): one reader per stream, otherwise as _pump_all."""
+def _pump(fd: int, dst, win: "Window", state: dict, close=None) -> None:
+    """Windows (pipes cannot be polled there): one reader per stream, otherwise as _pump_all. The command's pipe is
+    closed at the end, also when our own output went away, so the command sees a broken pipe instead of blocking."""
     lines = _Lines()
     while not state["stop"].is_set():
         try:
             chunk = os.read(fd, 65536)
         except OSError:
             break
+        if chunk and win.first_out is None:
+            win.first_out = time.monotonic()
         if not chunk or not _write(dst, chunk):
             break
         if win.pending():
@@ -771,9 +795,9 @@ def _pump(fd: int, dst, win: "Window", state: dict, owned: bool = True) -> None:
                 win.feed([text])
     lines.end(win)
     state[fd] = "done"
-    if owned:
-        with contextlib.suppress(OSError):
-            os.close(fd)
+    if close is not None:
+        with contextlib.suppress(OSError, ValueError):
+            close()
 
 
 COPIER = ("import os, sys\n"
@@ -853,8 +877,11 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         after = "after the --from line" if a.window_from is not None else "in the command's output"
         notes.append(f"--until {a.window_until!r} never appeared {after}, so the window runs to the end of the command.")
     exit_t = (w.frozen or {}).get("t", s.t1)
-    at_exit = a.window_from is not None and end["t"] - begin["t"] < 0.01 and begin["t"] >= exit_t - 0.1
-    if begin.get("late") or end.get("late") or at_exit:   # (a window of no time that ends as the command exits)
+    # Held back: the --from line read only after the exit, or a window of no time at the exit with nothing at all
+    # read before it (a late --until alone is just the command's last line, read a moment after it exited).
+    nothing_before = w.first_out is None or w.first_out >= exit_t - 0.1
+    at_exit = a.window_from is not None and end["t"] - begin["t"] < 0.01 and begin["t"] >= exit_t - 0.1 and nothing_before
+    if begin.get("late") or at_exit:
         notes.append("The marker lines were only read when the command exited, so the window may be wrong: the command "
                      "probably held its output (a C program writing into a file or pipe does). Run it with `stdbuf -oL` "
                      "(Linux), or let joules write to a terminal.")

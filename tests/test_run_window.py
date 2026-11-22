@@ -2,6 +2,7 @@
 model server has loaded. Tested end to end on a stand-in laptop GPU that reports power only (no energy counter),
 with a script shaped like a typical benchmark runner: a server started in the background and killed by a trap, a
 model-loading phase, then the benchmark between two marker lines, each phase at its own power."""
+import contextlib
 import json
 import shlex
 import os
@@ -527,6 +528,57 @@ class RunWindow(unittest.TestCase):
         seen = [ln for ln in shown.decode(errors="replace").splitlines() if ln.startswith("seen")]
         self.assertTrue(seen and "100" in seen[0], shown[-500:])
 
+    # ---- found in review round 6
+    def test_pythonunbuffered_only_where_output_is_a_pipe(self):
+        code = "import os; print('go'); print('PU', os.environ.get('PYTHONUNBUFFERED'))"
+        p, r = self.run_j(["--no-cpu", "--from", "go"], [sys.executable, "-c", code])
+        self.assertIn(b"PU 1", p.stdout)                                  # into a pipe: set, so lines are not held
+        os.environ.pop("PYTHONUNBUFFERED", None)
+        shown = self._on_own_terminal(["--from", "go", "--", sys.executable, "-c", code])
+        self.assertIn(b"PU None", shown)                                  # on a terminal: left alone
+
+    def test_a_closed_stdout_stays_closed_for_the_command(self):
+        code = "import os, sys\ntry:\n    os.write(1, b'go\\n'); sys.stderr.write('wrote\\n')\nexcept OSError as e:\n    sys.stderr.write('EBADF\\n' if e.errno == 9 else repr(e))\n"
+        for extra in ([], ["--from", "go"]):
+            q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu {' '.join(extra)} -- "
+                               f"{shlex.quote(sys.executable)} -c {shlex.quote(code)} >&-", shell=True, capture_output=True,
+                               env=self.env(), timeout=60)
+            self.assertIn(b"EBADF", q.stderr, extra)
+
+    def test_the_windows_reader_closes_the_pipe_when_our_output_goes(self):
+        """When our output goes away (a pager quits), the command gets a broken pipe instead of blocking for ever.
+        Uses the streams _start sets up on Windows (pipes; Windows itself cannot be run here)."""
+        import threading
+        from unittest import mock
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Gone:
+            buffer = None
+            def write(self, *a): raise BrokenPipeError(32, "gone")
+            def flush(self): pass
+
+        class Win:
+            first_out = None
+            def pending(self): return False
+        cmd = [sys.executable, "-c", "import sys\nwhile True: sys.stdout.write('y' * 4096)"]
+        with open(os.devnull, "w") as quiet, mock.patch.object(cli.os, "name", "nt"), \
+                mock.patch.object(sys, "stdout", quiet), mock.patch.object(sys, "stderr", quiet):
+            q = cli._start(cmd, piped=True)
+        fd, _, close = q.joules_streams[0]
+        cli._pump(fd, Gone(), Win(), {"stop": threading.Event()}, close or None)
+        try:
+            q.wait(timeout=10)
+        finally:
+            if q.poll() is None:
+                q.kill()
+            for f in (q.stdout, q.stderr):
+                if f:
+                    with contextlib.suppress(OSError, ValueError):
+                        f.close()
+        self.assertIsNotNone(q.returncode)
+
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
@@ -544,6 +596,38 @@ class RunWindow(unittest.TestCase):
                "JOULES_NVML_LIB": self.laptop, "FAKE_NVML_POWER_FILE": self.power, "NO_COLOR": "1"}
         p = subprocess.run([sys.executable, "-m", "joules", "doctor", "--offline"], capture_output=True, text=True, env=env, timeout=60)
         self.assertIn("power readings (no energy counter): sampled every 0.1 s", p.stdout + p.stderr)
+
+
+class LateNote(unittest.TestCase):
+    """The "markers only read at exit" note: given when output was held back, not for a last line read late."""
+
+    def report(self, begin, end, exit_t, first_out, until="done"):
+        import argparse
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class M:
+            name, kind, energy_j = "GPU 0", "gpu", 10.0
+        w = cli.Window.__new__(cli.Window)
+        import threading
+        w.lock, w.frozen, w.first_out = threading.Lock(), {"t": exit_t, "j": {"GPU 0": 10.0}}, first_out
+        w.begin = {"t": begin[0], "j": {"GPU 0": 1.0}, "line": "start", "late": begin[1]}
+        w.end = {"t": end[0], "j": {"GPU 0": 2.0}, "line": "done", "late": end[1]}
+
+        class S:
+            t0, t1 = 0.0, exit_t
+        a = argparse.Namespace(window_from="start", window_until=until)
+        return [n for n in cli._window_report(a, w, S(), [M()], {})[1] if "only read when" in n]
+
+    def test_a_last_line_read_just_after_exit_gets_no_note(self):
+        self.assertEqual(self.report(begin=(1.0, False), end=(1.51, True), exit_t=1.5, first_out=0.9), [])
+
+    def test_output_held_until_exit_gets_the_note(self):
+        self.assertTrue(self.report(begin=(4.0, False), end=(4.0, False), exit_t=4.0, first_out=4.0))
+        self.assertTrue(self.report(begin=(4.01, True), end=(4.01, True), exit_t=4.0, first_out=4.01))
+
+    def test_a_quick_pair_after_earlier_output_gets_no_note(self):
+        self.assertEqual(self.report(begin=(2.0, False), end=(2.0, False), exit_t=2.05, first_out=0.3), [])
 
 
 if __name__ == "__main__":
