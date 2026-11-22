@@ -1162,6 +1162,100 @@ class RunWindow(unittest.TestCase):
         self.assertEqual(w.begin["t"], 3.0)
         self.assertTrue(w.begin["late"])
 
+    # ---- found in review round 17
+    def test_much_output_with_a_plain_word_is_not_slow_matching(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "START", "END")
+        block = ("x" * 99 + "\n") * 650   # 64 KB, as one read brings
+        for _ in range(3000):              # ~200 MB of output before the markers
+            w.feed([block], [1])
+        self.assertEqual(w.match_s, 0.0)
+        w2 = cli.Window(Clock(), 0.0, [], "a*START", "END")
+        w2.feed([("a" * 30000 + "\n") * 3], [1])   # slow in itself
+        self.assertGreater(w2.match_s, 0.0)
+
+    def test_a_socket_output_hand_over_repeats_nothing(self):
+        """joules' stdout is a socket (Node harnesses, the systemd journal) whose reader is slow: a Ctrl-C hand-over
+        passes on exactly what the command wrote."""
+        import socket
+        a, b = socket.socketpair()
+        a.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        b.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        code = ("import sys; o = sys.stdout.buffer\nfor i in range(20000): o.write(b'%07d ' % i + b'z' * 92 + b'\\n')\n"
+                "o.write(b'START\\nEND\\n'); o.flush()\n")
+        want = b"".join(b"%07d " % i + b"z" * 92 + b"\n" for i in range(20000)) + b"START\nEND\n"
+        q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "START", "--until", "END", "--",
+                              sys.executable, "-c", code], stdout=a.fileno(), stderr=open(os.path.join(self.d, "err"), "wb"),
+                             stdin=subprocess.DEVNULL, env=self.env())
+        a.close()
+        time.sleep(3)
+        q.send_signal(signal.SIGINT)
+        q.wait(timeout=20)
+        got = b""
+        b.settimeout(5)
+        try:
+            while len(got) < len(want) + 1:
+                d = b.recv(65536)
+                if not d:
+                    break
+                got += d
+        except socket.timeout:
+            pass
+        b.close()
+        self.assertEqual(got, want)
+
+    def test_where_output_goes_decides_how_it_is_written(self):
+        import socket
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        for path, kind in ((os.devnull, "file"), ("/dev/zero", "tty"), (os.path.join(self.d, "f"), "file")):
+            if not os.path.exists(path) and path != os.path.join(self.d, "f"):
+                continue
+            with open(path, "wb") as f:
+                o = cli._Out.__new__(cli._Out)
+                o.dst = f
+                o._fd()
+                self.assertEqual(o.kind, kind, path)
+        a, b = socket.socketpair()
+        try:
+            with os.fdopen(a.fileno(), "wb", closefd=False) as f:
+                o = cli._Out.__new__(cli._Out)
+                o.dst = f
+                o._fd()
+                self.assertEqual(o.kind, "socket")
+                o.sock.close()
+        finally:
+            a.close()
+            b.close()
+
+    def test_windows_keeps_the_pause_while_another_stream_is_behind(self):
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Empty:
+            gone, size = False, 0
+            def full(self): return False
+            def put(self, c): pass
+
+        class Win:
+            first_out = {}
+            paused = True
+            def pending(self): return True
+        win = Win()
+        win.paused_streams = {99}   # another stream is still behind
+        r, w = os.pipe()
+        os.close(w)   # (no output: the reader ends at once)
+        try:
+            cli._pump(r, None, win, {"stop": threading.Event()}, None, Empty())
+        finally:
+            os.close(r)
+        self.assertTrue(win.paused)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)

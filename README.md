@@ -146,8 +146,9 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
   - Markers are matched without colour codes, and a marker on a progress-bar line counts when that line is finished.
     They are Python regular expressions: keep them simple (a plain word is fastest). A leading `.*` or `.+` is
     fine (joules drops it), but another leading repeat (`\w*`, `[^ ]+`) or nested repeats (`(a+)+`) can be slow on
-    long lines and hold up joules and the script; joules says so if matching took over a second. In a line longer than 1 MB, joules keeps only its last 64 KB (and 256 bytes before that), so a
-    match longer than that, or one that needs to look further back, may be missed.
+    long lines and hold up joules and the script; joules says so if matching took over a second. In a line
+    longer than 1 MB, joules keeps only its last 64 KB (and 256 bytes before that), so a match longer than that,
+    or one that needs to look further back, may be missed.
   - Measuring stops when the script exits. A server it leaves running does not keep joules waiting, and on Linux
     and macOS it keeps its output after joules finishes.
   - The CPU-time estimate (used where there are no energy counters) is only known for the whole run, so it is not
@@ -157,8 +158,9 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     no time is the sign to look for.
   - A slow reader of joules' output (a pager, a slow pipe) does not move the window: joules keeps reading the
     script's output on time, holding up to 16 MB of it for the reader (and says so if it falls further behind).
-  - On Linux and macOS, a Ctrl-C while joules waits for a slow reader stops the waiting: joules reports at once and a small helper
-    passes on the rest of the output after it (the report may then start part-way through a line).
+  - On Linux and macOS, a Ctrl-C while joules waits for a slow reader stops the waiting: joules reports at once
+    and a small helper passes on the rest of the output after it (the report may then start part-way through a
+    line; if your terminal was paused with Ctrl-S part-way through a write, up to 4 KB may show twice).
   - The script writes to joules, not to your file, so if your disk fills up the script does not see the error;
     the output that did not fit is lost, as it would be anyway.
   - Not for full-screen terminal programs (htop, nvtop): they set up joules' terminal, not yours.

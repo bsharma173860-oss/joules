@@ -718,7 +718,9 @@ class Window:
         try:
             return self._feed(texts, srcs, partial, keep_from)
         finally:
-            self.match_s += time.perf_counter() - t0
+            took = time.perf_counter() - t0
+            if took > 0.05:   # only a search slow in itself held things up (a plain word over much output never is)
+                self.match_s += took
 
     def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
@@ -908,7 +910,16 @@ class _Out:
             if not isinstance(fd, int):
                 return None
             mode = os.fstat(fd).st_mode
-            self.kind = "pipe" if stat.S_ISFIFO(mode) else "tty" if os.isatty(fd) else "file"   # (/dev/null: a file)
+            st = os.fstat(fd)
+            if stat.S_ISFIFO(mode):
+                self.kind = "pipe"
+            elif stat.S_ISSOCK(mode) and os.name == "posix":
+                import socket
+                self.kind, self.sock = "socket", socket.socket(fileno=os.dup(fd))
+            elif os.isatty(fd) or (stat.S_ISCHR(mode) and st.st_rdev != os.stat(os.devnull).st_rdev):
+                self.kind = "tty"    # a terminal, or a device that may stop part-way (written 4 KB at a time)
+            else:
+                self.kind = "file"   # (and /dev/null)
             return fd
         except (OSError, ValueError, AttributeError, io.UnsupportedOperation):
             return None
@@ -916,7 +927,7 @@ class _Out:
     def _piece(self, fd) -> int:
         """How much to write at once: 64 KB into an empty pipe (Linux), else 4 KB (PIPE_BUF) where a write may wait
         (a pipe, a terminal: Ctrl-S), and 64 KB where it does not (a file). (A terminal write stopped by Ctrl-S part
-        way is not atomic: there a hand-over (SIGTERM, Ctrl-C) may repeat up to 4 KB.)"""
+        way is not atomic: there a hand-over (SIGTERM, Ctrl-C) may repeat up to 4 KB; sockets are sent exactly.)"""
         if self.kind == "pipe":
             try:
                 import fcntl
@@ -929,8 +940,42 @@ class _Out:
                 return 4096
         return 4096 if self.kind == "tty" else 65536
 
+    def _send(self, chunk: bytes) -> bool:
+        """A socket: wait until it takes data, then send what it takes at once (never blocking part-way), under the
+        lock, so how far it got is always exact (a hand-over then repeats nothing)."""
+        import socket
+        while self.off < len(chunk):
+            self.write_t0 = self.write_t0 or time.monotonic()
+            try:
+                ready = select.select([], [self.sock], [], 0.1)[1]
+            except (OSError, ValueError):
+                return False
+            with self.cv:
+                if self.handed:
+                    return True
+                if not ready:
+                    continue
+                try:
+                    n = self.sock.send(chunk[self.off:self.off + 65536], socket.MSG_DONTWAIT)
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
+                except OSError as e:
+                    if e.errno == errno.EBADF:
+                        return False
+                    n = len(chunk) - self.off   # this chunk is lost, as the command's own would be
+                self.off += n
+            t1 = time.monotonic()
+            if t1 - self.write_t0 > 0.05:
+                self.last_block = t1
+            self.write_t0 = None
+        return True
+
     def _put(self, fd, chunk: bytes) -> bool:
         """Write one chunk in pieces, keeping how far it got. False if our own output is gone."""
+        if self.kind == "socket":
+            return self._send(chunk)
         while self.off < len(chunk):
             piece = chunk[self.off:self.off + self._piece(fd)]
             with self.cv:
@@ -957,7 +1002,7 @@ class _Out:
                     return True
         return True
 
-    cur, off, kind, inflight, taken_off = b"", 0, "file", 0, 0
+    cur, off, kind, inflight, taken_off, sock = b"", 0, "file", 0, 0, None
     write_t0 = None   # when the write under way started
     last_block = 0.0  # when a write last had to wait for the reader
 
@@ -1098,12 +1143,15 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
     out = out or _Out(dst)
     lines = _Lines()
     while not state["stop"].is_set():
+        held = win.__dict__.setdefault("paused_streams", set())   # (Windows reads each stream apart)
         while out.full() and not out.gone and not state["stop"].is_set():
             if win.pending() and getattr(out, "slow_reader", lambda: True)():
+                held.add(fd)
                 win.paused = True
             time.sleep(0.05)
-        if win.paused and out.size == 0:   # caught up (this stream; Windows reads each stream apart)
-            win.paused = False
+        if fd in held and out.size == 0:   # this stream caught up; paused while any other has not
+            held.discard(fd)
+            win.paused = bool(held)
         if out.gone:
             break
         try:
