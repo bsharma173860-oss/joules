@@ -42,15 +42,20 @@ class Window(unittest.TestCase):
         self.assertEqual(samples.parse_time("2026-11-22T14:03:07.250"), dt.datetime(2026, 11, 22, 14, 3, 7, 250000).timestamp())
         self.assertEqual(samples.parse_time("2026-11-22 14:03:07Z"), 1795356187.0)
         self.assertEqual(samples.parse_time("2026-11-22T14:03:07+01:00"), 1795356187.0 - 3600)
-        with self.assertRaises(ValueError):
-            samples.parse_time("yesterday")
+        self.assertEqual(samples.parse_time("2026-11-22 14:03:07,250+0000"), 1795356187.25)   # (Python logging, +HHMM)
+        self.assertEqual(samples.parse_time("2026-11-22T14:03:07.123456789Z"), 1795356187.123456)
+        self.assertEqual(samples.parse_time("2026-11-22T14:03:07.5Z"), 1795356187.5)
+        for bad in ("yesterday", "nan", "inf", "-1", "1795356187250"):   # (the last: milliseconds)
+            with self.assertRaises(ValueError):
+                samples.parse_time(bad)
 
     def test_reading_the_file(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         p = os.path.join(d, "s.csv")
-        Path(p).write_text("unix_time,device,energy_j,power_w\n2,G,10,5\n1,G,0,5\n3,G,")   # (cut off mid-line)
-        self.assertEqual(samples.read_samples(p), {"G": [(1.0, 0.0), (2.0, 10.0)]})
+        for cut in ("3,G,", "3,G,9", "3"):   # (cut off mid-line, even inside the energy)
+            Path(p).write_text("unix_time,device,energy_j,power_w\n2,G,10,5\n1,G,0,5\n" + cut)
+            self.assertEqual(samples.read_samples(p), {"G": [(1.0, 0.0), (2.0, 10.0)]})
         Path(p).write_text("unix_time,device,energy_j,power_w\n1,G,x,5\n2,G,1,5\n")
         with self.assertRaises(ValueError):
             samples.read_samples(p)
@@ -84,9 +89,10 @@ class Log(unittest.TestCase):
         log.write([m])
         log.close()
         rows = samples.read_samples(p)["GPU 0"]
-        self.assertEqual([round(t - log.wall0, 6) for t, _ in rows], [10.0, 11.0, 13.0])
+        t0 = rows[0][0]
+        self.assertEqual([round(t - t0, 2) for t, _ in rows], [0.0, 1.0, 3.0])
         self.assertEqual([e for _, e in rows], [0.0, 40.0, 120.0])
-        self.assertAlmostEqual(samples.window({"GPU 0": rows}, log.wall0 + 10.5, log.wall0 + 12.5)["totals"]["energy_j"], 80.0)
+        self.assertAlmostEqual(samples.window({"GPU 0": rows}, t0 + 0.5, t0 + 2.5)["totals"]["energy_j"], 80.0, delta=0.1)
         self.assertEqual(notes, [])
 
 
@@ -183,6 +189,33 @@ class EndToEnd(unittest.TestCase):
                                 "JOULES_TELEMETRY": "0", "JOULES_NVML_LIB": self.laptop, "FAKE_NVML_POWER_FILE": self.power})
         self.assertEqual(p.returncode, 2)
         self.assertIn("cannot write", p.stderr)
+
+    def test_a_failed_last_write_is_said(self):
+        if not os.path.exists("/dev/full"):
+            self.skipTest("no /dev/full")
+        p, run = self.run_j(self.laptop, "true")
+        self.assertFalse(run["notes"])
+        p = subprocess.run([sys.executable, "-m", "joules", "run", "--no-cpu", "--samples", "/dev/full", "--out",
+                            os.path.join(self.d, "run.json"), "--", "true"], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "HOME": self.d, "JOULES_NO_PROMPT": "1",
+                                "JOULES_TELEMETRY": "0", "JOULES_NVML_LIB": self.laptop, "FAKE_NVML_POWER_FILE": self.power})
+        self.assertIn("Could not write the samples to /dev/full", p.stderr)
+
+    def test_the_run_given_for_idle_is_checked(self):
+        p, run = self.run_j(self.laptop, self.STEP, "--subtract-idle", "0.3")
+        t1, t2 = self.times()
+        r = self.window("--start", t1, "--end", t2, "--run", os.path.join(self.d, "run.json"))
+        self.assertNotIn("notes", r)
+        other = dict(run, started_at="2020-01-01T00:00:00+00:00")
+        Path(self.d, "other.json").write_text(json.dumps(other))
+        r = self.window("--start", t1, "--end", t2, "--run", os.path.join(self.d, "other.json"))
+        self.assertTrue([n for n in r["notes"] if "not inside the run" in n], r)
+        Path(self.d, "bad.json").write_text("[1, 2]")
+        p = subprocess.run([sys.executable, "-m", "joules", "window", os.path.join(self.d, "s.csv"), "--start", t1,
+                            "--end", t2, "--run", os.path.join(self.d, "bad.json")], capture_output=True, text=True,
+                           timeout=60, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("is not the JSON of a joules run", p.stderr)
 
     def test_the_file_is_written_while_the_command_runs(self):
         script = "sleep 2.5; cp s.csv mid.csv; sleep 0.2"

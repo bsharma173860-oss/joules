@@ -390,6 +390,9 @@ def cmd_run(a) -> int:
     if a.samples:
         try:
             log = SampleLog(a.samples, d.notes)
+            if all(m.kind == "est" for m in d.meters):
+                d.notes.append(f"Nothing here can be read during the run (only the CPU-time estimate, known at the "
+                               f"end), so {a.samples} has no samples.")
         except OSError as e:
             print(f"joules run: cannot write {a.samples} ({e.strerror or e})", file=sys.stderr)
             d.close()
@@ -462,20 +465,30 @@ def cmd_window(a) -> int:
     try:
         start, end = parse_time(a.start), parse_time(a.end)
         samples = read_samples(a.file)
-        idle = None
+        idle, notes = None, []
         if a.run:
             with open(a.run, encoding="utf-8") as f:
                 run = json.load(f)
-            idle = {d["name"]: d["idle_w"] for d in run.get("devices", []) if "idle_w" in d}
+            try:
+                idle = {d["name"]: float(d["idle_w"]) for d in run["devices"] if "idle_w" in d}
+                t0 = dt.datetime.fromisoformat(run["started_at"]).timestamp()
+                if start < t0 - 1 or end > t0 + float(run["duration_s"]) + 1:
+                    notes.append(f"The window is not inside the run in {a.run}: are the samples from that run?")
+            except (KeyError, TypeError, ValueError, AttributeError):
+                raise ValueError(f"{a.run} is not the JSON of a joules run (joules run --out)") from None
+            if not idle:
+                notes.append("The run has no idle figures (it was not run with --subtract-idle), so no energy above idle.")
+            elif not set(idle) & set(samples):
+                notes.append(f"No device in the samples has an idle figure in {a.run}, so no energy above idle.")
         r = samples_window(samples, start, end, idle)
     except OSError as e:
         print(f"joules window: cannot read {e.filename} ({e.strerror or e})", file=sys.stderr)
         return 2
-    except (ValueError, KeyError) as e:   # (json.JSONDecodeError is a ValueError)
+    except ValueError as e:   # (json.JSONDecodeError is a ValueError)
         print(f"joules window: {e}", file=sys.stderr)
         return 2
-    if a.run and idle is not None and not idle:
-        r["notes"] = ["The run has no idle figures (it was not run with --subtract-idle), so no energy above idle."]
+    if notes:
+        r["notes"] = notes
     t = r["totals"]
     lines = [f"{bold('joules window')} · {fmt_s(r['duration_s'])} · "
              f"{dt.datetime.fromtimestamp(start).isoformat(timespec='milliseconds')} → "

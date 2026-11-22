@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import io
+import math
+import re
 import time
 
 from .meters import Meter, PowerMeter
@@ -21,7 +24,6 @@ class SampleLog:
         self.csv = csv.writer(self.f)
         self.csv.writerow(HEADER)
         self.path, self.notes = path, notes
-        self.wall0 = time.time() - time.monotonic()   # monotonic reading times -> unix time
         self.last: dict[str, tuple[float, float]] = {}
         self.flushed = time.monotonic()
 
@@ -38,34 +40,48 @@ class SampleLog:
                     continue
                 e = m.energy_j
                 w = m._w if isinstance(m, PowerMeter) else (e - prev[1]) / (t - prev[0]) if prev else ""
-                self.csv.writerow([f"{self.wall0 + t:.6f}", m.name, f"{e:.6f}", w if w == "" else f"{w:.3f}"])
+                wall = time.time() - (time.monotonic() - t)   # (now, not once: the wall clock may be stepped)
+                self.csv.writerow([f"{wall:.6f}", m.name, f"{e:.6f}", w if w == "" else f"{w:.3f}"])
                 self.last[m.name] = (t, e)
             if time.monotonic() - self.flushed >= 1.0:
                 self.f.flush()
                 self.flushed = time.monotonic()
         except OSError as e:
-            self.notes.append(f"Could not write the samples to {self.path} ({e.strerror or e}); they stop there.")
-            self.close()
+            self._failed(e)
+
+    def _failed(self, e: OSError) -> None:
+        self.notes.append(f"Could not write the samples to {self.path} ({e.strerror or e}); they stop there.")
+        self.close()
 
     def close(self) -> None:
         if self.f is not None:
             f, self.f = self.f, None
             try:
                 f.close()
-            except OSError:
-                pass
+            except OSError as e:   # (the last flush: closed all the same)
+                self.notes.append(f"Could not write the samples to {self.path} ({e.strerror or e}); the last second "
+                                  "or so of them is missing.")
 
 
 def parse_time(text: str) -> float:
     """Unix seconds, or an ISO date and time (no zone: local time)."""
     try:
-        return float(text)
+        t = float(text)
     except ValueError:
-        pass
-    s = text.strip().replace("Z", "+00:00").replace("z", "+00:00")
+        t = None
+    if t is not None:
+        if not math.isfinite(t) or t < 0:
+            raise ValueError(f"{text!r} is not a time")
+        if t > 1e11:
+            raise ValueError(f"{text!r} looks like milliseconds or finer: give unix seconds (e.g. {t / 1000:.3f})")
+        return t
+    # (as Python 3.11 reads them, on 3.9 too: a comma before the fraction, any number of its digits, +HHMM)
+    s = re.sub(r"[Zz]$", "+00:00", text.strip())
+    s = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", s)
+    s = re.sub(r"(:\d\d)[.,](\d+)", lambda m: m[1] + "." + (m[2] + "000000")[:6], s)
     try:
         return dt.datetime.fromisoformat(s).timestamp()   # (naive: local time)
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         raise ValueError(f"{text!r} is not a time: give unix seconds or an ISO date and time, "
                          "e.g. 2026-11-22T14:03:07.250 (local) or ...+00:00") from None
 
@@ -74,15 +90,18 @@ def read_samples(path: str) -> dict[str, list[tuple[float, float]]]:
     """Each device's (time, energy) rows, in time order."""
     out: dict[str, list[tuple[float, float]]] = {}
     with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.reader(f))
+        text = f.read()
+    if not text.endswith("\n"):   # (an unfinished last line: the run was cut off while writing it)
+        text = text[:text.rfind("\n") + 1]
+    rows = list(csv.reader(io.StringIO(text)))
     if not rows or rows[0] != HEADER:
         raise ValueError(f"{path} is not a joules samples file (its first line should be {','.join(HEADER)})")
     for n, row in enumerate(rows[1:], 2):
         try:
+            if len(row) != len(HEADER):
+                raise ValueError
             out.setdefault(row[1], []).append((float(row[0]), float(row[2])))
-        except (ValueError, IndexError):
-            if n == len(rows):   # (an unfinished last line: the run was cut off while writing it)
-                break
+        except ValueError:
             raise ValueError(f"{path} line {n} is not a sample: {','.join(row)}") from None
     for rows_ in out.values():
         rows_.sort()

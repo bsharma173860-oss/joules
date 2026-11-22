@@ -124,6 +124,8 @@ joules window run.csv --start 2026-11-22T14:03:07.250 --end 2026-11-22T14:09:41.
   refused. `--json` and `--out` work as for `joules run`.
 - The readings are `--interval` apart (0.1 s by default). A device with an energy counter is exact at each reading;
   one with only power readings is exact for power that holds steady between them.
+  On a Mac, powermetrics gives power in samples of about 0.2 s, so each end of a window can be off by
+  up to one sample.
 
 ## Comparing two ways of doing the same work
 
