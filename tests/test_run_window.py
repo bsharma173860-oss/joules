@@ -2060,6 +2060,53 @@ class RunWindow(unittest.TestCase):
         self.assertIsNone(out["window_s"])
         self.assertTrue([n for n in notes if "RuntimeError: boom" in n and "no window" in n], notes)
 
+    # ---- found in review round 38
+    def test_a_meter_that_failed_while_measuring_idle_is_read_by_marks_in_the_run(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import meters, sampler
+
+        class Flaky(meters.Meter):
+            kind, method, bad = "gpu", "test", True
+            def start(self, now):
+                if self.bad:
+                    raise OSError("no reading")
+                super().start(now)
+            def poll(self, now):
+                if self.bad:
+                    raise OSError("no reading")
+                self._t_last = now
+        m = Flaky("GPU 0")
+        idle = sampler.idle_baseline([m], 0.15, 0.05)
+        self.assertNotIn("GPU 0", idle)   # (no idle figure, not 0 W)
+        m.bad = False
+        with sampler.Sampler([m], 0.05):
+            self.assertFalse(m.joules_unstarted)   # (marks in the run read it, see PhaseClock.snapshot)
+
+    def test_idle_is_subtracted_only_over_what_a_late_started_meter_measured(self):
+        import argparse
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class M:
+            name, kind, method, energy_j, avg_w, peak_w, _t0 = "GPU 0", "gpu", "test", 60.0, 30.0, 30.0, 1.0
+
+        class D:
+            meters = [M()]
+        row = cli._devices(D(), {"GPU 0": 10.0}, 3.0, 0.0)[0]
+        self.assertAlmostEqual(row["above_idle_j"], 40.0)   # 60 J - 10 W x the 2 s it measured
+        w = cli.Window.__new__(cli.Window)
+        w.lock, w.frozen, w.first_out, w.ttys, w.behind = threading.Lock(), {"t": 3.0, "j": {"GPU 0": 60}}, {1: 0.0}, {}, False
+        w.begin = {"t": 0.0, "j": {"GPU 0": 0.0}, "line": "go", "src": 1}
+        w.end = {"t": 3.0, "j": {"GPU 0": 60.0}, "line": "stop", "src": 1}
+        w.alt_end, w.match_s = None, 0.0
+
+        class S:
+            t0, t1 = 0.0, 3.0
+        out = cli._window_report(argparse.Namespace(window_from="go", window_until="stop"), w, S(), [M()],
+                                 {"GPU 0": 10.0})[0]
+        self.assertAlmostEqual(out["window_above_idle_j"], 40.0)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)

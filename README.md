@@ -173,6 +173,8 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
 - **Laptop GPUs:** many have no energy counter. joules then samples their power, every 0.1 s by default
   (`--interval`; `joules doctor` says "power readings (no energy counter)"), so a window shorter than a few seconds
   is less exact. Leave `--subtract-idle` on for a laptop, where the idle draw is a large share.
+- **Macs (Apple silicon):** power comes from `powermetrics` in samples of about 0.2 s, each an average over the
+  time before it, so each end of a window can be off by up to one sample. Keep windows to many seconds there.
 
 ## Phases of your own program
 

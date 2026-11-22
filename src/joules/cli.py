@@ -403,16 +403,27 @@ def _setup(a) -> tuple[Discovery, dict]:
     if d.meters and a.subtract_idle > 0:
         print(dim(f"joules: measuring idle power for {a.subtract_idle:g} s…"), file=sys.stderr)
         idle = idle_baseline(d.meters, a.subtract_idle, a.interval)
+        for m in d.meters:
+            if m.name not in idle:
+                d.notes.append(f"{m.name}: no reading worked while measuring idle power, so it has no above-idle "
+                               "figure.")
     return d, idle
 
 
-def _devices(d: Discovery, idle: dict, duration: float) -> list[dict]:
+def _measured_from(m, t0: float) -> float:
+    """When the meter's energy starts: the run's start, or later if its first reading failed (see Sampler)."""
+    t = getattr(m, "_t0", None)
+    return t if isinstance(t, (int, float)) and t > t0 else t0
+
+
+def _devices(d: Discovery, idle: dict, duration: float, t0: float | None = None) -> list[dict]:
     out = []
     for m in d.meters:
         row = {"name": m.name, "kind": m.kind, "method": m.method, "energy_j": m.energy_j, "avg_w": m.avg_w, "peak_w": m.peak_w}
         if m.name in idle:
             row["idle_w"] = idle[m.name]
-            row["above_idle_j"] = max(0.0, m.energy_j - idle[m.name] * duration)
+            late = _measured_from(m, t0) - t0 if t0 is not None else 0.0   # (idle only over what it measured)
+            row["above_idle_j"] = max(0.0, m.energy_j - idle[m.name] * max(0.0, duration - late))
         h = m.health() if hasattr(m, "health") else None
         if h:
             row["gpu"] = h
@@ -637,7 +648,7 @@ def cmd_run(a) -> int:
             _stop_following(old_winch)
         if term and term.hit:   # a SIGTERM (SIGHUP) that came while nothing was left to hand over
             os.kill(os.getpid(), term.sig or signal.SIGTERM)
-    devices = _devices(d, idle, s.duration_s)
+    devices = _devices(d, idle, s.duration_s, s.t0)
     ops = a.flops or (training_flops(a.params, a.tokens) if a.params and a.tokens else None)
     report = {"schema": "joules/1", "tool": f"joules {__version__}", "kind": "run", "command": cmd, "exit_code": code,
               "started_at": started, "duration_s": s.duration_s, "simulated": d.simulated, "host": _host(),
@@ -2039,8 +2050,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     info.update(from_line=begin.get("line"), until_line=end.get("line"),
                 starts_at_s=round(begin["t"] - s.t0, 3), ends_at_s=round(end["t"] - s.t0, 3), devices_j=per)
     out = {"window": info, "window_s": secs, "window_energy_j": sum(per.values())}
-    if idle:   # above idle, per device as for the whole run
-        out["window_above_idle_j"] = sum(max(0.0, j - idle[n] * secs) if n in idle else j for n, j in per.items())
+    if idle:   # above idle, per device as for the whole run (idle only over the part the meter measured)
+        span = {m.name: max(0.0, end["t"] - max(begin["t"], _measured_from(m, s.t0))) for m in meters}
+        out["window_above_idle_j"] = sum(max(0.0, j - idle[n] * span[n]) if n in idle else j for n, j in per.items())
     return out, notes
 
 

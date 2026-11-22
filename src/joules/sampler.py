@@ -22,6 +22,7 @@ class Sampler:
         self.t0 = time.monotonic()
         self._unstarted: list[Meter] = []
         for m in self.meters:
+            m.joules_unstarted = False   # (fresh for this run: a meter that failed in the idle baseline may work now)
             try:
                 m.start(self.t0)
             except (OSError, ValueError):
@@ -80,4 +81,5 @@ def idle_baseline(meters: list[Meter], seconds: float, interval: float = 0.1) ->
         return {}
     with Sampler(meters, interval):
         time.sleep(seconds)
-    return {m.name: m.avg_w for m in meters}
+    # (a meter no reading of which worked has no idle figure: 0 W would count all its energy as above idle)
+    return {m.name: m.avg_w for m in meters if not getattr(m, "joules_unstarted", False)}
