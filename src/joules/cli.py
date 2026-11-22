@@ -545,7 +545,9 @@ def cmd_run(a) -> int:
                 win.ttys = {fd: _isatty(dst) for fd, dst, _ in proc.joules_streams}
                 win.untouched = getattr(proc, "joules_untouched", [])
                 outs = {fd: _Out(dst) for fd, dst, _ in proc.joules_streams}   # written on by their own threads
-                pump_state = {"stop": threading.Event(), "exited": threading.Event(), "caught_up": threading.Event()}
+                pump_state = {"stop": threading.Event(), "exited": threading.Event(), "caught_up": threading.Event(),
+                              "fds": [fd for fd, _, _ in proc.joules_streams], "owed": {}, "blocked": {},
+                              "wlock": threading.Lock()}
                 if os.name == "posix":
                     pumps = [threading.Thread(target=_pump_all, args=(proc.joules_streams, win, pump_state, outs), daemon=True)]
                     old_winch = _follow_resizes(proc)
@@ -576,10 +578,7 @@ def cmd_run(a) -> int:
                 pump_state["exited"].set()
                 if os.name != "posix":   # (POSIX: the reader notes it)
                     win.behind = any(o.full() for o in outs.values())
-                    owed = {fd: _peek_pipe(fd) for fd, _, _ in proc.joules_streams if pump_state.get(fd) != "done"}
-                    pump_state["owed"] = owed   # what waits in the pipes now: once read, later lines came after
-                    if all(v <= 0 for v in owed.values()):
-                        win.caught_up = True
+                    _win_caught_up(pump_state, win)   # (each reader looks at its own pipe: see _pump)
     finally:
         d.close()
     if windowed:   # measuring stopped when the command exited, as without a window; now the rest of its output
@@ -709,6 +708,7 @@ class Window:
         self.end_re = re.compile(_searchable(end_re)) if end_re is not None else None
         self.match_s = 0.0    # time spent matching beyond a plain search (it holds up the rest of joules)
         self._cpu = self._budget = 0.0
+        self.match_by = {}    # the same, per pattern
         global _GROUP
         if _GROUP is None:
             _GROUP = max(0.001, 10 * _cpu_step())
@@ -771,6 +771,7 @@ class Window:
 
     def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
              eof: bool = False) -> bool:
+        key = "--from" if self.begin is None else "--until"   # (the pattern being searched for)
         t0 = time.thread_time()   # this thread's own CPU time: a busy machine does not count
         try:
             return self._feed(texts, srcs, partial, keep_from, eof)
@@ -784,7 +785,9 @@ class Window:
                 self._cpu += time.thread_time() - t0
                 self._budget += 0.0002 + n / 50e6
                 if self._cpu >= self.group or self._budget >= self.group:
-                    self.match_s += max(0.0, self._cpu - self._budget)
+                    extra = max(0.0, self._cpu - self._budget)
+                    self.match_s += extra
+                    self.match_by[key] = self.match_by.get(key, 0.0) + extra
                     self._cpu = self._budget = 0.0
 
     def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
@@ -1106,6 +1109,19 @@ class _Out:
                 self.cv.notify_all()
 
 
+def _win_caught_up(state: dict, win) -> None:
+    """Windows, after the exit: is all the command wrote before exiting read? Each stream is done, has read what
+    waited in its pipe at its first look after the exit, or is still in a read begun before the exit (nothing came)."""
+    exited, wl = state.get("exited"), state.get("wlock")
+    if wl is None or not exited.is_set():
+        return
+    with wl:
+        ok = all(state.get(fd) == "done" or state["owed"].get(fd, 1) <= 0
+                 or (fd not in state["owed"] and state["blocked"].get(fd)) for fd in state["fds"])
+    if ok:
+        win.caught_up = True
+
+
 def _peek_pipe(fd: int) -> int:
     """Windows: bytes waiting in a pipe (PeekNamedPipe), 0 if that cannot be told."""
     try:
@@ -1121,9 +1137,11 @@ def _peek_pipe(fd: int) -> int:
 
 
 def _readable(fd: int, timeout: float) -> bool:
-    try:
-        return bool(select.select([fd], [], [], timeout)[0])
-    except (OSError, ValueError):   # (fd numbers past select's limit: say yes, and let the other rules decide)
+    try:   # (poll: no limit on fd numbers)
+        p = select.poll()
+        p.register(fd, select.POLLIN)
+        return bool(p.poll(int(timeout * 1000)))
+    except (OSError, ValueError, AttributeError):
         return True
 
 
@@ -1257,10 +1275,21 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
             win.paused = bool(held)
         if out.gone:
             break
+        exited, wl = state.get("exited"), state.get("wlock")
+        if wl is not None:   # after the exit: what waits in our pipe now (we are the only one reading it) comes first
+            with wl:
+                if exited.is_set() and fd not in state["owed"]:
+                    state["owed"][fd] = _peek_pipe(fd)
+                state["blocked"][fd] = not exited.is_set()   # (a read begun before the exit)
+            _win_caught_up(state, win)
         try:
             chunk = os.read(fd, 65536)
         except OSError:
             break
+        finally:
+            if wl is not None:
+                with wl:
+                    state["blocked"][fd] = False
         if not chunk:
             break
         win.first_out.setdefault(fd, time.monotonic())
@@ -1269,18 +1298,14 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
             if text is not None:
                 win.feed([text], [fd])
         out.put(chunk)
-        owed = state.get("owed")   # (set at the exit: what was then waiting in the pipes)
-        if owed is not None and fd in owed:
-            owed[fd] -= len(chunk)
-            if all(v <= 0 for v in list(owed.values())):
-                win.caught_up = True
+        if wl is not None:
+            with wl:
+                if fd in state["owed"]:
+                    state["owed"][fd] -= len(chunk)
     lines.end(win, fd)
-    owed = state.get("owed")
-    if owed is not None and fd in owed:   # (a stream that ended has nothing more waiting)
-        owed[fd] = 0
-        if all(v <= 0 for v in list(owed.values())):
-            win.caught_up = True
     state[fd] = "done"
+    if state.get("wlock") is not None:
+        _win_caught_up(state, win)
     held = win.__dict__.get("paused_streams")
     if held is not None and fd in held:   # (a stream that ended is not behind)
         held.discard(fd)
@@ -1569,13 +1594,18 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         alt = getattr(w, "alt_end", None) if end is None else None
         found_end = end
     if getattr(w, "match_s", 0.0) >= 1.0:
-        line_by_line = [n for n, rx in (("--from", getattr(w, "start_re", None)), ("--until", getattr(w, "end_re", None)))
-                        if rx is not None and getattr(w, "pre", {}).get(rx, 0) is None]
-        advice = (f"{' and '.join(line_by_line)} has a lookaround, \\A/\\Z, a possessive or atomic part or a scoped flag, "
-                  "which makes joules search it line by line: drop that if you can (a plain word is fastest)."
-                  if line_by_line else
-                  "Use a simpler pattern: no leading repeat like \\w* or [^ ]+, no nested repeats (a plain word is "
-                  "fastest).")
+        by = getattr(w, "match_by", None) or {}
+        given = [k for k, rx in (("--from", getattr(w, "start_re", None)), ("--until", getattr(w, "end_re", None))) if rx]
+        slow_ones = [k for k in given if by.get(k, 0.0) >= 0.25 * w.match_s] or given or ["--from/--until"]
+        tips = []
+        for k in slow_ones:
+            rx = {"--from": getattr(w, "start_re", None), "--until": getattr(w, "end_re", None)}.get(k)
+            if rx is not None and getattr(w, "pre", {}).get(rx, 0) is None:
+                tips.append(f"{k} has a lookaround, \\A/\\Z, a possessive or atomic part or a scoped flag, which makes "
+                            "joules search it line by line: drop that if you can.")
+            else:
+                tips.append(f"Make {k} simpler: no leading repeat like \\w* or [^ ]+, no nested repeats.")
+        advice = " ".join(tips) + " (A plain word is fastest.)"
         notes.append(f"Matching --from/--until took {w.match_s:.1f} s of joules' time, which held up the command's "
                      "output (and the command, once its pipe was full), so the run (and any window) may be off. "
                      + advice)

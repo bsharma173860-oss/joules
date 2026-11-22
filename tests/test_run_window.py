@@ -611,8 +611,8 @@ class RunWindow(unittest.TestCase):
         p, r = self.run_j(["--no-cpu", "--from", ">>> running", "--until", ">>> done"], [exe], stderr=err)
         err.close()
         self.assertTrue(any("only read when" in n for n in r["notes"]), r["notes"])  # the log line was on stderr
-        p, r = self.run_j(["--no-cpu", "--from", "go", "--until", "end"], ["sh", "-c", "echo go; echo end"])
-        self.assertEqual([n for n in r["notes"] if "10 ms" in n or "only read" in n], [])   # too short to matter
+        # (a run too short to matter gets no note: LateNote.test_a_very_short_run_gets_no_note; run end to end its
+        # length depends on how fast the machine starts the command, so it is not checked here)
 
     def test_a_sigterm_to_joules_alone_leaves_the_command_running(self):
         """As without a window: joules ends, the command carries on and its output still arrives."""
@@ -1488,10 +1488,11 @@ class RunWindow(unittest.TestCase):
             notes = cli._window_report(argparse.Namespace(window_from=pattern, window_until=None), w, S(), [], {})[1]
             self.assertTrue([n for n in notes if says in n], (pattern, notes))
 
-    def test_windows_says_a_marker_came_after_the_exit(self):
-        """Windows: what waits in the pipes at the exit (PeekNamedPipe there) is read first; a --from line after that
-        came from a process left running. Simulated with a pipe here."""
+    def _win_reader(self, before, at_exit, after, slow=0.0):
+        """Windows' reader (_pump) on a pipe, PeekNamedPipe stood in for by FIONREAD: write `before`, let the reader
+        start on it, write `at_exit`, record the exit (as cmd_run does), then write `after`. Returns the --from mark."""
         import threading
+        from unittest import mock
         sys.path.insert(0, str(ROOT / "src"))
         from joules import cli
 
@@ -1503,19 +1504,85 @@ class RunWindow(unittest.TestCase):
             def full(self): return False
             def put(self, c): pass
         w = cli.Window(Clock(), 0.0, [], "START", None)
-        w.freeze({"t": 1.0, "j": {}})
+        if slow:
+            real = w._feed
+            w._feed = lambda *a, **k: (time.sleep(slow), real(*a, **k))[1]
         r, wr = os.pipe()
-        os.write(wr, b"held line\n")
-        state = {"stop": threading.Event(), "owed": {r: 10}}
-        t = threading.Thread(target=cli._pump, args=(r, None, w, state, None, Out()), daemon=True)
-        t.start()
-        time.sleep(0.3)
-        os.write(wr, b"START\n")
-        time.sleep(0.3)
-        os.close(wr)
-        t.join(5)
+        state = {"stop": threading.Event(), "exited": threading.Event(), "fds": [r], "owed": {}, "blocked": {},
+                 "wlock": threading.Lock()}
+        with mock.patch.object(cli, "_peek_pipe", cli._pending):
+            t = threading.Thread(target=cli._pump, args=(r, None, w, state, None, Out()), daemon=True)
+            t.start()
+            if before:
+                os.write(wr, before)
+            time.sleep(0.1)
+            if at_exit:
+                os.write(wr, at_exit)
+            w.freeze({"t": 1.0, "j": {}})
+            state["exited"].set()
+            cli._win_caught_up(state, w)
+            time.sleep(0.2)
+            if after:
+                os.write(wr, after)
+            time.sleep(0.3 + 2 * slow)
+            os.close(wr)
+            t.join(5)
         os.close(r)
-        self.assertTrue(w.begin and w.begin["after_exit"], w.begin)
+        return w.begin
+
+    def test_windows_says_a_marker_came_after_the_exit(self):
+        """Windows: what waits in the pipe at the exit is read first; a --from line after that came from a process
+        left running. Simulated with a pipe here."""
+        b = self._win_reader(b"held line\n", b"", b"START\n")
+        self.assertTrue(b and b["after_exit"], b)
+
+    def test_windows_does_not_take_a_line_written_before_the_exit_for_one_after_it(self):
+        """The reader is still busy with a chunk read before the exit when the exit comes; START was written
+        before the exit too."""
+        b = self._win_reader(b"x" * 10000 + b"\n", b"START\n", b"", slow=0.3)
+        self.assertTrue(b and not b["after_exit"], b)
+
+    # ---- found in review round 23
+    def test_slow_matching_advice_names_the_pattern_that_was_slow(self):
+        import argparse
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+
+        class S:
+            t0, t1 = 0.0, 4.0
+        w = cli.Window(Clock(), 0.0, [], "(?<!x)START", "(a+)+b")
+        w.feed(["START"], [1])
+        for _ in range(6):
+            w.feed(["a" * 20], [1])
+        w.freeze({"t": 4.0, "j": {}})
+        notes = cli._window_report(argparse.Namespace(window_from="(?<!x)START", window_until="(a+)+b"), w, S(), [], {})[1]
+        slow = [n for n in notes if "Matching" in n]
+        if slow:   # (on a very fast machine it may stay under 1 s)
+            self.assertIn("Make --until simpler", slow[0])
+            self.assertNotIn("--from has a lookaround", slow[0])
+        self.assertGreater(w.match_by.get("--until", 0), w.match_by.get("--from", 0))
+
+    def test_the_quiet_check_works_on_high_fd_numbers(self):
+        import resource
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 2100:
+            self.skipTest("cannot open that many files here")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 2100), hard))
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        r, w = os.pipe()
+        high = os.dup2(r, 2000)
+        try:
+            self.assertFalse(cli._readable(high, 0.005))   # nothing there
+            os.write(w, b"x")
+            self.assertTrue(cli._readable(high, 0.005))
+        finally:
+            for f in (r, w, high):
+                os.close(f)
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
