@@ -575,15 +575,16 @@ def cmd_run(a) -> int:
                         break
                     except KeyboardInterrupt:
                         continue
+                if os.name != "posix":   # (recorded before the exit is flagged: readers look at it then)
+                    with pump_state["wlock"]:
+                        pump_state["reads_at_exit"] = dict(pump_state["reads"])
+                        pump_state["exit_t"] = time.monotonic()
                 pump_state["exited"].set()
                 if pump_state.get("wake"):
                     with contextlib.suppress(OSError):
                         os.write(pump_state["wake"][1], b"x")
                 if os.name != "posix":   # (POSIX: the reader notes it)
                     win.behind = any(o.full() for o in outs.values())
-                    with pump_state["wlock"]:
-                        pump_state["reads_at_exit"] = dict(pump_state["reads"])
-                        pump_state["exit_t"] = time.monotonic()
                     # (each reader looks at its own pipe, see _pump; a reader still in its read after 50 ms got nothing)
                     threading.Timer(0.06, _win_caught_up, (pump_state, win)).start()
     finally:
@@ -1139,6 +1140,8 @@ def _win_caught_up(state: dict, win) -> None:
     if wl is None or not exited.is_set():
         return
     with wl:
+        if "exit_t" not in state:   # (the exit is being recorded)
+            return
         settled = time.monotonic() - state.get("exit_t", 0.0) >= 0.05
         at_exit, reads = state.get("reads_at_exit", {}), state.get("reads", {})
         ok = all(state.get(fd) == "done" or state["owed"].get(fd, 1) <= 0

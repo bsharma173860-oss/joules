@@ -1611,6 +1611,25 @@ class RunWindow(unittest.TestCase):
         shown = self._on_own_terminal(["--from", "^GO", "--", "bash", "-c", "(sleep 0.45; echo GO) & sleep 0.3; echo hi"])
         self.assertIn(b"printed after the command exited", shown)
 
+    # ---- found in review round 25
+    def test_windows_caught_up_waits_for_the_exit_to_be_recorded(self):
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class W:
+            caught_up = False
+        state = {"exited": threading.Event(), "wlock": threading.Lock(), "fds": [5], "owed": {}, "blocked": {5: True},
+                 "reads": {}}
+        state["exited"].set()        # flagged, but the exit time and read counts not stored yet
+        w = W()
+        cli._win_caught_up(state, w)
+        self.assertFalse(w.caught_up)
+        with state["wlock"]:
+            state["reads_at_exit"], state["exit_t"] = {}, time.monotonic() - 0.1
+        cli._win_caught_up(state, w)
+        self.assertTrue(w.caught_up)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
