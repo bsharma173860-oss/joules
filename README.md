@@ -129,7 +129,8 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
 
 - **What is reported:** joules reports the whole run and the window between the two lines. The JSON adds
   `window_s`, `window_energy_j` and `window_above_idle_j` (the last with `--subtract-idle`), plus a `window` object
-  with the lines that matched.
+  with the lines that matched. The other figures (facility with `--pue`, cost, CO₂, and those from `--flops`,
+  `--params` and `--tokens`) are for the whole run.
 - **Matching:** the first `--from` line opens the window, and the first `--until` line after it closes it.
   - If `--until` never appears, the window runs to the end.
   - If `--from` never appears, joules says so and you get the whole run.
@@ -152,8 +153,8 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     stretch the measured run; joules says so if matching took over a second. In a line longer than 1 MB, joules
     keeps only its last 64 KB (and 256 bytes before that), so a match longer than that, or one that needs to look
     further back, may be missed.
-  - Measuring stops when the script exits. A server it leaves running does not keep joules waiting, and on Linux
-    and macOS it keeps its output after joules finishes.
+  - Measuring stops when the script exits. A server it leaves running keeps joules waiting only about 2 s more
+    (longer if what reads joules' output is slow), and on Linux and macOS it keeps its output after joules finishes.
   - The CPU-time estimate (used where there are no energy counters) is only known for the whole run, so it is not
     in the window.
   - If the marker lines only arrive as the script exits, or the window is under 10 ms (both markers arrived

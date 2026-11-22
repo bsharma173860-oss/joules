@@ -961,6 +961,8 @@ class Window:
 
     def pending(self) -> bool:
         """Is a mark still to be found? Once not, output is passed on without looking at it."""
+        if getattr(self, "failed", None):
+            return False
         return self.begin is None or (self.end is None and self.end_re is not None)
 
     def freeze(self, snap: dict) -> None:
@@ -1024,7 +1026,12 @@ class Window:
              eof: bool = False) -> bool:
         sec = {}   # this call's own CPU time per pattern searched (a busy machine does not count; Windows feeds
         try:       # from two threads at once, so it is not kept on the window)
+            if getattr(self, "failed", None):
+                return False
             return self._feed(texts, srcs, partial, keep_from, eof, sec)
+        except Exception as e:   # (never let looking for the window stop the command's output being passed on)
+            self.failed = f"{type(e).__name__}: {e}"
+            return False
         finally:
             # only what goes beyond a plain search of this much text counts (a plain word never adds up, however
             # much output; a slow pattern does, in big reads or small, e.g. 4 KB from a terminal)
@@ -1952,6 +1959,11 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
                      "first is not known; with no later --until line, joules took it as the end.")
     info = {"from": a.window_from, "until": a.window_until,
             "found_from": begin is not None and a.window_from is not None, "found_until": end is not None}
+    if getattr(w, "failed", None):
+        notes.append(f"joules stopped looking for the window's lines after an error of its own ({w.failed}), so "
+                     "there is no window: the figures above are the whole run. The command's output was passed on.")
+        info = {"from": a.window_from, "until": a.window_until, "found_from": False, "found_until": False}
+        return {"window": info, "window_s": None, "window_energy_j": None}, notes
     cut = getattr(w, "cut_short", False)
     # (a process the command left running kept its output open: joules read all written until it stopped reading)
     left_open = not cut and getattr(w, "left_open", False)
@@ -2038,15 +2050,6 @@ def render_run(r: dict) -> str:
     lines = [head, *_device_lines(r["devices"]), dim("  " + "─" * 58)]
     lines.append(f"  {bold('total')}  {bold(fmt_j(t['devices_j']))} = {fmt_wh(t['devices_j'])}"
                  + (f"   {dim('above idle')} {fmt_j(t['above_idle_j'])}" if "above_idle_j" in t else ""))
-    if r.get("window_energy_j") is not None:
-        w = r["window"]
-        span = f"{w['starts_at_s']:.1f}–{w['ends_at_s']:.1f} s"
-        lines.append(f"  {bold('window')} {bold(fmt_j(r['window_energy_j']))} over {fmt_s(r['window_s'])} ({span} into the run)"
-                     + (f"   {dim('above idle')} {fmt_j(r['window_above_idle_j'])}" if "window_above_idle_j" in r else ""))
-        def label(found, line, none):
-            return (line or "(an empty line)") if found else none
-        lines.append(dim(f"    from: {label(w['found_from'], w['from_line'], 'the start')}")
-                     + dim(f"   until: {label(w['found_until'], w['until_line'], 'the end')}"))
     if t["pue"] != 1.0:
         lines.append(f"  facility (PUE {t['pue']:g})  {fmt_j(t['facility_j'])} = {fmt_wh(t['facility_j'])}")
     lines.append(f"  cost {_money(t['cost']['amount'])} at {t['cost']['price_per_kwh']:g}/kWh · CO₂ {fmt_g(t['co2']['grams'])} g at {t['co2']['g_per_kwh']:g} g/kWh")
@@ -2062,6 +2065,17 @@ def render_run(r: dict) -> str:
         draw_s = "%.0f%% of rated power" % c["avg_draw_pct"]
         lines.append(f"  your hardware ran at {good(mfu_s)} and {good(draw_s)}")
         lines.append(f"  open in the calculator with these numbers: {accent(r['calculator_link'])}")
+    # (last: every figure above it is for the whole run)
+    if r.get("window_energy_j") is not None:
+        w = r["window"]
+        span = f"{w['starts_at_s']:.1f}–{w['ends_at_s']:.1f} s"
+        lines.append(f"  {bold('window')} {bold(fmt_j(r['window_energy_j']))} over {fmt_s(r['window_s'])} ({span} into the run)"
+                     + (f"   {dim('above idle')} {fmt_j(r['window_above_idle_j'])}" if "window_above_idle_j" in r else "")
+                     + f"   {dim('(the figures above are the whole run)')}")
+        def label(found, line, none):
+            return (line or "(an empty line)") if found else none
+        lines.append(dim(f"    from: {label(w['found_from'], w['from_line'], 'the start')}")
+                     + dim(f"   until: {label(w['found_until'], w['until_line'], 'the end')}"))
     for n in r["notes"]:
         lines.append(warn("  ! " + n))
     return "\n".join(lines)

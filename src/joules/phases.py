@@ -59,6 +59,8 @@ class PhaseClock:
         with self.lock:
             now = time.monotonic()
             for m in self.meters:
+                if getattr(m, "joules_unstarted", False):   # its first reading failed: not started yet (still 0 J)
+                    continue
                 try:
                     m.poll(now)
                 except (OSError, ValueError):

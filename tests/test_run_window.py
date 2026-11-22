@@ -2023,6 +2023,43 @@ class RunWindow(unittest.TestCase):
         notes = cli._window_report(argparse.Namespace(window_from="S", window_until="E"), w, S(), [M()], {})[1]
         self.assertTrue([n for n in notes if "left running" in n], notes)
 
+    # ---- found in review round 37
+    def test_a_first_reading_that_fails_loses_no_output_and_keeps_the_window(self):
+        """The meter is retried 0.1 s later; a mark read before that must not break the reader (output lost, the
+        command stuck on a full pipe) or the report."""
+        env = {"FAKE_NVML_FAIL_EVERY": "2"}
+        out = os.path.join(self.d, "r.json")
+        p = subprocess.run([sys.executable, "-m", "joules", "run", "--out", out, "--from", "go", "--until", "stop", "--",
+                            "bash", "-c", "echo go; seq 1 200000; echo stop; sleep 0.3; echo last-line"],
+                           capture_output=True, timeout=60, env={**self.env(JOULES_NVML_LIB=self.laptop), **env})
+        self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+        self.assertEqual(p.stdout.count(b"\n"), 200003)
+        self.assertTrue(p.stdout.endswith(b"stop\nlast-line\n"))
+        self.assertNotIn(b"Traceback", p.stderr)
+        r = json.loads(Path(out).read_text())
+        self.assertTrue(r["window"]["found_from"] and r["window"]["found_until"], r["window"])
+        p = subprocess.run([sys.executable, "-m", "joules", "run", "--out", out, "--until", "x", "--", "true"],
+                           capture_output=True, timeout=60, env={**self.env(JOULES_NVML_LIB=self.laptop), **env})
+        self.assertNotIn(b"Traceback", p.stderr)
+        self.assertTrue(os.path.exists(out))
+
+    def test_an_error_while_looking_for_the_window_never_stops_the_output(self):
+        import argparse
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): raise RuntimeError("boom")
+        w = cli.Window(Clock(), 0.0, [], "START", "END")
+        self.assertFalse(w.feed(["START"], [1]))
+        self.assertFalse(w.pending())   # (output is passed on without looking at it)
+
+        class S:
+            t0, t1 = 0.0, 4.0
+        out, notes = cli._window_report(argparse.Namespace(window_from="START", window_until="END"), w, S(), [], {})
+        self.assertIsNone(out["window_s"])
+        self.assertTrue([n for n in notes if "RuntimeError: boom" in n and "no window" in n], notes)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
@@ -2039,7 +2076,7 @@ class RunWindow(unittest.TestCase):
         env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "HOME": self.d, "JOULES_NO_PROMPT": "1", "JOULES_TELEMETRY": "0",
                "JOULES_NVML_LIB": self.laptop, "FAKE_NVML_POWER_FILE": self.power, "NO_COLOR": "1"}
         p = subprocess.run([sys.executable, "-m", "joules", "doctor", "--offline"], capture_output=True, text=True, env=env, timeout=60)
-        self.assertIn("power readings (no energy counter): sampled every 0.1 s", p.stdout + p.stderr)
+        self.assertIn("power readings (no energy counter): sampled, every 0.1 s by default", p.stdout + p.stderr)
 
 
 class LateNote(unittest.TestCase):

@@ -26,6 +26,7 @@ class Sampler:
                 m.start(self.t0)
             except (OSError, ValueError):
                 self._unstarted.append(m)  # retried on every poll until a reading works
+                m.joules_unstarted = True  # (a PhaseClock reading the meters between polls skips it until then)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
@@ -39,6 +40,7 @@ class Sampler:
                         if m in self._unstarted:
                             m.start(now)
                             self._unstarted.remove(m)
+                            m.joules_unstarted = False
                             self._note(f"{m.name}: the first reading failed, so its energy is measured from "
                                        f"{now - self.t0:.1f} s into the run.")
                         else:
