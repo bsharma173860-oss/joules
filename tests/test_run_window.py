@@ -1843,6 +1843,63 @@ class RunWindow(unittest.TestCase):
             lines.end(w, 1)
             self.assertIsNone(w.end, cut)
 
+    # ---- found in review round 33
+    def test_lines_with_a_rare_word_are_found_without_scanning_every_line(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        import random
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "^=+ DONE ={20}$", None)
+        block = ("=" * 80 + "\n") * 800 + "==================== DONE ===\n"   # ~65 KB, the word on one line
+        t0 = time.process_time()
+        for _ in range(300):              # ~19 MB
+            self.assertFalse(w.feed([block], [1]))
+        self.assertLess(time.process_time() - t0, 1.5)
+        self.assertTrue(w.feed(["x\n" + "=" * 3 + " DONE " + "=" * 20 + "\n"], [1]))
+        r = random.Random(7)   # the two ways of finding the lines agree
+        for _ in range(3000):
+            hay = "".join(r.choice(["a", "b", "ab", "\n", "\n", "x"]) for _ in range(r.randint(0, 40)))
+            words = r.choice([["ab"], ["a"], ["b", "ab"], ["x"]])
+            want = [list(m.span()) for m in cli._runs_with(words).finditer(hay)]
+            self.assertEqual([list(s) for s in cli._word_runs(hay, words, cli._runs_with(words))], want, (hay, words))
+
+    def test_a_title_code_after_cr_is_one_line_end_however_reads_split(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        for data in (b"START\r\x1b]0;my title\x07\nwork\n", b"START\r\x1b]0;t\x1b\\\nwork\n"):
+            for cut in range(1, len(data)):
+                w = cli.Window(Clock(), 0.0, [], "START", "^$")
+                lines = cli._Lines()
+                for part in (data[:cut], data[cut:]):
+                    t = lines.add(part, w, 1)
+                    if t is not None:
+                        w.feed([t], [1])
+                lines.end(w, 1)
+                self.assertTrue(w.begin, (data, cut))
+                self.assertIsNone(w.end, (data, cut))
+
+    def test_a_skipped_long_line_ending_in_cr_codes_nl_ends_once(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "START", "^$")
+        lines = cli._Lines()
+        data = b"START " + b"x" * (2 << 20) + b"\r\x1b[K\n" + b"work\nmore\n"
+        for i in range(0, len(data), 65536):
+            t = lines.add(data[i:i + 65536], w, 1)
+            if t is not None and w.pending():
+                w.feed([t], [1])
+        lines.end(w, 1)
+        self.assertTrue(w.begin)
+        self.assertIsNone(w.end)   # (no empty line: the long line ended once)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)

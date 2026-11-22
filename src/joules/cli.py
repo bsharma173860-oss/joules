@@ -683,6 +683,30 @@ def _escape_start(b: bytes) -> bool:
     return not rest or (rest[:1] == b"\x1b" and len(rest) < 64 and b"\n" not in rest and b"\r" not in rest)
 
 
+def _word_runs(hay: str, words, runs) -> list:
+    """The runs of whole lines of hay that have one of words, as (start, end) offsets in order. A word on many
+    lines: one regex over the block (runs). A rarer one: from each place it is found (cost by occurrences)."""
+    found = sum(hay.count(w) for w in words)
+    if found * 4 > hay.count("\n") + 1:
+        return [m.span() for m in runs.finditer(hay)]
+    lines = {}
+    for w in words:
+        p = hay.find(w)
+        while p >= 0:
+            a = hay.rfind("\n", 0, p) + 1
+            b = hay.find("\n", p)
+            b = len(hay) if b < 0 else b + 1
+            lines[a] = b
+            p = hay.find(w, b)
+    spans = []
+    for a in sorted(lines):
+        if spans and spans[-1][1] >= a:
+            spans[-1][1] = max(spans[-1][1], lines[a])
+        else:
+            spans.append([a, lines[a]])
+    return spans
+
+
 def _runs_with(words):
     """A pattern for runs of whole lines that each have one of words (as plain text): one match per run, in C."""
     alt = "|".join(re.escape(w) for w in words)
@@ -844,7 +868,8 @@ def _searchable(pattern: str) -> str:
     return "." * need + rest
 
 
-_ANSI_B = re.compile(rb"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b[@-Z\\-_])*")
+_ANSI_B = re.compile(rb"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b[@-OQ-WYZ\\])*")
+# (two-byte escapes: not ] P X ^ _, which start longer strings: an unfinished one is not taken for a whole one)
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b[@-Z\\-_]")  # colours, moves, titles, charsets
 
 
@@ -945,8 +970,10 @@ class Window:
             if not any(w in hay for w in words):
                 return None
             # (where the lines with a word are: in the text itself, unless folding may have moved them)
-            runs = getattr(self, "runs", {}).get(rx) or _runs_with(words)
-            spans = [m.span() for m in runs.finditer(hay)] if not fold or text.isascii() else None
+            if not fold or text.isascii():
+                spans = _word_runs(hay, words, getattr(self, "runs", {}).get(rx) or _runs_with(words))
+            else:
+                spans = None
         block = getattr(self, "block", {}).get(rx) if spans is not None and text else None
         done = 0   # (lines before this offset: searched with nothing, or without the word)
         if block is not None:
@@ -1111,8 +1138,10 @@ class _Lines:
             if k < 0:
                 self.buf, self.ctx = b"", 0
                 return None
-            if data[k:k + 2] == b"\r\n":
-                k += 1
+            if data[k:k + 1] == b"\r":   # (\r\n, also with escape codes between them, is one line end)
+                e = _ANSI_B.match(data, k + 1).end()
+                if data[e:e + 1] == b"\n":
+                    k = e
             self.cr = data[k:k + 1] == b"\r" and _escape_start(data[k + 1:])
             data, self.skip, ctx = data[k + 1:], False, 0
         i = max(data.rfind(b"\n"), data.rfind(b"\r"))
