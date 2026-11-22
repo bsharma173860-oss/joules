@@ -8,6 +8,7 @@ import json
 import shlex
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -779,6 +780,89 @@ class RunWindow(unittest.TestCase):
                            capture_output=True, env=self.env(), timeout=120)
         self.assertEqual(int(q.stdout.split()[0]), 6 + 25_000_000 + 4)
         self.assertIn("fell more than 16 MB behind", Path(err).read_text())
+
+    # ---- found in review round 10
+    def test_a_sigterm_with_a_stuck_reader_repeats_nothing_after_odd_sized_writes(self):
+        """Odd-sized writes leave a pipe's pages part-filled: still nothing may be passed on twice."""
+        code = ("import os, time\nos.write(1, b'a' * 2999 + b'\\n'); time.sleep(0.2)\nos.write(1, b'b' * 6999 + b'\\n')\n"
+                "time.sleep(0.2)\nos.write(1, b''.join(b'line %07d\\n' % i for i in range(20000)))\n")
+        late = "import sys, time\ntime.sleep(4)\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n"
+        out = os.path.join(self.d, "out")
+        with open(out, "wb") as f:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "line", "--", sys.executable,
+                                  "-c", code], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env())
+            rd = subprocess.Popen([sys.executable, "-c", late], stdin=q.stdout, stdout=f)
+            q.stdout.close()
+            time.sleep(1.5)
+            q.terminate()
+            self.assertEqual(q.wait(timeout=20), -15)
+            rd.wait(timeout=30)
+        want = b"a" * 2999 + b"\n" + b"b" * 6999 + b"\n" + b"".join(b"line %07d\n" % i for i in range(20000))
+        self.assertEqual(Path(out).read_bytes(), want)
+
+    def test_take_does_not_wait_out_its_timeout(self):
+        import threading
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        r, w = os.pipe()
+        try:
+            out = cli._Out(os.fdopen(w, "wb", closefd=False))
+            out.put(b"x" * 300_000)   # more than the pipe holds: the writer gets stuck
+            time.sleep(0.3)
+            t0 = time.monotonic()
+            rest = out.take()
+            self.assertLess(time.monotonic() - t0, 0.4)
+            got = b""
+            while len(got) < 300_000 - len(rest):
+                got += os.read(r, 65536)
+            self.assertEqual(len(got) + len(rest), 300_000)   # nothing lost, nothing twice
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_one_ctrl_c_after_the_exit_loses_no_output(self):
+        """A pager that ignores Ctrl-C (like less) reads late; one Ctrl-C to joules must not drop what it holds."""
+        code = "import sys\nfor i in range(30000): print('line %07d' % i + 'x' * 80)\n"
+        late = ("import signal, sys, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(4)\n"
+                "sys.stdout.buffer.write(sys.stdin.buffer.read())\n")
+        out, err = os.path.join(self.d, "out"), os.path.join(self.d, "err")
+        with open(out, "wb") as f, open(err, "wb") as e:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "line", "--", sys.executable,
+                                  "-c", code], stdout=subprocess.PIPE, stderr=e, env=self.env())
+            rd = subprocess.Popen([sys.executable, "-c", late], stdin=q.stdout, stdout=f)
+            q.stdout.close()
+            time.sleep(2)
+            q.send_signal(signal.SIGINT)
+            q.wait(timeout=20)
+            rd.wait(timeout=30)
+        self.assertEqual(Path(out).read_text().count("\n"), 30000)
+        self.assertIn("window", Path(err).read_text())
+
+    def test_many_ctrl_cs_at_the_exit_still_give_the_report(self):
+        code = ("import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nprint('A')\n"
+                "[print('l' * 100) for i in range(2000)]\ntime.sleep(0.5)\n")
+        for trial in range(6):
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "A", "--", sys.executable, "-c",
+                                  code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env())
+            time.sleep(0.4 + trial * 0.05)
+            while q.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    q.send_signal(signal.SIGINT)
+                time.sleep(0.003)
+            o, e = q.communicate()
+            self.assertNotIn(b"Traceback", e, e[-800:])
+            self.assertEqual(o.count(b"l" * 100), 2000)
+            self.assertIn(b"window", e)
+
+    def test_an_ignored_sigterm_stays_ignored(self):
+        q = subprocess.Popen(["bash", "-c", f"trap '' TERM; exec {shlex.quote(sys.executable)} -m joules run --no-cpu --from=A -- "
+                              "sh -c 'echo A; sleep 2; echo B'"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env())
+        time.sleep(1)
+        q.terminate()
+        o, e = q.communicate(timeout=20)
+        self.assertEqual(q.returncode, 0)
+        self.assertIn(b"B", o)
+        self.assertIn(b"window", e)
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""

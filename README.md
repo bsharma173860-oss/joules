@@ -150,7 +150,9 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     together), joules notes that the output may have been held back. It cannot always tell, so a window of almost
     no time is the sign to look for.
   - A slow reader of joules' output (a pager, a slow pipe) does not move the window: joules keeps reading the
-    script's output on time, holding up to 16 MB of it for the reader.
+    script's output on time, holding up to 16 MB of it for the reader (and says so if it falls further behind).
+  - The script writes to joules, not to your file, so if your disk fills up the script does not see the error;
+    the output that did not fit is lost, as it would be anyway.
   - Not for full-screen terminal programs (htop, nvtop): they set up joules' terminal, not yours.
   - On Windows stdout and stderr are always read separately (unless both go to the same file), so on a console
     their order can change and a marker pair split between them can be missed; put both markers on one stream.

@@ -538,7 +538,12 @@ def cmd_run(a) -> int:
                     terminated = True
                     break
             if windowed and not terminated:
-                win.freeze(clock.snapshot())   # the run ends here; marks read from now on are its end
+                while True:
+                    try:
+                        win.freeze(clock.snapshot())   # the run ends here; marks read from now on are its end
+                        break
+                    except KeyboardInterrupt:
+                        continue
                 pump_state["exited"].set()
     finally:
         d.close()
@@ -553,12 +558,18 @@ def cmd_run(a) -> int:
                 with (term.raising() if term else contextlib.nullcontext()):
                     for o in outs.values():
                         o.thread.join()
-            except KeyboardInterrupt:
-                pass
+            except KeyboardInterrupt:   # stop waiting for a slow reader: a helper passes on the rest
+                left = [(dst, outs[fd].take()) for fd, dst, _ in proc.joules_streams]
+                if any(pre for _, pre in left) and os.name == "posix":
+                    for dst, pre in left:
+                        if pre:
+                            _hand_off(None, dst, pre)
+                    d.notes.append("joules stopped waiting for what reads its output (Ctrl-C); a small helper passes "
+                                   "on the rest of the command's output after joules finishes.")
         except _Terminated:
             _end_on_term(proc, pumps, pump_state, outs)
         if term:
-            term.restore()
+            term.restore(ctrl_c=False)
         if os.name == "posix":
             _stop_following(old_winch)
         if term and term.hit:   # a SIGTERM that came while nothing was left to hand over
@@ -604,6 +615,8 @@ def cmd_run(a) -> int:
             state.update(params=a.params, tokens=a.tokens)
         report["calculator_link"] = calculator_link(state)
     _emit(a, report, render_run(report))
+    if windowed and term:
+        term.restore()
     if a.track:
         _track(a, report)  # a tracking problem is reported but never changes the command's exit code
     _website_hint(a, cmd)
@@ -793,7 +806,7 @@ class _Out:
         with self.cv:
             self.handed = True
             self.cv.notify_all()
-            self.cv.wait_for(lambda: not self.writing, 0.5)
+            self.cv.wait_for(lambda: not self.writing, 0.1)   # (a write to a reader that reads ends at once)
             data = b"" if self.gone else self.cur[self.off:] + b"".join(self.q)
             self.q.clear()
             self.size, self.cur = 0, b""
@@ -812,15 +825,17 @@ class _Out:
             return None
 
     def _piece(self, fd) -> int:
-        """How much to write at once: what a pipe has room for (Linux), else 4 KB (PIPE_BUF) where a write may wait
-        (a pipe, a terminal: Ctrl-S), and 64 KB where it does not (a file)."""
+        """How much to write at once: 64 KB into an empty pipe (Linux), else 4 KB (PIPE_BUF) where a write may wait
+        (a pipe, a terminal: Ctrl-S), and 64 KB where it does not (a file). (A terminal write stopped by Ctrl-S part
+        way is not atomic: there a SIGTERM may repeat up to 4 KB.)"""
         if self.kind == "pipe":
             try:
                 import fcntl
                 import termios
                 n = array.array("i", [0])
                 fcntl.ioctl(fd, termios.FIONREAD, n, True)
-                return max(4096, min(65536, fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ) - n[0]))
+                # an empty pipe takes 64 KB at once; otherwise its room is in part-filled pages, so 4 KB (atomic)
+                return 65536 if n[0] == 0 and fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ) >= 65536 else 4096
             except (ImportError, OSError, AttributeError, ValueError):
                 return 4096
         return 4096 if self.kind == "tty" else 65536
@@ -860,6 +875,7 @@ class _Out:
             ok = self._put(fd, chunk) if fd is not None else _write(self.dst, chunk)
             with self.cv:
                 self.writing = False
+                self.cv.notify_all()
                 if self.handed:
                     return
                 self.cur, self.off = b"", 0
@@ -1010,17 +1026,27 @@ class _TermGuard:
 
     def __init__(self):
         self.hit = self.armed = False
-        self.old = None
+        self.old = self.old_int = None
 
     def install(self) -> None:
-        if threading.current_thread() is threading.main_thread():
-            with contextlib.suppress(ValueError, OSError):
+        if threading.current_thread() is not threading.main_thread():
+            return
+        with contextlib.suppress(ValueError, OSError):
+            if signal.getsignal(signal.SIGTERM) is not signal.SIG_IGN:   # (an ignored SIGTERM stays ignored)
                 self.old = signal.signal(signal.SIGTERM, self._on)
+            if signal.getsignal(signal.SIGINT) is signal.default_int_handler:   # Ctrl-C too only lands where we wait
+                self.old_int = signal.signal(signal.SIGINT, self._on_int)
 
     def _on(self, *_):
         self.hit = True
         if self.armed:
+            self.armed = False
             raise _Terminated
+
+    def _on_int(self, *_):
+        if self.armed:
+            self.armed = False
+            raise KeyboardInterrupt
 
     @contextlib.contextmanager
     def raising(self):
@@ -1032,11 +1058,15 @@ class _TermGuard:
         finally:
             self.armed = False
 
-    def restore(self) -> None:
-        if self.old is not None:
-            with contextlib.suppress(ValueError, OSError):
-                signal.signal(signal.SIGTERM, self.old)
-            self.old = None
+    def restore(self, ctrl_c: bool = True) -> None:
+        """Put the handlers back (Ctrl-C only once the report is out, if ctrl_c is False now)."""
+        for sig, old in ((signal.SIGTERM, self.old), (signal.SIGINT, self.old_int if ctrl_c else None)):
+            if old is not None:
+                with contextlib.suppress(ValueError, OSError):
+                    signal.signal(sig, old)
+        self.old = None
+        if ctrl_c:
+            self.old_int = None
 
 
 def _hung_up(fd: int) -> bool:
