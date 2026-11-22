@@ -20,11 +20,14 @@
 from __future__ import annotations
 
 import argparse
+import array
 import codecs
 import collections
 import contextlib
 import datetime as dt
+import errno
 import functools
+import io
 import json
 import os
 import platform
@@ -34,6 +37,7 @@ import selectors
 import shlex
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -625,6 +629,7 @@ class Window:
         self.first_out = {}   # when the command's first output was read, per stream
         self.ttys = {}        # which streams are terminals
         self.behind = False   # was output still waiting for a slow reader on our side when the command exited?
+        self.paused = False   # did joules stop reading for a slow reader while a mark was still to come?
         # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
         self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?", rx.pattern) else re.compile(rx.pattern, rx.flags | re.M))
                     for rx in (self.start_re, self.end_re) if rx}
@@ -689,19 +694,27 @@ class _Lines:
 
     def __init__(self):
         self.buf, self.skip = b"", False
+        self.cr = False   # the last line ended with \r at the very end of a read: a \n next belongs to it
 
     def add(self, chunk: bytes, win: "Window", src=None) -> str | None:
         data = self.buf + chunk
+        if self.cr and not self.buf and data[:1] == b"\n":   # \r\n split between two reads is one line end
+            data = data[1:]
+        self.cr = False
         if self.skip:
             k = min((x for x in (data.find(b"\n"), data.find(b"\r")) if x >= 0), default=-1)
             if k < 0:
                 self.buf = b""
                 return None
+            if data[k:k + 2] == b"\r\n":
+                k += 1
+            self.cr = data[k:k + 1] == b"\r" and k == len(data) - 1
             data, self.skip = data[k + 1:], False
         i = max(data.rfind(b"\n"), data.rfind(b"\r"))
         done = None
         if i >= 0:
             j = i - 1 if data[i:i + 1] == b"\n" and data[i - 1:i] == b"\r" else i   # \r\n is one line end
+            self.cr = data[i:i + 1] == b"\r" and i == len(data) - 1
             done, data = data[:j].decode("utf-8", "replace"), data[i + 1:]
         if len(data) > 1 << 20:
             if done is not None:
@@ -734,8 +747,10 @@ def _write(dst, chunk: bytes) -> bool:
         else:
             dst.write(chunk.decode("utf-8", "replace")); dst.flush()
         return True
-    except (OSError, ValueError, AttributeError):
+    except (BrokenPipeError, ValueError, AttributeError):
         return False
+    except OSError as e:   # a full disk and the like: this chunk is lost (as the command's own write would fail)
+        return e.errno != errno.EBADF
 
 
 class _Out:
@@ -772,17 +787,68 @@ class _Out:
             self.cv.notify_all()
 
     def take(self) -> bytes:
-        """Stop writing (after the write under way) and return what is still waiting."""
+        """Stop writing and return what is still waiting, with the unwritten rest of the chunk under way: its writer
+        may be stuck (a paused pager), so joules hands that over rather than wait for it. A piece that may have to wait
+        is at most PIPE_BUF bytes, which a pipe or terminal takes all at once or not at all (see _piece)."""
         with self.cv:
             self.handed = True
             self.cv.notify_all()
-            self.cv.wait_for(lambda: not self.writing)
-            data = b"" if self.gone else b"".join(self.q)
+            self.cv.wait_for(lambda: not self.writing, 0.5)
+            data = b"" if self.gone else self.cur[self.off:] + b"".join(self.q)
             self.q.clear()
-            self.size = 0
+            self.size, self.cur = 0, b""
             return data
 
+    def _fd(self):
+        try:
+            fd = self.dst.fileno()
+            self.dst.flush()   # (anything joules itself wrote first)
+            if not isinstance(fd, int):
+                return None
+            mode = os.fstat(fd).st_mode
+            self.kind = "pipe" if stat.S_ISFIFO(mode) else "tty" if os.isatty(fd) or stat.S_ISCHR(mode) else "file"
+            return fd
+        except (OSError, ValueError, AttributeError, io.UnsupportedOperation):
+            return None
+
+    def _piece(self, fd) -> int:
+        """How much to write at once: what a pipe has room for (Linux), else 4 KB (PIPE_BUF) where a write may wait
+        (a pipe, a terminal: Ctrl-S), and 64 KB where it does not (a file)."""
+        if self.kind == "pipe":
+            try:
+                import fcntl
+                import termios
+                n = array.array("i", [0])
+                fcntl.ioctl(fd, termios.FIONREAD, n, True)
+                return max(4096, min(65536, fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ) - n[0]))
+            except (ImportError, OSError, AttributeError, ValueError):
+                return 4096
+        return 4096 if self.kind == "tty" else 65536
+
+    def _put(self, fd, chunk: bytes) -> bool:
+        """Write one chunk in pieces, keeping how far it got. False if our own output is gone."""
+        while self.off < len(chunk):
+            try:
+                n = os.write(fd, chunk[self.off:self.off + self._piece(fd)])
+            except BlockingIOError:   # (someone made our terminal non-blocking)
+                time.sleep(0.01)
+                continue
+            except BrokenPipeError:
+                return False
+            except OSError as e:
+                if e.errno == errno.EBADF:
+                    return False
+                n = len(chunk) - self.off   # a full disk and the like: this chunk is lost, as the command's own would be
+            with self.cv:
+                self.off += n
+                if self.handed:
+                    return True
+        return True
+
+    cur, off, kind = b"", 0, "file"
+
     def _run(self) -> None:
+        fd = self._fd()
         while True:
             with self.cv:
                 while not self.q and not self.closed and not self.handed:
@@ -790,10 +856,13 @@ class _Out:
                 if self.handed or not self.q:
                     return
                 chunk = self.q.popleft()
-                self.writing = True
-            ok = _write(self.dst, chunk)
+                self.cur, self.off, self.writing = chunk, 0, True
+            ok = self._put(fd, chunk) if fd is not None else _write(self.dst, chunk)
             with self.cv:
                 self.writing = False
+                if self.handed:
+                    return
+                self.cur, self.off = b"", 0
                 self.size -= len(chunk)
                 if not ok:
                     self.gone, self.size = True, 0
@@ -852,6 +921,8 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                 elif not room and fd in watched:
                     sel.unregister(fd)
                     watched.discard(fd)
+                    if win.pending():
+                        win.paused = True
             if not open_:
                 break
             if owed is None and state["exited"].is_set():   # what the command wrote before it exited
@@ -1160,7 +1231,7 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     tiny = a.window_from is not None and info["found_until"] and end["t"] - begin["t"] < 0.01   # no benchmark is that short
     at_exit = tiny and begin["t"] >= exit_t - 0.1
     if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny):
-        if getattr(w, "behind", False):
+        if getattr(w, "behind", False) or getattr(w, "paused", False):
             notes.append("The marker lines were only read when the command exited, so the window may be wrong: what "
                          "reads joules' output (a pager, a slow pipe) took it so slowly that joules fell behind.")
         elif begin.get("late") or (at_exit and nothing_before):
@@ -1172,6 +1243,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
             notes.append("The window is under 10 ms, so its marker lines probably arrived together: if the command "
                          "held its output (a C program writing into a file or pipe does), the window is wrong. Run it "
                          "with `stdbuf -oL` (Linux).")
+    if getattr(w, "paused", False) and not any("fell behind" in n for n in notes):
+        notes.append("What reads joules' output (a pager, a slow pipe) fell more than 16 MB behind before the window's "
+                     "markers, so joules paused reading the command's output and the window may be off.")
     live = [m for m in meters if m.kind != "est"]   # the CPU-time estimate is only known once the command has ended
     if len(live) < len(meters):
         notes.append("The CPU-time estimate is only known for the whole run, so it is not in the window.")

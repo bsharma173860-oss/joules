@@ -241,7 +241,7 @@ class RunWindow(unittest.TestCase):
     # ---- found in review round 2
     def run_j(self, args, cmd, lib=None, timeout=60, **kw):
         out = os.path.join(self.d, "r.json")
-        streams = {"stdout": subprocess.PIPE, "stderr": kw.pop("stderr", subprocess.PIPE)}
+        streams = {"stdout": kw.pop("stdout", subprocess.PIPE), "stderr": kw.pop("stderr", subprocess.PIPE)}
         p = subprocess.run([sys.executable, "-m", "joules", "run", "--out", out, *args, "--", *cmd], **streams,
                            env=self.env(JOULES_NVML_LIB=lib or self.laptop), timeout=timeout, **kw)
         return p, (json.loads(Path(out).read_text()) if os.path.exists(out) else None)
@@ -736,6 +736,49 @@ class RunWindow(unittest.TestCase):
     def test_an_empty_marker_line_is_named_as_such(self):
         p, r = self.run_j(["--no-cpu", "--from", "^$", "--until", "x"], ["sh", "-c", "echo; sleep 0.3; echo x"])
         self.assertIn("from: (an empty line)", p.stdout.decode() + p.stderr.decode())
+
+    # ---- found in review round 9
+    def test_a_sigterm_with_a_stuck_reader_ends_joules_and_loses_nothing(self):
+        """A paused pager on joules' output: SIGTERM still ends joules at once, and once the reader reads again it
+        gets every byte, once."""
+        big = "import sys; sys.stdout.write(''.join('line %06d\\n' % i for i in range(30000)))"
+        late = "import sys, time\ntime.sleep(4)\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n"
+        out = os.path.join(self.d, "out")
+        with open(out, "wb") as f:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "line", "--", sys.executable,
+                                  "-c", big], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env())
+            rd = subprocess.Popen([sys.executable, "-c", late], stdin=q.stdout, stdout=f)
+            q.stdout.close()
+            time.sleep(1.5)
+            t0 = time.monotonic()
+            q.terminate()
+            self.assertEqual(q.wait(timeout=20), -15)
+            self.assertLess(time.monotonic() - t0, 2.5)
+            rd.wait(timeout=30)
+        self.assertEqual(Path(out).read_text(), "".join("line %06d\n" % i for i in range(30000)))
+
+    def test_a_full_disk_does_not_kill_the_command(self):
+        if not os.path.exists("/dev/full"):
+            self.skipTest("no /dev/full here")
+        with open("/dev/full", "wb") as full:
+            p, r = self.run_j(["--no-cpu", "--from", "a"], ["bash", "-c", "echo a; sleep 0.3; echo b; echo 'still running' >&2"],
+                              stdout=full)
+        self.assertIn(b"still running", p.stderr)
+        self.assertEqual(r["exit_code"], 0)
+
+    def test_crlf_split_between_reads_is_one_line_end(self):
+        p, r = self.run_j(["--no-cpu", "--from", "START", "--until", "^$"],
+                          ["bash", "-c", "printf 'START\\r'; sleep 0.3; printf '\\nwork\\r\\n'; sleep 1; printf '\\r\\n'; sleep 0.2"])
+        self.assertTrue(1.1 < r["window_s"] < 1.6, r["window_s"])
+
+    def test_falling_more_than_16_mb_behind_is_noted(self):
+        code = "import sys\nprint('START', flush=True)\nsys.stdout.write(('x' * 99 + '\\n') * 250000)\nprint('END')\n"
+        err = os.path.join(self.d, "err")
+        q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu --from ^START --until END -- "
+                           f"{shlex.quote(sys.executable)} -c {shlex.quote(code)} 2>{err} | (sleep 3; wc -c)", shell=True,
+                           capture_output=True, env=self.env(), timeout=120)
+        self.assertEqual(int(q.stdout.split()[0]), 6 + 25_000_000 + 4)
+        self.assertIn("fell more than 16 MB behind", Path(err).read_text())
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
