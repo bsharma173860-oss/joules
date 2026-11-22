@@ -1180,7 +1180,7 @@ class RunWindow(unittest.TestCase):
             w.feed([block], [1])
         self.assertLess(w.match_s, 0.5)
         w2 = cli.Window(Clock(), 0.0, [], "a*START", "END")
-        w2.feed([("a" * 30000 + "\n") * 3], [1])   # slow in itself
+        w2.feed(["a" * 30000 + " START"], [1])   # slow in itself (a*START drops nothing here: it is not .*)
         self.assertGreater(w2.match_s, 0.0)
 
     def test_a_socket_output_hand_over_repeats_nothing(self):
@@ -1269,10 +1269,10 @@ class RunWindow(unittest.TestCase):
 
         class Clock:
             def snapshot(self): return {"t": 1.0, "j": {}}
-        w = cli.Window(Clock(), 0.0, [], "START", r"\w*DONE")
+        w = cli.Window(Clock(), 0.0, [], "START", r"\w*\dDONE")
         w.begin = {"t": 0.0, "j": {}, "line": "START"}
         for _ in range(30):
-            w.feed(["a" * 5000], [1])
+            w.feed(["a" * 5000 + " DONE"], [1])   # (it has the word, so the pattern runs, slowly, and fails)
         self.assertGreater(w.match_s, 0.2)
 
     def test_a_socket_output_on_a_high_fd_number(self):
@@ -1339,24 +1339,11 @@ class RunWindow(unittest.TestCase):
 
         class Clock:
             def snapshot(self): return {"t": 1.0, "j": {}}
-        w = cli.Window(Clock(), 0.0, [], r"\w+X", None)
-        block = ("a" * 399 + "\n") * 10   # 4 KB, as a terminal gives
-        for _ in range(300):
+        w = cli.Window(Clock(), 0.0, [], r"(x+x+)+y", None)
+        block = ("x" * 14 + " y\n") * 240   # ~4 KB, as a terminal gives; each line has the y, so the pattern runs
+        for _ in range(20):
             w.feed([block], [1])
         self.assertGreater(w.match_s, 0.2)
-
-    def test_flags_keep_the_quick_pre_search(self):
-        sys.path.insert(0, str(ROOT / "src"))
-        from joules import cli
-
-        class Clock:
-            def snapshot(self): return {"t": 1.0, "j": {}}
-        for pattern, quick in (("(?i)never", True), ("(?:a|b)c", True), ("(?P<x>a)", True), ("(?<!x)foo", False),
-                               ("foo(?=x)", False), (r"\Afoo", False), ("(?i)never(?!x)", False)):
-            w = cli.Window(Clock(), 0.0, [], pattern, None)
-            self.assertEqual(w.pre[w.start_re] is not None, quick, pattern)
-        w = cli.Window(Clock(), 0.0, [], "(?i)NEVER", None)
-        self.assertTrue(w.feed(["x\nsay never\ny"], [1]))   # and it still finds the line
 
     def test_held_output_on_a_terminal_is_not_called_a_process_left_running(self):
         """A pseudo-terminal reports only part of what waits in it: what the command wrote before exiting must not
@@ -1445,10 +1432,10 @@ class RunWindow(unittest.TestCase):
 
         class Clock:
             def snapshot(self): return {"t": 1.0, "j": {}}
-        w = cli.Window(Clock(), 0.0, [], "(a|aa)*c", None)
+        w = cli.Window(Clock(), 0.0, [], "(a|aa)+c", None)
         for i in range(15000):
-            w.feed(["tik %d" % i], [1])
-        w.feed(["a" * 28], [1])   # ~0.2 s or more of backtracking
+            w.feed(["tik %d c" % i], [1])       # (cheap: each has the c, and fails at once)
+        w.feed(["a" * 28 + " c"], [1])   # ~0.1 s or more of backtracking
         self.assertGreater(w.match_s, 0.1)
 
     def test_a_marker_after_the_exit_on_a_terminal_kept_busy_by_a_process(self):
@@ -1481,7 +1468,7 @@ class RunWindow(unittest.TestCase):
 
         class S:
             t0, t1 = 0.0, 4.0
-        for pattern, says in (("(?<!x)NEVER", "line by line"), (r"\w*NEVER", "no leading repeat")):
+        for pattern, says in (("[0-9]+", "no plain text"), (r"\w*NEVER", "no leading repeat")):
             w = cli.Window(Clock(), 0.0, [], pattern, None)
             w.match_s = 2.0
             w.freeze({"t": 4.0, "j": {}})
@@ -1725,52 +1712,31 @@ class RunWindow(unittest.TestCase):
         self.assertLess(w.match_s, 0.5)
 
     # ---- found in review round 29
-    def test_a_pattern_gone_line_by_line_for_being_slow_gets_the_repeat_advice(self):
-        import argparse
+    def test_the_text_every_match_must_contain(self):
+        """Read from the parsed pattern; the pattern itself then only runs on single lines that have it."""
+        import re as re_
         sys.path.insert(0, str(ROOT / "src"))
         from joules import cli
-
-        class Clock:
-            def snapshot(self): return {"t": 1.0, "j": {}}
-
-        class S:
-            t0, t1 = 0.0, 4.0
-        w = cli.Window(Clock(), 0.0, [], "B|(x+x+)+y", None)
-        w.slow_piece = 0.0   # (any piece counts as slow: it goes line by line)
-        w.feed(["x" * 10 + "\n" + "x" * 10], [1])
-        self.assertIsNone(w.pre[w.start_re])
-        w.match_s, w.match_by = 2.0, {"--from": 2.0}
-        w.freeze({"t": 4.0, "j": {}})
-        notes = cli._window_report(argparse.Namespace(window_from="B|(x+x+)+y", window_until=None), w, S(), [], {})[1]
-        slow = [n for n in notes if "Matching" in n]
-        self.assertTrue(slow and "Make --from simpler" in slow[0] and "lookaround" not in slow[0], notes)
-
-    def test_lines_the_quick_search_found_empty_are_not_searched_again(self):
-        sys.path.insert(0, str(ROOT / "src"))
-        from joules import cli
+        for pattern, want in (("START", (["START"], False)), (r"(\w+\s?)+X", (["X"], False)),
+                              (r"^(\w+\s?)+done$", (["done"], False)), ("(?i)never", (["never"], True)),
+                              ("a|bc", (["a", "bc"], False)), ("a|.*", None), ("(ab)?cd", (["cd"], False)),
+                              ("(?i:x)y", (["y"], False)), (r">>> done\.", ([">>> done."], False)),
+                              ("x{0}y", (["y"], False)), ("[0-9]+", None)):
+            self.assertEqual(cli._must_contain(re_.compile(pattern)), want, pattern)
 
         class Clock:
             def snapshot(self): return {"t": 1.0, "j": {}}
         w = cli.Window(Clock(), 0.0, [], "needle", None)
-        w.slow_piece = 0.0
-        lines = w._lines("aaa\nbbb\nccc\n", w.start_re)
-        self.assertEqual(lines[:3], [None, None, None])
+        self.assertEqual(w._lines("aaa\na needle\nccc", w.start_re), [None, "a needle", None])
+        self.assertIsNone(w._lines("aaa\nbbb", w.start_re))
+        self.assertTrue(cli.Window(Clock(), 0.0, [], "(?i)NEVER", None).feed(["x\nsay never\ny"], [1]))
 
-    def test_a_coarse_cpu_clock_does_not_switch_a_plain_word_to_line_by_line(self):
-        from unittest import mock
-        sys.path.insert(0, str(ROOT / "src"))
-        from joules import cli
-        real = time.thread_time
-
-        class Clock:
-            def snapshot(self): return {"t": 1.0, "j": {}}
-        w = cli.Window(Clock(), 0.0, [], "NEVERSEEN", None)
-        w.slow_piece, w.group = 2 * 0.015625, 10 * 0.015625   # (what Windows' 15.6 ms CPU clock step gives)
-        block = ("x" * 79 + "\n") * 820
-        with mock.patch.object(cli.time, "thread_time", lambda: (real() // 0.015625) * 0.015625):
-            for _ in range(3000):
-                w.feed([block], [1])
-        self.assertIsNotNone(w.pre[w.start_re])
+    def test_a_pattern_fast_line_by_line_is_fast_over_many_lines(self):
+        """Patterns that can match a line end (\\s, [^...]) with a nested repeat are only ever run on one line."""
+        p, r = self.run_j(["--no-cpu", "--from", "START", "--until", r"(\w+\s?)+X"],
+                          ["bash", "-c", "echo START; for i in $(seq 20); do echo 'ab cd ef gh ij kl mn'; done; echo done"],
+                          timeout=30)
+        self.assertLess(r["duration_s"], 2.0)
 
     def test_a_hand_over_with_output_still_unread_says_joules_stopped_looking(self):
         """A slow reader on joules' output, the --until line printed but not yet read when Ctrl-C hands over."""

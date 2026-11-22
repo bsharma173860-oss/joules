@@ -674,6 +674,59 @@ def cmd_run(a) -> int:
     return code
 
 
+def _must_contain(rx):
+    """(words, fold): one of `words` is in every string rx matches (`fold`: compare in lower case), or None if no
+    such plain text can be told. Read from the parsed pattern: literal runs that every match passes through."""
+    try:
+        try:
+            from re import _parser as sp, _constants as sc   # (Python 3.11+)
+        except ImportError:
+            import sre_parse as sp
+            import sre_constants as sc
+        tree = sp.parse(rx.pattern, rx.flags)
+    except Exception:   # (an unusual pattern: no shortcut, every line is searched)
+        return None
+    reps = {sc.MAX_REPEAT, sc.MIN_REPEAT, getattr(sc, "POSSESSIVE_REPEAT", None)} - {None}
+    atomic = getattr(sc, "ATOMIC_GROUP", None)
+    fold = bool(rx.flags & re.IGNORECASE)
+
+    def best(items) -> str:   # the longest literal run every match of this sequence contains
+        top, cur = "", ""
+        for op, av in items:
+            if op is sc.LITERAL:
+                cur += chr(av)
+                continue
+            top, cur = max(top, cur, key=len), ""
+            sub = ""
+            if op is sc.SUBPATTERN:
+                if av[1] or av[2]:   # (scoped flags: case may change inside; no shortcut there)
+                    continue
+                sub = best(av[-1])
+            elif op in reps and av[0] >= 1:
+                sub = best(av[2])
+            elif atomic is not None and op is atomic:
+                sub = best(av)
+            top = max(top, sub, key=len)
+        return max(top, cur, key=len)
+    items = list(tree)
+    if len(items) == 1 and items[0][0] is sc.BRANCH:   # a|b|c: one of the branches' words
+        words = [best(b) for b in items[0][1][1]]
+        if not all(words):
+            return None
+    else:
+        w = best(items)
+        if not w:
+            return None
+        words = [w]
+    if fold:
+        if not all(w.isascii() for w in words):   # (case folding beyond ASCII: no shortcut)
+            return None
+        words = [w.lower() for w in words]
+    if any("\n" in w for w in words):   # (cannot be on one line: let the search say so)
+        return None
+    return words, fold
+
+
 def _cpu_step() -> float:
     """How finely this thread's CPU clock moves (Linux: well under a microsecond; Windows: 15.6 ms)."""
     t0 = time.thread_time()
@@ -728,7 +781,6 @@ class Window:
             _STEP = _cpu_step()
             _GROUP = max(0.001, 10 * _STEP)
         self.group = _GROUP
-        self.slow_piece = max(0.005, 2 * _STEP)   # a quick-search piece slower than this: go line by line
         self.lock = threading.Lock()
         self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
         self.end = None
@@ -738,14 +790,9 @@ class Window:
         self.behind = False   # was output still waiting for a slow reader on our side when the command exited?
         self.paused = False   # did joules stop reading for a slow reader while a mark was still to come?
         self.alt_end = None   # an --until line that arrived with the --from line on another stream (order unknown)
-        # a quick search over several lines at once, multi-line so ^ and $ match at each line (not with \A or \Z)
-        # (not with lookarounds or \A \Z \z, which could see past a line end there and so miss a line)
-        # (nor with possessive repeats, atomic groups or scoped flags like (?-m:...), which can fail across lines)
-        self.pre_size = {}   # how much the quick search takes at once, per pattern (see _lines)
-        self.pre = {rx: (None if re.search(r"\\[AZz]|\(\?<?[=!]|\(\?>|[*+?}]\+|\(\?[a-zA-Z]*-", rx.pattern)
-                         else re.compile(rx.pattern, rx.flags | re.M))
-                    for rx in (self.start_re, self.end_re) if rx}
-        self.no_pre = {rx for rx, pre in self.pre.items() if pre is None}   # (for its construct, not for being slow)
+        # the plain text every match must contain, looked for first with a plain (linear) substring search; the
+        # pattern itself only ever runs on single lines that contain it (all lines, for a pattern without any)
+        self.must = {rx: _must_contain(rx) for rx in (self.start_re, self.end_re) if rx}
 
     def _mark(self, text: str, src=None, eof: bool = False) -> dict:
         snap, late = self.frozen, True
@@ -796,30 +843,16 @@ class Window:
         self.frozen = {"t": snap["t"], "j": dict(snap["j"])}
 
     def _lines(self, text: str, rx) -> list[str] | None:
-        """text: already cleaned (see _feed)."""
-        pre = self.pre.get(rx)
-        if pre is not None:
-            found, i = False, 0
-            while not found:   # in pieces of whole lines (other threads run between), small at first and doubling
-                size = self.pre_size.get(rx, 256)   # while the search stays fast, up to 64 KB
-                j = text.find("\n", i + size)
-                j = len(text) if j < 0 else j + 1
-                t0 = time.thread_time()
-                found = pre.search(text, i, j) is not None
-                if time.thread_time() - t0 > getattr(self, "slow_piece", 0.005):   # slow even so (it holds up
-                    self.pre[rx] = None   # every other thread while it runs): line by line from now on
-                    lines = text.split("\n")
-                    if not found:   # (the lines it has searched have nothing: not again; None keeps the numbering)
-                        k = text.count("\n", 0, j)
-                        lines[:k] = [None] * k
-                    return lines
-                self.pre_size[rx] = min(65536, size * 2)
-                i = j
-                if i >= len(text):
-                    break
-            if not found:
-                return None
-        return text.split("\n")
+        """The lines of a block (already cleaned, see _feed) to search with rx: None if no line can match; lines
+        that cannot match (they lack the text every match must contain) are None in the list (keeping the numbering)."""
+        must = getattr(self, "must", {}).get(rx)
+        if not must:
+            return text.split("\n")
+        words, fold = must
+        hay = text.lower() if fold else text
+        if not any(w in hay for w in words):
+            return None
+        return [ln if any(w in (ln.lower() if fold else ln) for w in words) else None for ln in text.split("\n")]
 
     def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
              eof: bool = False) -> bool:
@@ -1273,7 +1306,7 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
             if win.paused and all(o.size == 0 for o in outs.values()) and not any(_pending(fd) for fd in open_):
                 win.paused = False   # caught up (nothing queued, nothing waiting in the pipes): later marks are on time
             if state["stop"].is_set():   # handing over to the copier: everything read so far is with its _Out
-                if win.pending() and any(_pending(fd) > 0 for fd in open_):
+                if win.pending() and not getattr(win, "caught_up", False) and any(_pending(fd) > 0 for fd in open_):
                     win.cut_short = True   # (output still unread: a marker may be in it)
                 for fd in open_:
                     lines[fd].end(win, fd)   # (an unfinished last line counts now, as at the end of the output)
@@ -1696,9 +1729,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         tips = []
         for k in slow_ones:
             rx = {"--from": getattr(w, "start_re", None), "--until": getattr(w, "end_re", None)}.get(k)
-            if rx is not None and rx in getattr(w, "no_pre", ()):
-                tips.append(f"{k} has a lookaround, \\A/\\Z, a possessive or atomic part or a scoped flag, which makes "
-                            "joules search it line by line: drop that if you can.")
+            if rx is not None and not getattr(w, "must", {}).get(rx):
+                tips.append(f"{k} has no plain text that every match must contain, so joules tries it on every line: "
+                            "put a word in it if you can.")
             else:
                 tips.append(f"Make {k} simpler: no leading repeat like \\w* or [^ ]+, no nested repeats.")
         advice = " ".join(tips) + " (A plain word is fastest.)"
