@@ -445,7 +445,8 @@ class RunWindow(unittest.TestCase):
         import termios
         m, sl = pty.openpty()
         fcntl.ioctl(sl, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
-        code = ("import os, signal, time\nsignal.signal(signal.SIGWINCH, lambda *a: print('size', *os.get_terminal_size(1), flush=True))\n"
+        code = ("import os, signal, time\n"   # (os.write: a resize may send two SIGWINCH at once, and print is not reentrant)
+                "signal.signal(signal.SIGWINCH, lambda *a: os.write(1, b'size %d %d\\n' % tuple(os.get_terminal_size(1))))\n"
                 "print('size', *os.get_terminal_size(1), flush=True)\ntime.sleep(2.5)\n")
         q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--until", "zzz", "--", sys.executable, "-c", code],
                              stdin=sl, stdout=sl, stderr=sl, env=self.env(), start_new_session=True)
@@ -810,7 +811,7 @@ class RunWindow(unittest.TestCase):
             out.put(b"x" * 300_000)   # more than the pipe holds: the writer gets stuck
             time.sleep(0.3)
             t0 = time.monotonic()
-            rest = out.take()
+            _, rest = out.take()
             self.assertLess(time.monotonic() - t0, 0.4)
             got = b""
             while len(got) < 300_000 - len(rest):
@@ -864,6 +865,65 @@ class RunWindow(unittest.TestCase):
         self.assertIn(b"B", o)
         self.assertIn(b"window", e)
 
+    # ---- found in review round 11
+    def _stopped_reader(self, cmd, sig_at, extra=()):
+        """joules into a reader that is stopped (a pager waiting for a key); one Ctrl-C to joules at sig_at, then the
+        reader goes on. Returns joules' exit code, what the reader got, and joules' stderr."""
+        out, err = os.path.join(self.d, "out"), os.path.join(self.d, "err")
+        with open(out, "wb") as f, open(err, "wb") as e:
+            rd = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=f)
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "line", *extra, "--", *cmd],
+                                 stdout=rd.stdin, stderr=e, env=self.env())
+            rd.stdin.close()
+            time.sleep(0.05)
+            os.kill(rd.pid, signal.SIGSTOP)
+            time.sleep(sig_at)
+            q.send_signal(signal.SIGINT)
+            try:
+                rc = q.wait(timeout=10)
+            finally:
+                os.kill(rd.pid, signal.SIGCONT)
+            rd.wait(timeout=30)
+        return rc, out, Path(err).read_text()
+
+    def test_one_ctrl_c_with_a_stopped_reader_and_a_server_left_running(self):
+        """| less, with a server the command started: one Ctrl-C ends joules at once and nothing is lost."""
+        gen = ("import subprocess, sys\nsubprocess.Popen([sys.executable, '-c', 'import time\\nfor i in range(5):\\n"
+               "    time.sleep(0.5); print(\"bg\", i, flush=True)'])\n"
+               "for i in range(4000): sys.stdout.write('line %06d %s\\n' % (i, 'x' * 40))\nsys.stdout.flush()\n")
+        for at in (0.5, 2.8):
+            rc, out, err = self._stopped_reader([sys.executable, "-c", gen], at)
+            self.assertEqual(rc, 0)
+            deadline = time.monotonic() + 10
+            while "bg 4" not in Path(out).read_text() and time.monotonic() < deadline:
+                time.sleep(0.2)
+            text = Path(out).read_text()
+            self.assertEqual(text.count("line "), 4000, at)
+            self.assertEqual([ln for ln in text.splitlines() if ln.startswith("bg")], [f"bg {i}" for i in range(5)])
+
+    def test_output_handed_over_on_ctrl_c_does_not_cut_up_the_report(self):
+        gen = "import sys\nfor i in range(3000): sys.stdout.write('line %06d %s\\n' % (i, 'x' * 40))\n"
+        out = os.path.join(self.d, "out")
+        with open(out, "wb") as f:
+            rd = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=f)
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "line", "--", sys.executable,
+                                  "-c", gen], stdout=rd.stdin, stderr=rd.stdin, env=self.env())   # one shared stream
+            rd.stdin.close()
+            time.sleep(0.05)
+            os.kill(rd.pid, signal.SIGSTOP)
+            time.sleep(2)
+            q.send_signal(signal.SIGINT)
+            time.sleep(0.5)
+            os.kill(rd.pid, signal.SIGCONT)   # (joules' own report goes into the same pipe)
+            q.wait(timeout=10)
+            rd.wait(timeout=30)
+        text = Path(out).read_text()
+        a = text.index("joules ·")
+        b = text.index("\n", text.index("after joules finishes")) + 1
+        report, rest = text[a:b], text[:a] + text[b:]
+        self.assertEqual(rest, "".join("line %06d %s\n" % (i, "x" * 40) for i in range(3000)))   # once, whole, in order
+        self.assertNotIn("\nline 0", report)   # the report is in one piece (it may start part-way through a line)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
@@ -886,7 +946,7 @@ class RunWindow(unittest.TestCase):
 class LateNote(unittest.TestCase):
     """The "markers only read at exit" note: given when output was held back, not for a last line read late."""
 
-    def report(self, begin, end, exit_t, first_out, until="done", tty=False, which="only read when"):
+    def report(self, begin, end, exit_t, first_out, until="done", tty=False, which="only read when", behind=False):
         import argparse
         sys.path.insert(0, str(ROOT / "src"))
         from joules import cli
@@ -898,7 +958,7 @@ class LateNote(unittest.TestCase):
         w.lock, w.frozen, w.first_out = threading.Lock(), {"t": exit_t, "j": {"GPU 0": 10.0}}, {1: first_out}
         if end is None:
             w.end = None
-        w.ttys, w.behind = {1: tty}, False
+        w.ttys, w.behind = {1: tty}, behind
         w.begin = {"t": begin[0], "j": {"GPU 0": 1.0}, "line": "start", "late": begin[1], "src": 1}
         w.end = {"t": end[0], "j": {"GPU 0": 2.0}, "line": "done", "late": end[1]} if end else None
 
@@ -921,6 +981,13 @@ class LateNote(unittest.TestCase):
         self.assertTrue(self.report(begin=(1.0, False), end=(1.001, False), exit_t=3.0, first_out=0.3, which="under 10 ms"))
         self.assertEqual(self.report(begin=(2.0, False), end=(2.0, False), exit_t=2.05, first_out=0.3, tty=True,
                                      which="under 10 ms"), [])   # on a terminal programs do not hold their output
+
+    def test_falling_behind_after_early_markers_is_not_called_late(self):
+        """Markers read at the start, then joules fell behind a slow reader: the markers were not late."""
+        self.assertEqual(self.report(begin=(0.01, False), end=(0.011, False), exit_t=3.0, first_out=0.01, behind=True,
+                                     which="fell behind"), [])
+        self.assertTrue(self.report(begin=(0.01, False), end=(0.011, False), exit_t=3.0, first_out=0.01, behind=True,
+                                    which="under 10 ms"))
 
     def test_from_alone_on_the_last_line_gets_no_note(self):
         """With --from alone the window runs to the exit, so a --from on the last line is a short window, not held output."""

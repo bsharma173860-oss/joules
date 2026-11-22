@@ -551,21 +551,23 @@ def cmd_run(a) -> int:
         try:
             if terminated:
                 raise _Terminated
-            _drain_after_exit(proc, pumps, pump_state, outs, d.notes, term)
-            for o in outs.values():
-                o.close()
-            try:   # all the command's output is passed on before the report
-                with (term.raising() if term else contextlib.nullcontext()):
-                    for o in outs.values():
-                        o.thread.join()
-            except KeyboardInterrupt:   # stop waiting for a slow reader: a helper passes on the rest
-                left = [(dst, outs[fd].take()) for fd, dst, _ in proc.joules_streams]
-                if any(pre for _, pre in left) and os.name == "posix":
-                    for dst, pre in left:
-                        if pre:
-                            _hand_off(None, dst, pre)
-                    d.notes.append("joules stopped waiting for what reads its output (Ctrl-C); a small helper passes "
-                                   "on the rest of the command's output after joules finishes.")
+            waited = _drain_after_exit(proc, pumps, pump_state, outs, d.notes, term)
+            if waited:
+                for o in outs.values():
+                    o.close()
+                while any(o.thread.is_alive() for o in outs.values()):   # all output passed on before the report
+                    try:
+                        with (term.raising() if term else contextlib.nullcontext()):
+                            for o in outs.values():
+                                o.thread.join()
+                    except KeyboardInterrupt:
+                        if os.name == "posix":   # stop waiting for a slow reader (Windows: no helper, keep going)
+                            waited = False
+                            break
+            if not waited:   # one Ctrl-C: hand everything over and report now
+                _hand_over(proc, pumps, pump_state, outs)
+                d.notes.append("joules stopped waiting for what reads its output (Ctrl-C); a small helper passes on "
+                               "the rest of the command's output after joules finishes.")
         except _Terminated:
             _end_on_term(proc, pumps, pump_state, outs)
         if term:
@@ -799,18 +801,29 @@ class _Out:
             self.closed = True
             self.cv.notify_all()
 
-    def take(self) -> bytes:
-        """Stop writing and return what is still waiting, with the unwritten rest of the chunk under way: its writer
-        may be stuck (a paused pager), so joules hands that over rather than wait for it. A piece that may have to wait
-        is at most PIPE_BUF bytes, which a pipe or terminal takes all at once or not at all (see _piece)."""
+    def take(self, ending: bool = True) -> tuple[bytes, bytes]:
+        """Stop writing and return (maybe, rest): what is still waiting, with the unwritten rest of the chunk under
+        way. Its writer may be stuck (a paused pager), so joules hands that over rather than wait for it. A piece that
+        may have to wait is at most PIPE_BUF bytes, which a pipe or terminal takes all at once or not at all (see
+        _piece). If joules ends now (ending), a stuck piece dies with it and is in rest; otherwise it may still be
+        written, so it is returned apart (maybe), and wrote_stuck() says at the end whether it was."""
         with self.cv:
             self.handed = True
             self.cv.notify_all()
             self.cv.wait_for(lambda: not self.writing, 0.1)   # (a write to a reader that reads ends at once)
-            data = b"" if self.gone else self.cur[self.off:] + b"".join(self.q)
+            if self.gone:
+                maybe, rest = b"", b""
+            else:
+                k = self.off + (self.inflight if self.writing and not ending else 0)
+                maybe, rest = self.cur[self.off:k], self.cur[k:] + b"".join(self.q)
+            self.taken_off = self.off
             self.q.clear()
             self.size, self.cur = 0, b""
-            return data
+            return maybe, rest
+
+    def wrote_stuck(self) -> bool:
+        with self.cv:
+            return self.off > self.taken_off
 
     def _fd(self):
         try:
@@ -827,7 +840,7 @@ class _Out:
     def _piece(self, fd) -> int:
         """How much to write at once: 64 KB into an empty pipe (Linux), else 4 KB (PIPE_BUF) where a write may wait
         (a pipe, a terminal: Ctrl-S), and 64 KB where it does not (a file). (A terminal write stopped by Ctrl-S part
-        way is not atomic: there a SIGTERM may repeat up to 4 KB.)"""
+        way is not atomic: there a hand-over (SIGTERM, Ctrl-C) may repeat up to 4 KB.)"""
         if self.kind == "pipe":
             try:
                 import fcntl
@@ -843,8 +856,11 @@ class _Out:
     def _put(self, fd, chunk: bytes) -> bool:
         """Write one chunk in pieces, keeping how far it got. False if our own output is gone."""
         while self.off < len(chunk):
+            piece = chunk[self.off:self.off + self._piece(fd)]
+            with self.cv:
+                self.inflight = len(piece)
             try:
-                n = os.write(fd, chunk[self.off:self.off + self._piece(fd)])
+                n = os.write(fd, piece)
             except BlockingIOError:   # (someone made our terminal non-blocking)
                 time.sleep(0.01)
                 continue
@@ -860,7 +876,7 @@ class _Out:
                     return True
         return True
 
-    cur, off, kind = b"", 0, "file"
+    cur, off, kind, inflight, taken_off = b"", 0, "file", 0, 0
 
     def _run(self) -> None:
         fd = self._fd()
@@ -1079,43 +1095,39 @@ def _hung_up(fd: int) -> bool:
         return False
 
 
-def _drain_after_exit(proc, pumps, state, outs, notes, term) -> None:
+def _drain_after_exit(proc, pumps, state, outs, notes, term) -> bool:
     """After the command exits: read all it wrote before exiting, wait 2 s more for its streams to close (a slow
     reader on our side may make that take longer: a stream all of whose writers have gone is read to its end), then
-    hand a stream still held open (a process the command left running) to a helper."""
+    hand a stream still held open (a process the command left running) to a helper. False if a Ctrl-C asked joules
+    to stop waiting (POSIX: the caller then hands everything over)."""
     guard = term.raising if term else contextlib.nullcontext
 
     def alive():
         return any(t.is_alive() for t in pumps)
 
-    def wait_until(until, ctrl_c_stops=False):
+    def wait_until(until):
         while alive() and time.monotonic() < until:
-            try:
-                with guard():
-                    for t in pumps:
-                        t.join(max(0.0, until - time.monotonic()))
-            except KeyboardInterrupt:
-                if ctrl_c_stops:
-                    return False
-        return True
-    if os.name == "posix":
-        try:
+            with guard():
+                for t in pumps:
+                    t.join(max(0.0, until - time.monotonic()))
+    try:
+        if os.name == "posix":
             with guard():
                 while not state["caught_up"].wait(0.2) and alive():
                     pass
-        except KeyboardInterrupt:
-            pass   # a Ctrl-C here means: stop now
-    wait_until(time.monotonic() + 2.0)   # a late Ctrl-C must not lose the report
-    if os.name == "posix":
-        while alive() and all(_hung_up(fd) for fd, _, _ in proc.joules_streams if state.get(fd) != "done"):
-            if not wait_until(time.monotonic() + 0.5, ctrl_c_stops=True):
-                break
+        wait_until(time.monotonic() + 2.0)
+        if os.name == "posix":
+            while alive() and all(_hung_up(fd) for fd, _, _ in proc.joules_streams if state.get(fd) != "done"):
+                wait_until(time.monotonic() + 0.5)
+    except KeyboardInterrupt:
+        if os.name == "posix":
+            return False
     if not alive():
-        return
+        return True
     if os.name != "posix":
         notes.append("The command's output was still open when it exited (a process it started keeps it open); "
                      "joules stopped reading it.")
-        return
+        return True
     state["stop"].set()
     while alive():   # our reader never waits on a writer, so it stops at once
         try:
@@ -1128,15 +1140,10 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> None:
         with guard():
             for fd, _ in left:
                 outs[fd].wait_empty()   # never drop output, however slow the reader on our side
-        drained = True
     except KeyboardInterrupt:
-        drained = False   # stop now
+        return False
     held = [fd for fd, _ in left if not _hung_up(fd)]
-    moved = False
-    try:
-        moved = drained and bool(left) and all(_hand_off(fd, dst) for fd, dst in left)
-    except KeyboardInterrupt:
-        pass
+    moved = bool(left) and all(_hand_off(fd, dst) for fd, dst in left)
     for fd, _ in left:
         state[fd] = "handed"
         with contextlib.suppress(OSError):
@@ -1144,28 +1151,45 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> None:
     if held:
         notes.append("The command's output was still open when it exited (a process it started keeps it open); " + (
             "a small helper keeps passing it on after joules finishes." if moved else "joules stopped reading it."))
+    return True
 
 
-def _end_on_term(proc, pumps, state, outs) -> None:
-    """SIGTERM to joules alone: hand everything to helpers and end as the signal would (no report)."""
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)   # a second one ends joules at once
+def _hand_over(proc, pumps, state, outs, ending: bool = False) -> None:
+    """POSIX: stop reading and give every stream, with what joules read but has not passed on yet, to helpers.
+    ending: joules ends at once (SIGTERM)."""
     state["stop"].set()
     for t in pumps:
         t.join(1.0)   # our reader never waits on a writer, so it stops at once
     for fd, dst, _ in proc.joules_streams:
         if state.get(fd) == "handed":
             continue
-        pre = outs[fd].take()   # what was read but not yet passed on
+        maybe, pre = outs[fd].take(ending)
         src = fd if state.get(fd) == "stopped" else None
-        if src is not None or pre:
-            _hand_off(src, dst, pre)
+        if src is not None or pre or maybe:
+            _hand_off(src, dst, pre, maybe, outs[fd].wrote_stuck)
+        if src is not None:
+            state[fd] = "handed"
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _end_on_term(proc, pumps, state, outs) -> None:
+    """SIGTERM to joules alone: hand everything to helpers and end as the signal would (no report)."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)   # a second one ends joules at once
+    _hand_over(proc, pumps, state, outs, ending=True)
     os.kill(os.getpid(), signal.SIGTERM)
     time.sleep(1)
     sys.exit(128 + signal.SIGTERM)
 
 
 COPIER = ("import os, sys\n"
-          "for fd in [int(x) for x in sys.argv[1:]] + [0]:\n"   # first what joules had not passed on yet, then the stream
+          "while True:\n"   # wait for joules to finish (it holds the other end of this pipe), so its report comes first
+          "    try:\n"
+          "        if not os.read(int(sys.argv[1]), 1):\n"
+          "            break\n"
+          "    except OSError:\n"
+          "        break\n"
+          "for fd in [int(x) for x in sys.argv[2:]] + [0]:\n"   # first what joules had not passed on yet, then the stream
           "    while True:\n"
           "        try:\n"
           "            b = os.read(fd, 65536)\n"
@@ -1217,24 +1241,49 @@ def _stop_following(old) -> None:
             signal.signal(signal.SIGWINCH, old[1] if old[1] is not None else signal.SIG_DFL)
 
 
-def _hand_off(fd, dst, pre: bytes = b"") -> bool:
+_GATE = None
+_KEEP = []
+
+
+def _hand_off(fd, dst, pre: bytes = b"", maybe: bytes = b"", wrote=None) -> bool:
     """A process the command left running still writes here: pass its output on from a small helper that outlives
-    joules, so the process is not cut off (killed by SIGPIPE) when joules exits. pre: output read but not yet
-    passed on, written first (fd None: only that)."""
+    joules, so the process is not cut off (killed by SIGPIPE) when joules exits. The helper starts once joules has
+    exited, with what joules read but had not passed on: maybe (a piece a stuck write of ours may yet write: as
+    joules exits, it is dropped if wrote() says it was written), then pre; then the stream (fd None: no stream)."""
+    import atexit
     import tempfile
+    files = []
     try:
-        with tempfile.TemporaryFile() as f:
-            if pre:
-                f.write(pre)
+        for data in (maybe, pre):
+            if data:
+                f = tempfile.TemporaryFile()
+                f.write(data)
                 f.flush()
                 f.seek(0)
-            extra = [f.fileno()] if pre else []
-            subprocess.Popen([sys.executable, "-c", COPIER, *map(str, extra)],
-                             stdin=fd if fd is not None else subprocess.DEVNULL, stdout=dst.fileno(),
-                             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, pass_fds=extra)
+                files.append(f)
+        global _GATE
+        if _GATE is None:
+            _GATE = os.pipe()   # joules keeps the write end until it exits
+        extra = [f.fileno() for f in files]
+        subprocess.Popen([sys.executable, "-c", COPIER, str(_GATE[0]), *map(str, extra)],
+                         stdin=fd if fd is not None else subprocess.DEVNULL, stdout=dst.fileno(),
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+                         pass_fds=[_GATE[0], *extra])
+        if maybe:
+            first = files[0]
+
+            def settle():
+                if wrote is not None and wrote():
+                    with contextlib.suppress(OSError):
+                        os.ftruncate(first.fileno(), 0)
+            atexit.register(settle)
+            _KEEP.append(first)   # open until joules exits
         return True
     except (OSError, ValueError, AttributeError):
         return False
+    finally:
+        for f in files[1 if maybe else 0:]:
+            f.close()
 
 
 def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, list[str]]:
@@ -1261,7 +1310,7 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     tiny = a.window_from is not None and info["found_until"] and end["t"] - begin["t"] < 0.01   # no benchmark is that short
     at_exit = tiny and begin["t"] >= exit_t - 0.1
     if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny):
-        if getattr(w, "behind", False) or getattr(w, "paused", False):
+        if (getattr(w, "behind", False) or getattr(w, "paused", False)) and (begin.get("late") or at_exit):
             notes.append("The marker lines were only read when the command exited, so the window may be wrong: what "
                          "reads joules' output (a pager, a slow pipe) took it so slowly that joules fell behind.")
         elif begin.get("late") or (at_exit and nothing_before):

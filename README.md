@@ -151,6 +151,8 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     no time is the sign to look for.
   - A slow reader of joules' output (a pager, a slow pipe) does not move the window: joules keeps reading the
     script's output on time, holding up to 16 MB of it for the reader (and says so if it falls further behind).
+  - A Ctrl-C while joules waits for a slow reader stops the waiting: joules reports at once and a small helper
+    passes on the rest of the output after it (the report may then start part-way through a line).
   - The script writes to joules, not to your file, so if your disk fills up the script does not see the error;
     the output that did not fit is lost, as it would be anyway.
   - Not for full-screen terminal programs (htop, nvtop): they set up joules' terminal, not yours.
