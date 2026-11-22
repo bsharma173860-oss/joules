@@ -1430,11 +1430,35 @@ class RunWindow(unittest.TestCase):
         class Clock:
             def snapshot(self): return {"t": 1.0, "j": {}}
         w = cli.Window(Clock(), 0.0, [], "NEVERSEEN", None)
+        w.group = 10 * 0.015625   # (what _cpu_step measures there)
         block = ("2026-11-22 12:00:00 INFO step done loss=0.123 " + "x" * 50 + "\n") * 40   # ~4 KB
         with mock.patch.object(cli.time, "thread_time", lambda: (real() // 0.015625) * 0.015625):
             for _ in range(75000):   # ~300 MB
                 w.feed([block], [1])
         self.assertLess(w.match_s, 0.5)
+
+    # ---- found in review round 21
+    def test_a_slow_search_does_not_hide_behind_cheap_ones_before_it(self):
+        """Many cheap reads first (a long benchmark log): their unused budget must not cancel a slow search later."""
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "(a|aa)*c", None)
+        for i in range(15000):
+            w.feed(["tik %d" % i], [1])
+        w.feed(["a" * 28], [1])   # ~0.2 s or more of backtracking
+        self.assertGreater(w.match_s, 0.1)
+
+    def test_a_marker_after_the_exit_on_a_terminal_kept_busy_by_a_process(self):
+        """A process left running writes to the terminal every 50 ms and prints the --from line after the exit."""
+        script = os.path.join(self.d, "orph.sh")
+        Path(script).write_text("( trap '' HUP; i=0; while [ $i -lt 60 ]; do echo tick; sleep 0.05; i=$((i+1)); "
+                                "[ $i = 20 ] && echo A; done ) &\necho x; sleep .5\n")
+        shown = self._on_own_terminal(["--from", "^A", "--", "bash", script])
+        self.assertIn(b"printed after the command exited", shown)
+        self.assertNotIn(b"held its output", shown)
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""

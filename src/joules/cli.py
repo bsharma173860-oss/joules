@@ -658,6 +658,20 @@ def cmd_run(a) -> int:
     return code
 
 
+def _cpu_step() -> float:
+    """How finely this thread's CPU clock moves (Linux: well under a microsecond; Windows: 15.6 ms)."""
+    t0 = time.thread_time()
+    deadline = time.perf_counter() + 0.05
+    while time.perf_counter() < deadline:
+        t1 = time.thread_time()
+        if t1 != t0:
+            return t1 - t0
+    return 0.016
+
+
+_GROUP = None   # matching time is judged over groups of about this much CPU or budget (measured when first needed)
+
+
 def _searchable(pattern: str) -> str:
     """The pattern to search with. Leading repeats of any character (.* .+ and their lazy forms, after an optional
     ^) change nothing in a search but make it slow on long lines (each start tried to the end): .* is dropped and
@@ -691,6 +705,10 @@ class Window:
         self.end_re = re.compile(_searchable(end_re)) if end_re is not None else None
         self.match_s = 0.0    # time spent matching beyond a plain search (it holds up the rest of joules)
         self._cpu = self._budget = 0.0
+        global _GROUP
+        if _GROUP is None:
+            _GROUP = max(0.001, 10 * _cpu_step())
+        self.group = _GROUP
         self.lock = threading.Lock()
         self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
         self.end = None
@@ -755,12 +773,15 @@ class Window:
         finally:
             # only what goes beyond a plain search of this much text counts (a plain word never adds up, however
             # much output; a slow pattern does, in big reads or small, e.g. 4 KB from a terminal)
-            # (totals, not each read clamped: Windows' CPU clock moves in 15.6 ms steps)
+            # Added up in small groups (closed once either reaches _GROUP): the CPU clock's steps (15.6 ms on Windows)
+            # even out within a group, and unused budget is not carried over to hide a slow search later.
             n = sum(len(t) for t in texts)
             with self.lock:
                 self._cpu += time.thread_time() - t0
                 self._budget += 0.0002 + n / 50e6
-                self.match_s = max(0.0, self._cpu - self._budget)
+                if self._cpu >= self.group or self._budget >= self.group:
+                    self.match_s += max(0.0, self._cpu - self._budget)
+                    self._cpu = self._budget = 0.0
 
     def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None,
               eof: bool = False) -> bool:
@@ -1105,6 +1126,7 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
     order = [fd for fd, _, _ in streams]
     lines = {fd: _Lines() for fd in order}
     sel, watched, owed = selectors.DefaultSelector(), set(), None   # (selectors: no limit on fd numbers)
+    pty_wait = set()
 
     def finish(fd):
         lines[fd].end(win, fd)
@@ -1140,19 +1162,21 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                 break
             if owed is None and state["exited"].is_set():   # what the command wrote before it exited
                 # (a pseudo-terminal reports only part of what waits in it: there, until a read finds nothing)
-                owed = {fd: (None if getattr(win, "ttys", {}).get(fd) else _pending(fd)) for fd in open_}
+                # (a pseudo-terminal reports only part of what waits in it: after that part, until a read finds
+                # nothing or a short one shows a process writing a little at a time, or 2 s on)
+                owed = {fd: _pending(fd) for fd in open_}
+                pty_wait = {fd for fd in open_ if getattr(win, "ttys", {}).get(fd)}
                 owed_t = time.monotonic()
                 win.behind = any(outs[fd].full() for fd in open_)
-            if owed is not None and all(owed.get(fd, 0) is not None and owed.get(fd, 0) <= 0 for fd in open_):
+            if owed is not None and all(owed.get(fd, 0) <= 0 and fd not in pty_wait for fd in open_):
                 state["caught_up"].set()
                 win.caught_up = True   # all the command wrote before exiting is read: later lines came after
             try:
                 if watched:
                     ready = {k.fd for k, _ in sel.select(0.1)}
-                    if owed is not None:   # a watched pseudo-terminal with nothing to read: what was in it is read
-                        late = time.monotonic() - owed_t > 2.0   # (or still readable 2 s on: a process left writing)
-                        for fd in [f for f, v in owed.items() if v is None and f in watched and (late or f not in ready)]:
-                            owed[fd] = 0
+                    if owed is not None and pty_wait:   # a watched pseudo-terminal with nothing to read, or 2 s on
+                        late = time.monotonic() - owed_t > 2.0
+                        pty_wait -= {f for f in pty_wait if owed.get(f, 0) <= 0 and f in watched and (late or f not in ready)}
                 else:
                     ready = set()
                     time.sleep(0.05)
@@ -1170,8 +1194,10 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                     finish(fd)
                     continue
                 win.first_out.setdefault(fd, time.monotonic())
-                if owed is not None and owed.get(fd, 0) is not None:
+                if owed is not None:
                     owed[fd] = owed.get(fd, 0) - len(chunk)
+                    if fd in pty_wait and owed[fd] <= 0 and len(chunk) < 1024:
+                        pty_wait.discard(fd)   # a short read once the reported part is read: not a held burst
                 if win.pending():
                     text = lines[fd].add(chunk, win, fd)
                     if text is not None:
