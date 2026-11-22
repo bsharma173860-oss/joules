@@ -636,6 +636,7 @@ class RunWindow(unittest.TestCase):
         if hard != resource.RLIM_INFINITY and hard < 2100:
             self.skipTest("cannot open that many files here")
         resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 2100), hard))
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
         r, w = os.pipe()
         high = os.dup2(r, 2000)
         os.close(r)
@@ -690,6 +691,52 @@ class RunWindow(unittest.TestCase):
         os.close(r)
 
 
+    # ---- found in review round 8
+    def test_a_sigterm_after_the_command_exits_loses_nothing(self):
+        """SIGTERM while joules still passes on output for a slow reader, or waits on a server the command left: all
+        the output still arrives, from a helper, as without a window."""
+        out = os.path.join(self.d, "out")
+        big = "import sys; sys.stdout.write('A\\n' + 'z' * (4 << 20))"
+        slow = "import sys, time\nwhile True:\n    b = sys.stdin.buffer.read(65536)\n    if not b: break\n" \
+               "    sys.stdout.buffer.write(b); time.sleep(0.1)\n"
+        with open(out, "wb") as f:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "A", "--", sys.executable, "-c",
+                                  big], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env())
+            rd = subprocess.Popen([sys.executable, "-c", slow], stdin=q.stdout, stdout=f)
+            q.stdout.close()
+            time.sleep(1.5)
+            q.terminate()
+            self.assertEqual(q.wait(timeout=20), -15)
+            rd.wait(timeout=60)
+        self.assertEqual(os.path.getsize(out), 2 + (4 << 20))
+        srv = "(for i in $(seq 1 15); do echo srv $i; sleep 0.2; done; echo srv end) & echo A"
+        with open(out, "wb") as f:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "A", "--", "bash", "-c", srv],
+                                 stdout=f, stderr=subprocess.DEVNULL, env=self.env())
+            time.sleep(1.2)
+            q.terminate()
+            self.assertEqual(q.wait(timeout=20), -15)
+        deadline = time.monotonic() + 10
+        while "srv end" not in Path(out).read_text() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertIn("srv end", Path(out).read_text())
+
+    def test_a_full_queue_at_exit_is_not_called_a_process_holding_the_output(self):
+        """The command fills joules' queue for a slow reader and exits, starting nothing: no "still open" note."""
+        code = "import os\nos.write(1, b'A\\n')\nfor i in range(256): os.write(1, b'x' * 65535 + b'\\n')\nos.write(1, b'y' * 65533 + b'\\n')\n"
+        reader = ("import os, sys, time\ntime.sleep(4); n = 0\nwhile True:\n"
+                  "    b = os.read(0, 1 << 20)\n    if not b: break\n    n += len(b)\nprint(n)\n")
+        err = os.path.join(self.d, "err")
+        q = subprocess.run(f"{shlex.quote(sys.executable)} -m joules run --no-cpu --from A -- {shlex.quote(sys.executable)} -c "
+                           f"{shlex.quote(code)} 2>{err} | {shlex.quote(sys.executable)} -c {shlex.quote(reader)}", shell=True,
+                           capture_output=True, env=self.env(), timeout=120)
+        self.assertEqual(int(q.stdout.split()[0]), 257 * 65536)   # (joules' queue exactly full at the exit)
+        self.assertNotIn("still open", Path(err).read_text())
+
+    def test_an_empty_marker_line_is_named_as_such(self):
+        p, r = self.run_j(["--no-cpu", "--from", "^$", "--until", "x"], ["sh", "-c", "echo; sleep 0.3; echo x"])
+        self.assertIn("from: (an empty line)", p.stdout.decode() + p.stderr.decode())
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
@@ -722,9 +769,11 @@ class LateNote(unittest.TestCase):
         w = cli.Window.__new__(cli.Window)
         import threading
         w.lock, w.frozen, w.first_out = threading.Lock(), {"t": exit_t, "j": {"GPU 0": 10.0}}, {1: first_out}
+        if end is None:
+            w.end = None
         w.ttys, w.behind = {1: tty}, False
         w.begin = {"t": begin[0], "j": {"GPU 0": 1.0}, "line": "start", "late": begin[1], "src": 1}
-        w.end = {"t": end[0], "j": {"GPU 0": 2.0}, "line": "done", "late": end[1]}
+        w.end = {"t": end[0], "j": {"GPU 0": 2.0}, "line": "done", "late": end[1]} if end else None
 
         class S:
             t0, t1 = 0.0, exit_t
@@ -745,6 +794,10 @@ class LateNote(unittest.TestCase):
         self.assertTrue(self.report(begin=(1.0, False), end=(1.001, False), exit_t=3.0, first_out=0.3, which="under 10 ms"))
         self.assertEqual(self.report(begin=(2.0, False), end=(2.0, False), exit_t=2.05, first_out=0.3, tty=True,
                                      which="under 10 ms"), [])   # on a terminal programs do not hold their output
+
+    def test_from_alone_on_the_last_line_gets_no_note(self):
+        """With --from alone the window runs to the exit, so a --from on the last line is a short window, not held output."""
+        self.assertEqual(self.report(begin=(0.5, False), end=None, exit_t=0.501, first_out=0.0, until=None, which=""), [])
 
     def test_a_very_short_run_gets_no_note(self):
         self.assertEqual(self.report(begin=(0.05, True), end=(0.05, True), exit_t=0.05, first_out=0.05, which=""), [])
