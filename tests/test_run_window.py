@@ -1029,9 +1029,13 @@ class RunWindow(unittest.TestCase):
                 mock.patch.object(cli._Out, "_piece", lambda self, fd: 4096):
             self.assertFalse(out._put(1, b"x" * 10))
 
+        seen = []
+
         class Full:
             gone, size = False, 1 << 30
-            def full(self): return True
+            def full(self):
+                seen.append(win.paused)
+                return True
             def put(self, c): pass
 
         class Win:
@@ -1048,7 +1052,8 @@ class RunWindow(unittest.TestCase):
             cli._pump(r, None, win, state, None, Full())
         finally:
             os.close(r)
-        self.assertTrue(win.paused)
+        self.assertTrue(any(seen))      # paused while the stream was behind
+        self.assertFalse(win.paused)    # and no longer once it ended
 
     # ---- found in review round 14
     def test_a_greedy_marker_early_in_a_long_line_is_found(self):
@@ -1255,6 +1260,77 @@ class RunWindow(unittest.TestCase):
         finally:
             os.close(r)
         self.assertTrue(win.paused)
+
+    # ---- found in review round 18
+    def test_a_slow_pattern_in_small_reads_is_counted(self):
+        """A terminal gives joules about 4 KB at a time: a slow pattern must add up there too."""
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "START", r"\w*DONE")
+        w.begin = {"t": 0.0, "j": {}, "line": "START"}
+        for _ in range(30):
+            w.feed(["a" * 5000], [1])
+        self.assertGreater(w.match_s, 0.2)
+
+    def test_a_socket_output_on_a_high_fd_number(self):
+        import resource
+        import socket
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 2100:
+            self.skipTest("cannot open that many files here")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 2100), hard))
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        a, b = socket.socketpair()
+        high = os.dup2(a.fileno(), 2000)
+        a.close()
+        filler = [os.open(os.devnull, os.O_RDONLY) for _ in range(1100)]   # (a parent that leaks fds: joules' own
+        self.addCleanup(lambda: [os.close(x) for x in filler])            #  copy of the socket lands above 1024)
+        try:
+            with os.fdopen(high, "wb", closefd=False) as f:
+                out = cli._Out(f)
+                out.put(b"hello\n")
+                out.close()
+                out.thread.join(5)
+                self.assertFalse(out.gone)
+            b.settimeout(2)
+            self.assertEqual(b.recv(100), b"hello\n")
+        finally:
+            os.close(high)
+            b.close()
+
+    def test_a_datagram_socket_output_keeps_its_messages(self):
+        import socket
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        b.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        prog = "import os\nfor i in range(300): os.write(1, b'%05d ' % i + b'x' * 94 + b'\\n')\n"
+        err = os.path.join(self.d, "err")
+        with open(err, "wb") as e:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "A", "--", sys.executable,
+                                  "-c", prog], stdout=a, stderr=e, env=self.env())
+            a.close()
+            got = []
+            b.settimeout(3)
+            try:
+                while True:
+                    got.append(b.recv(1 << 17))
+            except socket.timeout:
+                pass
+            q.wait(timeout=20)
+        b.close()
+        self.assertEqual(len(got), 300)
+        self.assertEqual(got[7], b"00007 " + b"x" * 94 + b"\n")
+        self.assertIn("datagram socket", Path(err).read_text())
+
+    def test_a_marker_from_a_process_left_running_is_said_to_come_after_the_exit(self):
+        p, r = self.run_j(["--no-cpu", "--from", "A", "--until", "B"],
+                          ["sh", "-c", "sleep 0.5; (sleep 0.3; echo A; sleep 0.5; echo B) & echo started"], timeout=60)
+        self.assertTrue(any("printed after the command exited" in n for n in r["notes"]), r["notes"])
+        self.assertFalse([n for n in r["notes"] if "held its output" in n])
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""

@@ -215,6 +215,32 @@ def _pty_pair(dst=None) -> tuple[int, int]:
     return m, sl
 
 
+_SOCK_STREAM = 1
+
+
+def _sock_type(fd: int):
+    try:
+        import socket
+        s = socket.socket(fileno=os.dup(fd))
+        try:
+            return s.type
+        finally:
+            s.close()
+    except (OSError, ValueError, ImportError):
+        return None
+
+
+def _message_socket(f) -> bool:
+    """A datagram (or seqpacket) socket: its messages would not survive passing through joules, so the command gets
+    it as it is (and joules does not read it)."""
+    try:
+        import socket
+        fd = f.fileno()
+        return os.name == "posix" and stat.S_ISSOCK(os.fstat(fd).st_mode) and _sock_type(fd) not in (None, socket.SOCK_STREAM)
+    except (OSError, ValueError, AttributeError, ImportError):
+        return False
+
+
 def _same_place() -> bool:
     """Do our stdout and stderr go to the same terminal or file (as on screen, or with 2>&1)?"""
     try:
@@ -249,7 +275,8 @@ def _start(cmd: list[str], piped: bool = False):
     goes, how to close it)]."""
     try:
         if piped:
-            outs = [f for f in (sys.stdout, sys.stderr) if _usable(f)]
+            outs = [f for f in (sys.stdout, sys.stderr) if _usable(f) and not _message_socket(f)]
+            untouched = [n for f, n in ((sys.stdout, "stdout"), (sys.stderr, "stderr")) if _usable(f) and f not in outs]
             same = len(outs) == 2 and _same_place()
             env = dict(os.environ)
             if os.name != "posix" or any(not _isatty(f) for f in outs):   # a pipe (always, on Windows): Python would hold its output
@@ -274,6 +301,7 @@ def _start(cmd: list[str], piped: bool = False):
                         os.close(w)
                 p.joules_streams = [(pair[0], f, functools.partial(os.close, pair[0]))
                                     for f, pair in ends.items() if not (f is sys.stderr and same)]
+                p.joules_untouched = untouched
                 return p
             out = subprocess.PIPE if sys.stdout in outs else None
             err = (subprocess.STDOUT if same else subprocess.PIPE) if sys.stderr in outs else None
@@ -515,6 +543,7 @@ def cmd_run(a) -> int:
                 clock = PhaseClock(d.meters, s.lock)
                 win = Window(clock, s.t0, d.meters, a.window_from, a.window_until)
                 win.ttys = {fd: _isatty(dst) for fd, dst, _ in proc.joules_streams}
+                win.untouched = getattr(proc, "joules_untouched", [])
                 outs = {fd: _Out(dst) for fd, dst, _ in proc.joules_streams}   # written on by their own threads
                 pump_state = {"stop": threading.Event(), "exited": threading.Event(), "caught_up": threading.Event()}
                 if os.name == "posix":
@@ -681,8 +710,8 @@ class Window:
             exited = self.frozen
             if exited is not None and snap["t"] >= exited["t"]:   # the command exited meanwhile
                 snap, late = exited, True
-        return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200],
-                "late": late, "src": src, "after_pause": self.paused}
+        return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200], "late": late, "src": src,
+                "after_pause": self.paused, "after_exit": late and getattr(self, "caught_up", False)}
 
     @staticmethod
     def clean(text: str) -> str:
@@ -718,9 +747,10 @@ class Window:
         try:
             return self._feed(texts, srcs, partial, keep_from)
         finally:
-            took = time.perf_counter() - t0
-            if took > 0.05:   # only a search slow in itself held things up (a plain word over much output never is)
-                self.match_s += took
+            # only time beyond what a plain search of this much text takes counts (a plain word never adds up,
+            # however much output; a slow pattern does, in big reads or small, e.g. 4 KB from a terminal)
+            n = sum(len(t) for t in texts)
+            self.match_s += max(0.0, time.perf_counter() - t0 - 0.005 - n / 50e6)
 
     def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
@@ -913,7 +943,7 @@ class _Out:
             st = os.fstat(fd)
             if stat.S_ISFIFO(mode):
                 self.kind = "pipe"
-            elif stat.S_ISSOCK(mode) and os.name == "posix":
+            elif stat.S_ISSOCK(mode) and os.name == "posix" and _sock_type(fd) == _SOCK_STREAM:
                 import socket
                 self.kind, self.sock = "socket", socket.socket(fileno=os.dup(fd))
             elif os.isatty(fd) or (stat.S_ISCHR(mode) and st.st_rdev != os.stat(os.devnull).st_rdev):
@@ -946,8 +976,11 @@ class _Out:
         import socket
         while self.off < len(chunk):
             self.write_t0 = self.write_t0 or time.monotonic()
-            try:
-                ready = select.select([], [self.sock], [], 0.1)[1]
+            try:   # (poll: no limit on fd numbers)
+                if self.poller is None:
+                    self.poller = select.poll()
+                    self.poller.register(self.sock, select.POLLOUT)
+                ready = self.poller.poll(100)
             except (OSError, ValueError):
                 return False
             with self.cv:
@@ -1002,7 +1035,7 @@ class _Out:
                     return True
         return True
 
-    cur, off, kind, inflight, taken_off, sock = b"", 0, "file", 0, 0, None
+    cur, off, kind, inflight, taken_off, sock, poller = b"", 0, "file", 0, 0, None, None
     write_t0 = None   # when the write under way started
     last_block = 0.0  # when a write last had to wait for the reader
 
@@ -1098,6 +1131,7 @@ def _pump_all(streams: list, win: "Window", state: dict, outs: dict) -> None:
                 win.behind = any(outs[fd].full() for fd in open_)
             if owed is not None and all(owed.get(fd, 0) <= 0 for fd in open_):
                 state["caught_up"].set()
+                win.caught_up = True   # all the command wrote before exiting is read: later lines came after
             try:
                 if watched:
                     ready = {k.fd for k, _ in sel.select(0.1)}
@@ -1168,6 +1202,10 @@ def _pump(fd: int, dst, win: "Window", state: dict, close=None, out=None) -> Non
         out.put(chunk)
     lines.end(win, fd)
     state[fd] = "done"
+    held = win.__dict__.get("paused_streams")
+    if held is not None and fd in held:   # (a stream that ended is not behind)
+        held.discard(fd)
+        win.paused = bool(held)
     if close is not None:
         with contextlib.suppress(OSError, ValueError):
             close()
@@ -1451,6 +1489,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         begin, end = w.begin, w.end
         alt = getattr(w, "alt_end", None) if end is None else None
         found_end = end
+    for name in getattr(w, "untouched", ()):
+        notes.append(f"Your {name} is a datagram socket, so the command writes to it directly (passing it through "
+                     "joules would merge its messages); markers on it are not seen.")
     if alt is not None:
         end = alt
         notes.append("The --until line arrived on the other stream together with the --from line, so which came "
@@ -1492,6 +1533,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
         if (getattr(w, "behind", False) or paused) and (begin.get("late") or at_exit):
             notes.append("The marker lines were only read when the command exited, so the window may be wrong: what "
                          "reads joules' output (a pager, a slow pipe) took it so slowly that joules fell behind.")
+        elif begin.get("after_exit"):
+            notes.append("The --from line was printed after the command exited (by a process it left running), and "
+                         "measuring stops when the command exits, so the window is empty.")
         elif begin.get("late") or held:
             notes.append("The marker lines were only read when the command exited, so the window may be wrong: the "
                          "command probably held its output until it ended" + (
