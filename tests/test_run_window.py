@@ -1692,7 +1692,7 @@ class RunWindow(unittest.TestCase):
             q.wait(timeout=30)
         text = Path(err).read_text()
         self.assertNotIn("never appeared", text)
-        self.assertTrue("stopped looking" in text or "window" in text, text[-500:])
+        self.assertIn("stopped looking", text)
 
     def test_the_quick_search_in_pieces_handles_empty_and_split_blocks(self):
         sys.path.insert(0, str(ROOT / "src"))
@@ -1723,6 +1723,72 @@ class RunWindow(unittest.TestCase):
         for _ in range(600):                                     # ~40 MB
             w.feed([block], [1])
         self.assertLess(w.match_s, 0.5)
+
+    # ---- found in review round 29
+    def test_a_pattern_gone_line_by_line_for_being_slow_gets_the_repeat_advice(self):
+        import argparse
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+
+        class S:
+            t0, t1 = 0.0, 4.0
+        w = cli.Window(Clock(), 0.0, [], "B|(x+x+)+y", None)
+        w.slow_piece = 0.0   # (any piece counts as slow: it goes line by line)
+        w.feed(["x" * 10 + "\n" + "x" * 10], [1])
+        self.assertIsNone(w.pre[w.start_re])
+        w.match_s, w.match_by = 2.0, {"--from": 2.0}
+        w.freeze({"t": 4.0, "j": {}})
+        notes = cli._window_report(argparse.Namespace(window_from="B|(x+x+)+y", window_until=None), w, S(), [], {})[1]
+        slow = [n for n in notes if "Matching" in n]
+        self.assertTrue(slow and "Make --from simpler" in slow[0] and "lookaround" not in slow[0], notes)
+
+    def test_lines_the_quick_search_found_empty_are_not_searched_again(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "needle", None)
+        w.slow_piece = 0.0
+        lines = w._lines("aaa\nbbb\nccc\n", w.start_re)
+        self.assertEqual(lines[:3], [None, None, None])
+
+    def test_a_coarse_cpu_clock_does_not_switch_a_plain_word_to_line_by_line(self):
+        from unittest import mock
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        real = time.thread_time
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], "NEVERSEEN", None)
+        w.slow_piece, w.group = 2 * 0.015625, 10 * 0.015625   # (what Windows' 15.6 ms CPU clock step gives)
+        block = ("x" * 79 + "\n") * 820
+        with mock.patch.object(cli.time, "thread_time", lambda: (real() // 0.015625) * 0.015625):
+            for _ in range(3000):
+                w.feed([block], [1])
+        self.assertIsNotNone(w.pre[w.start_re])
+
+    def test_a_hand_over_with_output_still_unread_says_joules_stopped_looking(self):
+        """A slow reader on joules' output, the --until line printed but not yet read when Ctrl-C hands over."""
+        code = ("import sys\nprint('START', flush=True)\nsys.stdout.write(('x' * 99 + '\\n') * 168400)\n"
+                "print('END', flush=True)\n")
+        err = os.path.join(self.d, "err")
+        with open(err, "wb") as e:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "START", "--until", "END",
+                                  "--", sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=e, env=self.env(),
+                                 preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            rd = subprocess.Popen(["sh", "-c", "sleep 6; wc -c"], stdin=q.stdout, stdout=subprocess.DEVNULL)
+            q.stdout.close()
+            time.sleep(3)
+            q.send_signal(signal.SIGINT)
+            q.wait(timeout=30)
+            rd.wait(timeout=30)
+        text = Path(err).read_text()
+        self.assertNotIn("never appeared", text)
 
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
