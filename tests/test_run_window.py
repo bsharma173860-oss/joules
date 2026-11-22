@@ -1812,6 +1812,37 @@ class RunWindow(unittest.TestCase):
         self.assertIsNone(w.end)
         self.assertFalse(getattr(w, "cut_short", False))
 
+    # ---- found in review round 32
+    def test_a_line_bound_pattern_is_not_tried_on_lines_without_its_word(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        w = cli.Window(Clock(), 0.0, [], r"\w+ done", None)
+        t0 = time.process_time()
+        self.assertTrue(w.feed(["Q" * 30000 + "\nstep 1 done"], [1]))   # (\w+ on the Q line alone: about a second)
+        self.assertLess(time.process_time() - t0, 0.2)
+        w = cli.Window(Clock(), 0.0, [], "^$", None)
+        self.assertTrue(w.feed([""], [1]))   # (a block that is one empty line)
+
+    def test_cr_escape_codes_nl_is_one_line_end_however_reads_split(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class Clock:
+            def snapshot(self): return {"t": 1.0, "j": {}}
+        data = b"START\r\x1b[0m\nwork\n"
+        for cut in range(1, len(data)):
+            w = cli.Window(Clock(), 0.0, [], "START", "^$")
+            lines = cli._Lines()
+            for part in (data[:cut], data[cut:]):
+                t = lines.add(part, w, 1)
+                if t is not None:
+                    w.feed([t], [1])
+            lines.end(w, 1)
+            self.assertIsNone(w.end, cut)
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)

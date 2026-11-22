@@ -677,6 +677,18 @@ def cmd_run(a) -> int:
 _FOLD = {0x131: "i", 0x17F: "s", 0x307: None}   # ı ſ (and İ's dot): what (?i) matches to i/s but lower() keeps
 
 
+def _escape_start(b: bytes) -> bool:
+    """Is b nothing, or only escape codes (the last perhaps unfinished)?"""
+    rest = b[_ANSI_B.match(b).end():]
+    return not rest or (rest[:1] == b"\x1b" and len(rest) < 64 and b"\n" not in rest and b"\r" not in rest)
+
+
+def _runs_with(words):
+    """A pattern for runs of whole lines that each have one of words (as plain text): one match per run, in C."""
+    alt = "|".join(re.escape(w) for w in words)
+    return re.compile(r"(?:^[^\n]*(?:%s)[^\n]*(?:\n|\Z))+" % alt, re.M)
+
+
 def _fold(text: str) -> str:
     """Lower case as (?i) compares ASCII words: ı, ſ and İ count as i, s and i (only ever lets more lines through)."""
     return text.lower().translate(_FOLD)
@@ -832,6 +844,7 @@ def _searchable(pattern: str) -> str:
     return "." * need + rest
 
 
+_ANSI_B = re.compile(rb"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b[@-Z\\-_])*")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b[@-Z\\-_]")  # colours, moves, titles, charsets
 
 
@@ -868,6 +881,7 @@ class Window:
         self.block = {rx: (re.compile(rx.pattern, rx.flags | re.M) if _line_bound(rx) else None)
                       for rx in (self.start_re, self.end_re) if rx}
         self.block_size = {}   # how much of a block is searched at once, per pattern (see _lines)
+        self.runs = {rx: _runs_with(m[0]) for rx, m in self.must.items() if m}   # (lines that have the word)
 
     def _mark(self, text: str, src=None, eof: bool = False) -> dict:
         snap, late = self.frozen, True
@@ -920,41 +934,50 @@ class Window:
     def _lines(self, text: str, rx) -> list[str] | None:
         """The lines of a block (already cleaned, see _feed) to search with rx: None if no line can match; lines
         that cannot match are None in the list (keeping the numbering). First the text every match must contain
-        (a plain substring search); then, for a pattern that cannot match a line end, one search of the whole block
-        (it cannot run across lines, so it costs no more than line by line, but in C), else the lines with the text."""
+        (plain substring searches); the pattern is only ever tried on lines that have it (on every line, if it has
+        none). For a pattern that cannot match a line end, the runs of such lines are searched at once (it cannot
+        run across lines, so it costs no more than line by line, but in C), else line by line."""
         must = getattr(self, "must", {}).get(rx)
+        spans = [(0, len(text))]
         if must:
             words, fold = must
             hay = _fold(text) if fold else text
             if not any(w in hay for w in words):
                 return None
-        block = getattr(self, "block", {}).get(rx)
-        i = 0
-        if block is not None:   # in pieces of whole lines, small at first and doubling while fast (up to 64 KB): a
-            while True:         # search holds up every other thread while it runs
-                size = self.block_size.get(rx, 256)
-                j = text.find("\n", i + size)
-                j = len(text) if j < 0 else j + 1
-                t0 = time.thread_time()
-                m = block.search(text, i, j)
-                if time.thread_time() - t0 > self.slow_piece:   # slow in itself: line by line from now on
-                    self.block[rx] = None
+            # (where the lines with a word are: in the text itself, unless folding may have moved them)
+            runs = getattr(self, "runs", {}).get(rx) or _runs_with(words)
+            spans = [m.span() for m in runs.finditer(hay)] if not fold or text.isascii() else None
+        block = getattr(self, "block", {}).get(rx) if spans is not None and text else None
+        done = 0   # (lines before this offset: searched with nothing, or without the word)
+        if block is not None:
+            for a, b in spans:   # in pieces of whole lines, small at first and doubling while fast (up to 64 KB):
+                i = a            # a search holds up every other thread while it runs
+                while i < b:
+                    size = self.block_size.get(rx, 256)
+                    j = text.find("\n", i + size, b)
+                    j = b if j < 0 else j + 1
+                    t0 = time.thread_time()
+                    m = block.search(text, i, j)
+                    if time.thread_time() - t0 > self.slow_piece:   # slow in itself: line by line from now on
+                        self.block[rx] = None
+                        done = m.start() if m is not None else i
+                        break
+                    self.block_size[rx] = min(65536, size * 2)
                     if m is not None:
-                        i = m.start()
-                    break
-                self.block_size[rx] = min(65536, size * 2)
-                if m is not None:
-                    lines = text.split("\n")
-                    k = text.count("\n", 0, m.start())   # (lines before the first that can match)
-                    lines[:k] = [None] * k
-                    return lines
-                i = j
-                if i >= len(text):
-                    return None
+                        lines = text.split("\n")
+                        k = text.count("\n", 0, m.start())   # (lines before the first that can match)
+                        lines[:k] = [None] * k
+                        return lines
+                    i = j
+                else:
+                    continue
+                break
+            else:
+                return None   # (no line with the word can match)
         lines = text.split("\n")
         if must:
             lines = [ln if any(w in (_fold(ln) if fold else ln) for w in words) else None for ln in lines]
-        k = text.count("\n", 0, i)   # (lines already searched as a block, with nothing)
+        k = text.count("\n", 0, done)
         lines[:k] = [None] * k
         return lines
 
@@ -1074,8 +1097,14 @@ class _Lines:
 
     def add(self, chunk: bytes, win: "Window", src=None) -> str | None:
         data, ctx = self.buf + chunk, self.ctx
-        if self.cr and not self.buf and data[:1] == b"\n":   # \r\n split between two reads is one line end
-            data = data[1:]
+        if self.cr:   # \r\n split between two reads is one line end (escape codes between them are dropped, as
+            m = _ANSI_B.match(data)   # within one read)
+            rest = data[m.end():]
+            if rest[:1] == b"\n":
+                data = rest[1:]
+            elif _escape_start(rest):   # (only escape codes so far: the \n may still come)
+                self.buf = data
+                return None
         self.cr = False
         if self.skip:
             k = min((x for x in (data.find(b"\n"), data.find(b"\r")) if x >= 0), default=-1)
@@ -1084,13 +1113,17 @@ class _Lines:
                 return None
             if data[k:k + 2] == b"\r\n":
                 k += 1
-            self.cr = data[k:k + 1] == b"\r" and k == len(data) - 1
+            self.cr = data[k:k + 1] == b"\r" and _escape_start(data[k + 1:])
             data, self.skip, ctx = data[k + 1:], False, 0
         i = max(data.rfind(b"\n"), data.rfind(b"\r"))
         done = None
         if i >= 0:
-            j = i - 1 if data[i:i + 1] == b"\n" and data[i - 1:i] == b"\r" else i   # \r\n is one line end
-            self.cr = data[i:i + 1] == b"\r" and i == len(data) - 1
+            j = i
+            if data[i:i + 1] == b"\n":   # \r\n is one line end, also with escape codes between them
+                r = data.rfind(b"\r", 0, i)
+                if r >= 0 and _ANSI_B.match(data, r + 1).end() == i:
+                    j = r
+            self.cr = data[i:i + 1] == b"\r" and _escape_start(data[i + 1:])   # (at the end, or only escapes after)
             done, data, ctx = self._text(data[:j], ctx), data[i + 1:], 0
         if len(data) > 1 << 20:
             if done is not None:
@@ -1105,8 +1138,8 @@ class _Lines:
         return done
 
     def end(self, win: "Window", src=None) -> None:
-        if self.buf and not self.skip and win.pending():
-            # (a last line with no line end: it counts only now, when the output ends)
+        # (a last line with no line end: it counts only now, when the output ends; escape codes alone are no line)
+        if self.buf and not self.skip and win.pending() and _ANSI_B.match(self.buf).end() < len(self.buf):
             win.feed([self._text(self.buf, self.ctx)], [src], eof=True)
         self.buf, self.ctx = b"", 0
 
