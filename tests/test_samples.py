@@ -19,7 +19,7 @@ LAPTOP = "GPU 0 NVIDIA GeForce RTX 3050 Laptop GPU"
 
 
 class Window(unittest.TestCase):
-    rows = {"GPU 0": [(100.0, 0.0), (101.0, 50.0), (103.0, 250.0)]}   # 50 W for a second, then 100 W
+    rows = {"GPU 0": [[(100.0, 0.0), (101.0, 50.0), (103.0, 250.0)]]}   # 50 W for a second, then 100 W
 
     def test_edges_are_interpolated(self):
         r = samples.window(self.rows, 100.5, 102.0)
@@ -36,6 +36,23 @@ class Window(unittest.TestCase):
                 samples.window(self.rows, start, end)
         with self.assertRaises(ValueError):
             samples.window({}, 1.0, 2.0)
+
+    def test_a_wall_clock_set_back_during_the_run(self):
+        """100 W; at 10 s the clock is set back 5 s, so times 5-10 s happened twice. Those are refused; the
+        others are read in the stretch of readings they belong to."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        p = os.path.join(d, "s.csv")
+        rows = [(t, t * 100) for t in range(0, 11)] + [(t - 5, t * 100) for t in range(11, 21)]
+        Path(p).write_text("unix_time,device,energy_j,power_w\n" + "".join(f"{t},G,{e},100\n" for t, e in rows))
+        runs = samples.read_samples(p)
+        self.assertEqual(len(runs["G"]), 2)
+        self.assertAlmostEqual(samples.window(runs, 2.0, 4.0)["totals"]["energy_j"], 200.0)
+        self.assertAlmostEqual(samples.window(runs, 2.0, 12.0)["totals"]["energy_j"], 1500.0)   # (12 = 17 s in)
+        self.assertAlmostEqual(samples.window(runs, 11.0, 14.0)["totals"]["energy_j"], 300.0)
+        for start, end in ((2.0, 7.0), (7.0, 12.0), (6.0, 8.0)):
+            with self.assertRaises(ValueError):
+                samples.window(runs, start, end)
 
     def test_times(self):
         self.assertEqual(samples.parse_time("1795360794.25"), 1795360794.25)
@@ -54,8 +71,8 @@ class Window(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d)
         p = os.path.join(d, "s.csv")
         for cut in ("3,G,", "3,G,9", "3"):   # (cut off mid-line, even inside the energy)
-            Path(p).write_text("unix_time,device,energy_j,power_w\n2,G,10,5\n1,G,0,5\n" + cut)
-            self.assertEqual(samples.read_samples(p), {"G": [(1.0, 0.0), (2.0, 10.0)]})
+            Path(p).write_text("unix_time,device,energy_j,power_w\r\n1,G,0,5\r\n2,G,10,5\r\n" + cut)
+            self.assertEqual(samples.read_samples(p), {"G": [[(1.0, 0.0), (2.0, 10.0)]]})
         Path(p).write_text("unix_time,device,energy_j,power_w\n1,G,x,5\n2,G,1,5\n")
         with self.assertRaises(ValueError):
             samples.read_samples(p)
@@ -88,11 +105,11 @@ class Log(unittest.TestCase):
         m.poll(13.0)
         log.write([m])
         log.close()
-        rows = samples.read_samples(p)["GPU 0"]
+        rows, = samples.read_samples(p)["GPU 0"]
         t0 = rows[0][0]
         self.assertEqual([round(t - t0, 2) for t, _ in rows], [0.0, 1.0, 3.0])
         self.assertEqual([e for _, e in rows], [0.0, 40.0, 120.0])
-        self.assertAlmostEqual(samples.window({"GPU 0": rows}, t0 + 0.5, t0 + 2.5)["totals"]["energy_j"], 80.0, delta=0.1)
+        self.assertAlmostEqual(samples.window({"GPU 0": [rows]}, t0 + 0.5, t0 + 2.5)["totals"]["energy_j"], 80.0, delta=0.1)
         self.assertEqual(notes, [])
 
 
@@ -138,7 +155,7 @@ class EndToEnd(unittest.TestCase):
         t1, t2 = self.times()
         r = self.window("--start", t1, "--end", t2)
         self.assertAlmostEqual(r["totals"]["energy_j"], 45 * r["duration_s"], delta=0.01)   # 45 W, exactly
-        rows = samples.read_samples(os.path.join(self.d, "s.csv"))[LAPTOP]
+        rows, = samples.read_samples(os.path.join(self.d, "s.csv"))[LAPTOP]
         self.assertAlmostEqual(rows[-1][1], run["devices"][0]["energy_j"], places=4)   # (the file ends with the run)
         self.assertAlmostEqual(rows[-1][0] - rows[0][0], run["duration_s"], delta=0.01)
         self.assertEqual(run["samples"], os.path.join(self.d, "s.csv"))
@@ -156,7 +173,7 @@ class EndToEnd(unittest.TestCase):
         t1, t2 = self.times()
         r = self.window("--start", t1, "--end", t2)
         self.assertAlmostEqual(r["totals"]["energy_j"], 45 * r["duration_s"], delta=0.01)
-        rows = samples.read_samples(os.path.join(self.d, "s.csv"))[LAPTOP]
+        rows, = samples.read_samples(os.path.join(self.d, "s.csv"))[LAPTOP]
         gaps = [b[0] - a[0] for a, b in zip(rows, rows[1:])]
         self.assertGreater(max(gaps), 0.15)   # (a failed read: no row, the next one spans the gap)
 

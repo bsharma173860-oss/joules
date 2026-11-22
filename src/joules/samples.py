@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
-import io
 import math
 import re
 import time
@@ -86,25 +85,27 @@ def parse_time(text: str) -> float:
                          "e.g. 2026-11-22T14:03:07.250 (local) or ...+00:00") from None
 
 
-def read_samples(path: str) -> dict[str, list[tuple[float, float]]]:
-    """Each device's (time, energy) rows, in time order."""
-    out: dict[str, list[tuple[float, float]]] = {}
-    with open(path, newline="", encoding="utf-8") as f:
-        text = f.read()
-    if not text.endswith("\n"):   # (an unfinished last line: the run was cut off while writing it)
-        text = text[:text.rfind("\n") + 1]
-    rows = list(csv.reader(io.StringIO(text)))
-    if not rows or rows[0] != HEADER:
-        raise ValueError(f"{path} is not a joules samples file (its first line should be {','.join(HEADER)})")
-    for n, row in enumerate(rows[1:], 2):
-        try:
-            if len(row) != len(HEADER):
-                raise ValueError
-            out.setdefault(row[1], []).append((float(row[0]), float(row[2])))
-        except ValueError:
-            raise ValueError(f"{path} line {n} is not a sample: {','.join(row)}") from None
-    for rows_ in out.values():
-        rows_.sort()
+def read_samples(path: str) -> dict[str, list[list[tuple[float, float]]]]:
+    """Each device's (time, energy) rows in the order read, in runs whose times go forward (a new run where the
+    wall clock was set back during the run)."""
+    out: dict[str, list[list[tuple[float, float]]]] = {}
+    with open(path, newline="", encoding="utf-8") as f:   # (line by line: a day of readings is a big file)
+        if next(csv.reader([f.readline()]), []) != HEADER:
+            raise ValueError(f"{path} is not a joules samples file (its first line should be {','.join(HEADER)})")
+        for n, line in enumerate(f, 2):
+            if not line.endswith("\n"):   # (an unfinished last line: the run was cut off while writing it)
+                break
+            row = next(csv.reader([line]), [])
+            try:
+                if len(row) != len(HEADER):
+                    raise ValueError
+                t, e = float(row[0]), float(row[2])
+            except ValueError:
+                raise ValueError(f"{path} line {n} is not a sample: {line.strip()}") from None
+            runs = out.setdefault(row[1], [[]])
+            if runs[-1] and t < runs[-1][-1][0]:
+                runs.append([])
+            runs[-1].append((t, e))
     return out
 
 
@@ -127,12 +128,16 @@ def window(samples: dict[str, list[tuple[float, float]]], start: float, end: flo
     if not samples:
         raise ValueError("the samples file has no samples")
     devices = []
-    for name, rows in samples.items():
-        first, last = rows[0][0], rows[-1][0]
+    for name, runs in samples.items():
+        first, last = min(r[0][0] for r in runs), max(r[-1][0] for r in runs)
         if start < first or end > last:
             raise ValueError(f"{name} has samples from {_show(first)} to {_show(last)}; the window "
                              f"{_show(start)} to {_show(end)} is not inside that")
-        row = {"name": name, "energy_j": _at(rows, end) - _at(rows, start)}
+        (i, e0), (j, e1) = _find(runs, start, name), _find(runs, end, name)
+        if j < i:
+            raise ValueError(f"the wall clock was set back during the run, and {_show(end)} comes before "
+                             f"{_show(start)} in {name}'s readings")
+        row = {"name": name, "energy_j": e1 - e0}
         if idle_w and name in idle_w:
             row["idle_w"] = idle_w[name]
             row["above_idle_j"] = max(0.0, row["energy_j"] - idle_w[name] * (end - start))
@@ -142,6 +147,17 @@ def window(samples: dict[str, list[tuple[float, float]]], start: float, end: flo
         total["above_idle_j"] = sum(d["above_idle_j"] for d in devices)
     return {"schema": "joules/1", "kind": "window", "start": start, "end": end, "duration_s": end - start,
             "devices": devices, "totals": total}
+
+
+def _find(runs, t: float, name: str) -> tuple[int, float]:
+    """Which run of readings has time t, and the energy then."""
+    hits = [i for i, r in enumerate(runs) if r[0][0] <= t <= r[-1][0]]
+    if len(hits) > 1:
+        raise ValueError(f"the wall clock was set back during the run, so {_show(t)} happened twice in {name}'s "
+                         "readings: pick a time outside the repeated stretch")
+    if not hits:   # (in a gap where the clock jumped back: the readings either side are of different moments)
+        raise ValueError(f"{_show(t)} falls where the wall clock was set back in {name}'s readings")
+    return hits[0], _at(runs[hits[0]], t)
 
 
 def _show(t: float) -> str:
