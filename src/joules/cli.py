@@ -629,6 +629,14 @@ def cmd_run(a) -> int:
     return code
 
 
+def _searchable(pattern: str) -> str:
+    """The pattern to search with: a leading .* (or ^.*, .*?) changes nothing in a search but makes it slow on long
+    lines (each start tried to the end), so it is dropped."""
+    m = re.match(r"\^?\.\*\??", pattern)
+    rest = pattern[m.end():] if m else pattern
+    return rest if m and rest and rest[0] not in "*+?{" else pattern
+
+
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b[@-Z\\-_]")  # colours, moves, titles, charsets
 
 
@@ -639,8 +647,9 @@ class Window:
 
     def __init__(self, clock: PhaseClock, start_t: float, meters, start_re: str | None, end_re: str | None):
         self.clock, self.meters = clock, meters
-        self.start_re = re.compile(start_re) if start_re is not None else None
-        self.end_re = re.compile(end_re) if end_re is not None else None
+        self.start_re = re.compile(_searchable(start_re)) if start_re is not None else None
+        self.end_re = re.compile(_searchable(end_re)) if end_re is not None else None
+        self.match_s = 0.0    # time spent matching (it holds up the rest of joules)
         self.lock = threading.Lock()
         self.begin = None if self.start_re else {"t": start_t, "j": {m.name: 0.0 for m in meters}, "line": None}
         self.end = None
@@ -655,9 +664,14 @@ class Window:
                     for rx in (self.start_re, self.end_re) if rx}
 
     def _mark(self, text: str, src=None) -> dict:
-        snap = self.frozen or self.clock.snapshot()
+        snap, late = self.frozen, True
+        if snap is None:
+            snap, late = self.clock.snapshot(), False
+            exited = self.frozen
+            if exited is not None and snap["t"] >= exited["t"]:   # the command exited meanwhile
+                snap, late = exited, True
         return {"t": snap["t"], "j": snap["j"], "line": text.strip()[:200],
-                "late": self.frozen is not None, "src": src, "after_pause": self.paused}
+                "late": late, "src": src, "after_pause": self.paused}
 
     @staticmethod
     def clean(text: str) -> str:
@@ -677,9 +691,9 @@ class Window:
         return self.begin is None or (self.end is None and self.end_re is not None)
 
     def freeze(self, snap: dict) -> None:
-        """The meters as the command exits (read while they are still running)."""
-        with self.lock:
-            self.frozen = {"t": snap["t"], "j": dict(snap["j"])}
+        """The meters as the command exits (read while they are still running). Not under the lock: a search in
+        progress must not delay it (a mark it then sets after the exit is the end of the run, see _mark)."""
+        self.frozen = {"t": snap["t"], "j": dict(snap["j"])}
 
     def _lines(self, text: str, rx) -> list[str] | None:
         text = self.clean(text)
@@ -689,6 +703,13 @@ class Window:
         return text.split("\n")
 
     def feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
+        t0 = time.perf_counter()
+        try:
+            return self._feed(texts, srcs, partial, keep_from)
+        finally:
+            self.match_s += time.perf_counter() - t0
+
+    def _feed(self, texts: list[str], srcs: list | None = None, partial: bool = False, keep_from=None) -> bool:
         """Whole lines that arrived together, one block per stream. The --from line is looked for in all of them
         first, then the --until line after it on its own stream. Which came first of lines that arrived together
         on two streams is not known: an --until line on the other stream is kept aside (alt_end), used only if no
@@ -1369,6 +1390,12 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
                      "the figures above are the whole run.")
         return {"window": info, "window_s": None, "window_energy_j": None}, notes
     end = end or {**(w.frozen or {"t": s.t1, "j": {m.name: m.energy_j for m in meters}}), "line": None}
+    if end["t"] < begin["t"]:   # (cannot end before it starts)
+        end = {**end, "t": begin["t"], "j": begin["j"]}
+    if getattr(w, "match_s", 0.0) >= 1.0:
+        notes.append(f"Matching --from/--until took {w.match_s:.1f} s of joules' time, which held up the command's "
+                     "output (and the command, once its pipe was full), so the run and the window may be off. "
+                     "Use a simpler pattern (no nested repeats; a plain word is fastest).")
     if a.window_until is not None and info["found_until"] is False:
         after = "after the --from line" if a.window_from is not None else "in the command's output"
         notes.append(f"--until {a.window_until!r} never appeared {after}, so the window runs to the end of the command.")
@@ -1387,7 +1414,8 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
     held = at_exit and nothing_before
     # did joules pause for a slow reader before a mark it then found?
     paused = bool(begin.get("after_pause") or (found_end or {}).get("after_pause"))
-    if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny or held):
+    slow = getattr(w, "match_s", 0.0) >= 1.0   # (said above: that, not held output, is why marks came late)
+    if exit_t - s.t0 >= 0.2 and (begin.get("late") or tiny or held) and not slow:
         if (getattr(w, "behind", False) or paused) and (begin.get("late") or at_exit):
             notes.append("The marker lines were only read when the command exited, so the window may be wrong: what "
                          "reads joules' output (a pager, a slow pipe) took it so slowly that joules fell behind.")

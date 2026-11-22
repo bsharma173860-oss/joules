@@ -1079,6 +1079,48 @@ class RunWindow(unittest.TestCase):
         self.assertEqual(int(q.stdout.split()[0]), 25_000_000 + 4)
         self.assertNotIn("16 MB", Path(err).read_text())
 
+    # ---- found in review round 15
+    def test_a_leading_dot_star_is_not_slow(self):
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        for pattern, want in ((".*START", "START"), ("^.*START", "START"), (".*?START", "START"), (".*A|B", "A|B"),
+                              (".*", ".*"), (".*+x", ".*+x"), ("(?i).*x", "(?i).*x"), ("START", "START")):
+            self.assertEqual(cli._searchable(pattern), want, pattern)
+        code = ("import time\nfor i in range(10): print('a' * 30000, flush=True)\n"
+                "print('START', flush=True); time.sleep(1); print('END', flush=True)\n")
+        t0 = time.monotonic()
+        p, r = self.run_j(["--no-cpu", "--from", ".*START", "--until", "END"], [sys.executable, "-c", code])
+        self.assertLess(time.monotonic() - t0, 6)
+        self.assertLess(r["duration_s"], 2.0)
+        self.assertTrue(0.9 < r["window_s"] < 1.3, r["window_s"])
+
+    def test_a_slow_pattern_is_said_to_be_slow_and_the_window_never_ends_before_it_starts(self):
+        code = ("import time\nfor i in range(10): print('a' * 30000, flush=True)\n"
+                "print('START', flush=True); time.sleep(1); print('END', flush=True)\n")
+        p, r = self.run_j(["--no-cpu", "--from", "a*START", "--until", "END"], [sys.executable, "-c", code], timeout=120)
+        w = r["window"]
+        self.assertGreaterEqual(w["ends_at_s"], w["starts_at_s"])
+        if any("Matching --from/--until took" in n for n in r["notes"]):   # (on a fast machine it may stay under 1 s)
+            self.assertFalse([n for n in r["notes"] if "held its output" in n or "10 ms" in n], r["notes"])
+
+    def test_a_mark_set_while_the_command_exits_is_the_end_of_the_run(self):
+        """The exit is recorded while a search is under way: the mark it then sets is late, at the exit."""
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+
+        class M:
+            name, kind, energy_j = "GPU 0", "gpu", 50.0
+        w = None
+
+        class Clock:
+            def snapshot(self):
+                w.freeze({"t": 3.0, "j": {"GPU 0": 30.0}})   # the command exits during this read
+                return {"t": 3.5, "j": {"GPU 0": 35.0}}
+        w = cli.Window(Clock(), 0.0, [M()], "START", "END")
+        w.feed(["START"], [1])
+        self.assertEqual(w.begin["t"], 3.0)
+        self.assertTrue(w.begin["late"])
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)
