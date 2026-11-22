@@ -532,13 +532,23 @@ def cmd_run(a) -> int:
     try:
         with Sampler(d.meters, a.interval, notes=d.notes) as s:
             windowed = a.window_from is not None or a.window_until is not None
-            proc = _start(cmd, piped=windowed)
+            # (from before the command starts: a signal at any moment after, before our reader exists, is held)
+            term = _TermGuard() if windowed and os.name == "posix" else None
+            if term:
+                term.install()
+            try:
+                proc = _start(cmd, piped=windowed)
+            except BaseException:
+                if term:
+                    term.restore()
+                raise
             if not proc:
+                if term:
+                    term.restore()
                 return 126 if proc is False else _not_found(cmd)
             for m in d.meters:
                 if hasattr(m, "attach"):
                     m.attach(proc)
-            term = _TermGuard() if windowed and os.name == "posix" else None
             if windowed:
                 clock = PhaseClock(d.meters, s.lock)
                 win = Window(clock, s.t0, d.meters, a.window_from, a.window_until)
@@ -552,7 +562,6 @@ def cmd_run(a) -> int:
                 if os.name == "posix":
                     pumps = [threading.Thread(target=_pump_all, args=(proc.joules_streams, win, pump_state, outs), daemon=True)]
                     old_winch = _follow_resizes(proc)
-                    term.install()
                 else:
                     pumps = [threading.Thread(target=_pump, args=(fd, dst, win, pump_state, close, outs[fd]), daemon=True)
                              for fd, dst, close in proc.joules_streams]
@@ -595,6 +604,7 @@ def cmd_run(a) -> int:
             if terminated:
                 raise _Terminated
             waited = _drain_after_exit(proc, pumps, pump_state, outs, d.notes, term)
+            win.left_open = pump_state.get("left_open", False)
             if waited:
                 for o in outs.values():
                     o.close()
@@ -609,12 +619,13 @@ def cmd_run(a) -> int:
                             break
             if not waited:   # one Ctrl-C: hand everything over and report now
                 if _hand_over(proc, pumps, pump_state, outs):
+                    win.left_open = True
                     d.notes.append("The command's output was still open when it exited (a process it started keeps "
                                    "it open).")
                 d.notes.append("joules stopped waiting for the command's output (Ctrl-C); a small helper passes on "
                                "the rest of it after joules finishes.")
         except _Terminated:
-            _end_on_term(proc, pumps, pump_state, outs)
+            _end_on_term(proc, pumps, pump_state, outs, term.sig if term else None)
         if not any(t.is_alive() for t in pumps):
             for f in pump_state.get("wake") or ():
                 with contextlib.suppress(OSError):
@@ -623,8 +634,8 @@ def cmd_run(a) -> int:
             term.restore(ctrl_c=False)
         if os.name == "posix":
             _stop_following(old_winch)
-        if term and term.hit:   # a SIGTERM that came while nothing was left to hand over
-            os.kill(os.getpid(), signal.SIGTERM)
+        if term and term.hit:   # a SIGTERM (SIGHUP) that came while nothing was left to hand over
+            os.kill(os.getpid(), term.sig or signal.SIGTERM)
     devices = _devices(d, idle, s.duration_s)
     ops = a.flops or (training_flops(a.params, a.tokens) if a.params and a.tokens else None)
     report = {"schema": "joules/1", "tool": f"joules {__version__}", "kind": "run", "command": cmd, "exit_code": code,
@@ -1614,6 +1625,9 @@ class _Terminated(Exception):
     pass
 
 
+_ENDING = [s for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if s is not None]
+
+
 class _TermGuard:
     """POSIX, until the command's output is all passed on: a SIGTERM to joules alone ends joules as it would without
     a window, but first hands the command's streams (and output not yet passed on) to a helper, so the command and
@@ -1622,19 +1636,22 @@ class _TermGuard:
 
     def __init__(self):
         self.hit = self.armed = False
-        self.old = self.old_int = None
+        self.sig = None   # the signal that asked joules to end (SIGTERM, or SIGHUP: a closed terminal)
+        self.old, self.old_int = {}, None
 
     def install(self) -> None:
         if threading.current_thread() is not threading.main_thread():
             return
         with contextlib.suppress(ValueError, OSError):
-            if signal.getsignal(signal.SIGTERM) is not signal.SIG_IGN:   # (an ignored SIGTERM stays ignored)
-                self.old = signal.signal(signal.SIGTERM, self._on)
+            for sig in _ENDING:
+                if signal.getsignal(sig) is signal.SIG_DFL:   # (an ignored or handled one is left as it is)
+                    self.old[sig] = signal.signal(sig, self._on)
             if signal.getsignal(signal.SIGINT) is signal.default_int_handler:   # Ctrl-C too only lands where we wait
                 self.old_int = signal.signal(signal.SIGINT, self._on_int)
 
-    def _on(self, *_):
+    def _on(self, sig, *_):
         self.hit = True
+        self.sig = self.sig or sig
         if self.armed:
             self.armed = False
             raise _Terminated
@@ -1656,11 +1673,11 @@ class _TermGuard:
 
     def restore(self, ctrl_c: bool = True) -> None:
         """Put the handlers back (Ctrl-C only once the report is out, if ctrl_c is False now)."""
-        for sig, old in ((signal.SIGTERM, self.old), (signal.SIGINT, self.old_int if ctrl_c else None)):
+        for sig, old in (*self.old.items(), (signal.SIGINT, self.old_int if ctrl_c else None)):
             if old is not None:
                 with contextlib.suppress(ValueError, OSError):
                     signal.signal(sig, old)
-        self.old = None
+        self.old = {}
         if ctrl_c:
             self.old_int = None
 
@@ -1720,6 +1737,7 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> bool:
             return True
         notes.append("The command's output was still open when it exited (a process it started keeps it open); "
                      "joules stopped reading it.")
+        state["left_open"] = True
         return True
     state["stop"].set()
     while alive():   # our reader never waits on a writer, so it stops at once
@@ -1742,6 +1760,7 @@ def _drain_after_exit(proc, pumps, state, outs, notes, term) -> bool:
         with contextlib.suppress(OSError):
             os.close(fd)
     if held:
+        state["left_open"] = True
         notes.append("The command's output was still open when it exited (a process it started keeps it open); " + (
             "a small helper keeps passing it on after joules finishes." if moved else "joules stopped reading it."))
     return True
@@ -1769,16 +1788,20 @@ def _hand_over(proc, pumps, state, outs, ending: bool = False) -> bool:
     return held
 
 
-def _end_on_term(proc, pumps, state, outs) -> None:
-    """SIGTERM to joules alone: hand everything to helpers and end as the signal would (no report)."""
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)   # a second one ends joules at once
+def _end_on_term(proc, pumps, state, outs, sig=None) -> None:
+    """SIGTERM (or SIGHUP) to joules alone: hand everything to helpers and end as the signal would (no report)."""
+    sig = sig or signal.SIGTERM
+    for s in _ENDING:   # a second one ends joules at once
+        if signal.getsignal(s) not in (signal.SIG_IGN, None):
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(s, signal.SIG_DFL)
     _hand_over(proc, pumps, state, outs, ending=True)
-    os.kill(os.getpid(), signal.SIGTERM)
+    os.kill(os.getpid(), sig)
     time.sleep(1)
-    sys.exit(128 + signal.SIGTERM)
+    sys.exit(128 + sig)
 
 
-COPIER = ("import os, sys\n"
+COPIER = ("import os, select, sys\n"
           "while True:\n"   # wait for joules to finish (it holds the other end of this pipe), so its report comes first
           "    try:\n"
           "        if not os.read(int(sys.argv[1]), 1):\n"
@@ -1795,7 +1818,10 @@ COPIER = ("import os, sys\n"
           "            break\n"
           "        try:\n"
           "            while b:\n"
-          "                b = b[os.write(1, b):]\n"
+          "                try:\n"
+          "                    b = b[os.write(1, b):]\n"
+          "                except BlockingIOError:\n"   # (an output someone made non-blocking: wait, as joules does)
+          "                    select.select([], [1], [])\n"
           "        except OSError:\n"
           "            sys.exit()\n")
 
@@ -1917,7 +1943,7 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
                      "first is not known; with no later --until line, joules took it as the end.")
     info = {"from": a.window_from, "until": a.window_until,
             "found_from": begin is not None and a.window_from is not None, "found_until": end is not None}
-    cut = getattr(w, "cut_short", False)
+    cut = getattr(w, "cut_short", False) or getattr(w, "left_open", False)
     if begin is None and cut:
         notes.append(f"--from {a.window_from!r} was not found before joules stopped looking (it handed the output "
                      "over before it had looked at all of it), so there is no window: the figures above are the "
@@ -1936,6 +1962,9 @@ def _window_report(a, w: Window, s: Sampler, meters, idle: dict) -> tuple[dict, 
             "was not found before joules stopped looking (it handed the output over before it had looked at all "
             "of it)" if cut else f"never appeared {after}") + ", so the window runs to the end of the command.")
     exit_t = (w.frozen or {}).get("t", s.t1)
+    if (found_end or {}).get("after_exit") and not begin.get("after_exit") and exit_t - s.t0 >= 0.2:
+        notes.append("The --until line was printed after the command exited (by a process it left running), and "
+                     "measuring stops when the command exits, so the window ends at the exit and misses the rest.")
     # Held back: the --from line read only after the exit, or a window of no time at the exit (a late --until alone
     # is just the command's last line, read a moment after it exited). Not for a run too short for it to matter.
     src, firsts = begin.get("src"), getattr(w, "first_out", None) or {}

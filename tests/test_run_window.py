@@ -1900,6 +1900,75 @@ class RunWindow(unittest.TestCase):
         self.assertTrue(w.begin)
         self.assertIsNone(w.end)   # (no empty line: the long line ended once)
 
+    # ---- found in review round 34
+    def test_an_until_line_printed_after_the_exit_gets_a_note(self):
+        """A wrapper that starts the work in the background and exits: the window ends at the exit, and joules says so."""
+        p, r = self.run_j(["--no-cpu", "--from", "^start", "--until", "^done"],
+                          ["bash", "-c", "sleep 0.3; echo start; sleep 0.5; (sleep 1.5; echo done) & echo launched"])
+        self.assertTrue(r["window"]["found_until"], r["window"])
+        self.assertTrue(any("--until line was printed after the command exited" in n for n in r["notes"]), r["notes"])
+
+    def test_a_marker_after_the_output_was_handed_over_is_not_said_to_never_appear(self):
+        p, r = self.run_j(["--no-cpu", "--from", "^start", "--until", "^done"],
+                          ["bash", "-c", "sleep 0.3; echo start; sleep 0.3; (sleep 4; echo done) & echo launched"])
+        self.assertTrue(any("not found before joules stopped looking" in n for n in r["notes"]), r["notes"])
+        self.assertFalse(any("never appeared" in n for n in r["notes"]), r["notes"])
+
+    def test_a_sighup_to_joules_alone_leaves_the_command_running(self):
+        """A closed ssh terminal while the output goes to a file: as without a window, the command keeps its output."""
+        out = os.path.join(self.d, "out")
+        with open(out, "wb") as f:
+            q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "tick", "--", "bash", "-c",
+                                  "trap '' HUP; for i in 1 2 3 4 5 6; do echo tick $i; sleep 0.3; done"], stdout=f,
+                                 stderr=subprocess.DEVNULL, env=self.env())
+            time.sleep(0.8)
+            q.send_signal(signal.SIGHUP)
+            self.assertEqual(q.wait(timeout=20), -signal.SIGHUP)
+        deadline = time.monotonic() + 10
+        while "tick 6" not in Path(out).read_text() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertIn("tick 6", Path(out).read_text())
+
+    def test_a_sigterm_as_the_command_starts_loses_no_output(self):
+        out = os.path.join(self.d, "out")
+        for _ in range(3):
+            with open(out, "wb") as f:
+                q = subprocess.Popen([sys.executable, "-m", "joules", "run", "--no-cpu", "--from", "tick", "--", "sh",
+                                      "-c", "kill -TERM $PPID; for i in 1 2 3 4 5; do echo tick $i; sleep 0.1; done"],
+                                     stdout=f, stderr=subprocess.DEVNULL, env=self.env())
+                self.assertEqual(q.wait(timeout=20), -signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while "tick 5" not in Path(out).read_text() and time.monotonic() < deadline:
+                time.sleep(0.2)
+            self.assertIn("tick 5", Path(out).read_text())
+
+    def test_the_helper_waits_on_an_output_made_non_blocking(self):
+        import fcntl
+        sys.path.insert(0, str(ROOT / "src"))
+        from joules import cli
+        gate_r, gate_w = os.pipe()
+        os.close(gate_w)   # (joules has finished)
+        src = os.path.join(self.d, "src")
+        data = b"".join(b"line %06d\n" % i for i in range(100000))   # ~1.2 MB, far more than a pipe holds
+        Path(src).write_bytes(data)
+        r, w = os.pipe()
+        fcntl.fcntl(w, fcntl.F_SETFL, fcntl.fcntl(w, fcntl.F_GETFL) | os.O_NONBLOCK)
+        with open(src, "rb") as f:
+            q = subprocess.Popen([sys.executable, "-c", cli.COPIER, str(gate_r)], stdin=f, stdout=w,
+                                 pass_fds=(gate_r,))
+        os.close(w)
+        os.close(gate_r)
+        time.sleep(0.5)   # (a slow reader: the pipe fills)
+        got = b""
+        while True:
+            b = os.read(r, 65536)
+            if not b:
+                break
+            got += b
+        os.close(r)
+        q.wait(timeout=20)
+        self.assertEqual(len(got), len(data))
+
     def test_window_with_an_energy_counter(self):
         """The same window on a GPU with an energy counter (the stand-in H100 draws 650 W)."""
         p, r, _ = self.joules(["--gpus", "0", "--from", r">>> running trie", "--until", r">>> done\."], lib=self.server)

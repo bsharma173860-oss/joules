@@ -148,9 +148,10 @@ joules run --subtract-idle 10 --from '>>> running trie' --until '>>> done\.' --o
     plain text every match must contain (`steps done` in `^\d+ steps done$`) and tries the pattern only on lines that have
     it, so put a word in it. A leading `.*` or `.+` is fine (joules drops it), but another leading repeat (`\w*`,
     `[^ ]+`) or nested repeats (`(a+)+`) can be slow on the lines it is tried on and hold up joules (passing output
-    on, measuring, even Ctrl-C) and so the script, and stretch the measured run; joules says so if matching took
-    over a second. In a line longer than 1 MB, joules keeps only its last 64 KB (and 256 bytes before that), so a
-    match longer than that, or one that needs to look further back, may be missed.
+    on, measuring, even Ctrl-C and SIGTERM: only SIGKILL stops a search that never ends) and so the script, and
+    stretch the measured run; joules says so if matching took over a second. In a line longer than 1 MB, joules
+    keeps only its last 64 KB (and 256 bytes before that), so a match longer than that, or one that needs to look
+    further back, may be missed.
   - Measuring stops when the script exits. A server it leaves running does not keep joules waiting, and on Linux
     and macOS it keeps its output after joules finishes.
   - The CPU-time estimate (used where there are no energy counters) is only known for the whole run, so it is not
