@@ -2,7 +2,7 @@
 
 As a library: joules.Session() measures named phases of your own program, joules.measure() one block, and
 joules.connect() puts the machine on WattOps (Live, Tracking and the GPU leaderboard) from a notebook."""
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 
 def __getattr__(name):  # the library API loads on first use, so the command line stays quick to start
