@@ -2,6 +2,36 @@
 
 joules is published on PyPI as [landauer-gap](https://pypi.org/project/landauer-gap/). Newest first.
 
+## 0.8.3 (24 November 2026)
+
+- **Energy between two times, picked afterwards.** `joules run --samples FILE.csv` writes one row per reading of each
+  device while the command runs: the time, the device, its energy since the start (from the counter, or integrated
+  power) and its power, flushed about every second. `joules window FILE.csv --start T --end T` then gives each
+  device's energy between any two times inside the run, interpolated at the edges, and above idle when `--run
+  run.json` names the run and it measured idle. Times are unix seconds or ISO (without a zone they are local time).
+  Useful when the part of a run you care about is only known after it ends: one phase of a training job, or the
+  minutes of a benchmark between two log lines. joules does not touch the command's output. See "Measuring part of a
+  run" in the README. Times outside the samples, unix times that look like milliseconds, and a `--run` file that is not
+  a joules run are refused with a clear message; a samples file cut off mid-line (a full disk) and a wall clock set
+  back during the run are handled.
+- A failed NVML energy read now skips one reading instead of stopping every meter for the rest of the run.
+- Failed power reads (the NVML power fallback, AMD ADLX) are skipped instead of counted as 0 W: a steady 300 W card
+  whose every other read failed measured 1500 J over 10 s instead of 3000 J.
+- A read error on the first or last reading of a meter (for example an AMD card powering down) no longer loses the
+  whole run: the meter is measured from its first good reading or up to its last one, and a note says so.
+- `peak_w` on counter meters is taken over windows of about one second; a steady 300 W load could report a peak of
+  about 580 W, because one poll sometimes held two counter steps. Energy is unchanged.
+- On AMD APUs, a note says when the GPU's power is also inside the CPU package figure from RAPL, so the two are not
+  read as separate. No number changes.
+- `joules proxy --track` now sends every request as it finishes: a long request that finished after a later, shorter
+  one used to be missing from the project's history. An upstream error body with a string `message` (vLLM's) no
+  longer crashes the handler or leaves a request counted as running.
+- `joules ci`: a single outlier run no longer makes a regression read as run-to-run noise. The change is noise only
+  when each side's median lies within the other side's runs.
+- A `--out` path in a folder that does not exist is refused before the command starts, and a failed write no longer
+  loses a printed result. `joules compare` and `joules ci` with a command that does not exist say "command not found"
+  (exit 127); a bad `--gpus` or `--interval` gets a clear error instead of a traceback.
+
 ## 0.8.2 (3 November 2026)
 
 - **AMD GPUs on Windows.** joules now reads AMD GPU power on Windows through ADLX, the library that ships with every
