@@ -75,7 +75,7 @@ pipx: `pipx install landauer-gap` (update: `pipx upgrade landauer-gap`).
 | `joules share FILE` | Share a result saved earlier with `--out FILE`. |
 | `joules ci --budget 10 -- CMD …` | Energy check for a pull request: this change vs the base branch. |
 | `joules compare "CMD A" "CMD B"` | The same work done two or more ways: interleaved runs after a warm-up, median energy, time, power and energy × time with their spread, a Mann-Whitney p-value against the baseline, and a warning when the GPU did not run under the same conditions. `--limits 100,70` repeats it at fixed power limits (sudo), `--lock-clocks base` (or a clock in MHz) locks the GPU's SM clock for every run and unlocks it afterwards (sudo), `--cool-to 50` starts every run from the same temperature, `--markdown`/`--csv` for papers. |
-| `joules proxy --upstream URL` | Energy receipt on every response of a model server. |
+| `joules proxy --upstream URL` | Energy per token for vLLM, SGLang or Ollama: an energy receipt on every response. See [Energy per token for model servers](#energy-per-token-for-model-servers). |
 | `joules agent` | Energy per job on a GPU server or cluster node: Slurm jobs, Kubernetes pods, containers, users. |
 | `joules connect` | Put this machine on WattOps under one name: the GPU leaderboard, Live and Tracking. Asks for the key without showing it. In a notebook: `import joules; joules.connect()`. |
 | `joules tune ollama:MODEL` | Benchmark at several GPU power limits (100, 85, 70, 55% of the maximum) and report the one with the cheapest token that is at most `--max-slowdown` (10%) slower. Puts the limit back. Needs `sudo`. |
@@ -213,16 +213,19 @@ hosted runners, which have no energy counters, energy is estimated from CPU time
 so; on a self-hosted runner with a GPU or RAPL it is measured. `joules run --estimate` uses the same
 estimate when a machine has no counters.
 
-## Energy receipts for AI responses
+## Energy per token for model servers
 
-> **Frozen:** `joules proxy` gets bug fixes only, no new features, until a paying user asks for more.
+`joules proxy` sits in front of a vLLM, SGLang or Ollama server and measures the hardware while each request
+runs. Point your client at the proxy instead of the server; nothing else changes.
 
-`joules proxy` sits in front of a model server and measures the hardware while each request runs.
-Point your client at the proxy instead of the server; nothing else changes.
+**A receipt is each request's share of the device's measured energy.** The meters measure whole devices (a GPU, a CPU
+package), not single requests, so in each sampling interval joules splits the device's energy equally between the
+requests running at that moment. With `--subtract-idle` receipts also carry the energy above idle.
 
 ```bash
-joules proxy --upstream http://localhost:11434          # Ollama
 joules proxy --upstream http://localhost:8000 --subtract-idle 5   # vLLM, measured above idle
+joules proxy --upstream http://localhost:30000 --subtract-idle 5  # SGLang, measured above idle
+joules proxy --upstream http://localhost:11434                    # Ollama
 ```
 
 ```
@@ -236,10 +239,9 @@ X-Energy-Receipt: /joules/receipts/r-000017
 
 - Streaming responses (SSE or Ollama's NDJSON) pass through untouched and carry `X-Energy-Receipt`;
   the receipt at that address is complete when the stream ends.
-- Tokens come from the response (`usage`, or Ollama's `eval_count`). Without them, streamed pieces
-  are counted and the receipt says `tokens_exact: false`.
-- Meters measure whole devices, so in each sampling interval the energy is shared equally between
-  the requests running at that moment. With `--subtract-idle` receipts also carry energy above idle.
+- Tokens come from the response (`usage`, or Ollama's `eval_count`). When streaming, ask the server for usage
+  (`"stream_options": {"include_usage": true}`) so the count is exact; without it, streamed pieces are counted and
+  the receipt says `tokens_exact: false`.
 - `/joules/receipts` lists the newest receipts, `/joules/metrics` serves Prometheus metrics, and
   `/joules/health` says what is measured.
 - `--track PROJECT` sends one summary per model every 5 minutes to your Tracking page: never
@@ -268,7 +270,7 @@ its host name. It then:
 1. runs the one-minute GPU test and puts it on the GPU leaderboard (skip it with `--no-board` / `board=False`);
 2. starts `joules agent` in the background under that name. Each program that runs a minute or more and then
    ends goes to your Tracking page, in a project named after the machine. The machine's power and jobs also
-   show on Live every 5 seconds: 1 GPU on the Free plan, more paid per GPU (from $4 a GPU a month).
+   show on Live every 5 seconds: 1 GPU on the Free plan; for more, [send us your setup](https://wattops.dev/review).
 
 As root on a machine that runs systemd, connect installs the agent as the `joules-agent` service instead, so it
 starts with the machine (`sudo joules connect`). Elsewhere (containers, notebooks, without root) the agent runs
@@ -296,8 +298,8 @@ sudo joules agent                         # http://127.0.0.1:9877/jobs and /metr
 sudo joules agent --track cluster         # each finished job on your Tracking page
 ```
 
-`--track` also puts the node on the **Live** page (https://wattops.dev/#/live): 1 GPU on the Free plan, more
-paid per GPU (from $4 a GPU a month), every GPU on Fleet (a machine without a GPU counts as one; a machine over the limit waits, trying every minute). Live shows
+`--track` also puts the node on the **Live** page (https://wattops.dev/#/live): 1 GPU on the Free plan, more on a plan
+set up with us ([send us your setup](https://wattops.dev/review)); a machine without a GPU counts as one, and a machine over the limit waits, trying every minute. Live shows
 its power, cost per hour, idle GPUs and the jobs running now, updated every 5 seconds (`--live-every`,
 0 turns it off), and every GPU on its own: power, how busy, clock, temperature, power limit and whether it is
 throttled and why, so a fleet of a hundred GPUs shows which ones are idle, hot or held back. Heartbeats do not count against your API calls. On a Mac the agent measures the whole
