@@ -2,6 +2,21 @@
 
 joules is published on PyPI as [landauer-gap](https://pypi.org/project/landauer-gap/). Newest first.
 
+## 0.8.4 (unreleased)
+
+- **`joules proxy --split tokens`: energy shared by each request's work, not equally.**
+  - With continuous batching, a 150,000-token prompt and a 20-token one running side by side used to get the same
+    share of each interval's energy. With `--split tokens`, shares follow the output pieces each request streams in
+    the interval, plus its prompt tokens x `--prefill-weight`, spread over its prefill.
+  - The prompt length comes from the engine's `/tokenize` endpoint (vLLM, SGLang), or else an estimate. It is
+    corrected with `usage.prompt_tokens`, minus cached tokens, when the response ends.
+  - Receipts carry `split`, `weights` and `work`, and a `basis` that states the method.
+  - The default stays `--split equal`, with unchanged receipts (plus `"split": "equal"`).
+  - Every interval's energy is still shared out in full.
+- **`joules proxy --calibrate --model M`** measures the prefill weight on your machine: the energy per prompt token
+  over the energy per output token, above idle, from three sets of requests sent straight to the engine.
+- Streamed reasoning output (`reasoning_content`) now counts as progress for the token split.
+
 ## 0.8.3 (24 November 2026)
 
 - **Energy between two times, picked afterwards.** `joules run --samples FILE.csv` writes one row per reading of each

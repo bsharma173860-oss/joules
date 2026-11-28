@@ -1033,6 +1033,8 @@ def cmd_proxy(a) -> int:
             print(warn("joules proxy: " + n), file=sys.stderr)
         return 1
     ci_ = a.ci if a.ci is not None else GRIDS[a.grid]
+    if a.calibrate:
+        return _calibrate(a, d)
 
     def log(r: dict) -> None:
         if a.quiet:
@@ -1043,7 +1045,9 @@ def cmd_proxy(a) -> int:
 
     try:
         srv = proxy.ProxyServer((a.host, a.port), a.upstream, d.meters, idle_w=sum(idle.values()) if idle else None,
-                                price=a.price, g_per_kwh=ci_, pue=a.pue, interval=a.interval, log=log)
+                                price=a.price, g_per_kwh=ci_, pue=a.pue, interval=a.interval, log=log,
+                                split=a.split, prefill_weight=1.0 if a.prefill_weight is None else a.prefill_weight,
+                                prefill_weight_from="default, not calibrated" if a.prefill_weight is None else "given")
     except (OSError, ValueError) as e:
         d.close()
         print(f"joules proxy: {e}", file=sys.stderr)
@@ -1064,6 +1068,10 @@ def cmd_proxy(a) -> int:
     here = f"http://{a.host}:{srv.server_address[1]}"
     print(f"{bold('joules proxy')} {here} → {a.upstream}", file=sys.stderr)
     print(f"  measuring: {', '.join(m.name for m in d.meters)}", file=sys.stderr)
+    if a.split == "tokens":
+        w = 1.0 if a.prefill_weight is None else a.prefill_weight
+        print(f"  energy split by tokens: a prompt token counts {w:g} of an output token"
+              + (" (default, not calibrated: measure yours with --calibrate)" if a.prefill_weight is None else ""), file=sys.stderr)
     print(f"  point your client here: Ollama {accent(here)} · OpenAI-compatible base_url {accent(here + '/v1')}", file=sys.stderr)
     print(f"  receipts {here}/joules/receipts · Prometheus {here}/joules/metrics" + (f" · tracking to project {a.track}" if a.track else ""), file=sys.stderr)
     for n in d.notes:
@@ -1082,6 +1090,43 @@ def cmd_proxy(a) -> int:
         d.close()
         st = srv.stats
         print(f"\njoules proxy: {st['requests']} requests · {fmt_j(st['energy_j'])} · {st['output_tokens']:,} output tokens", file=sys.stderr)
+    return 0
+
+
+def _calibrate(a, d) -> int:
+    from .calibrate import calibrate
+    if not a.model:
+        d.close()
+        print("joules proxy --calibrate: give --model (the model name the server serves)", file=sys.stderr)
+        return 2
+    if any(m.method == "SIMULATED" for m in d.meters) or any("estimat" in m.method.lower() for m in d.meters):
+        print(warn("joules proxy --calibrate: these meters are simulated or estimated, so the weight measures time, "
+                   "not energy. Calibrate on the machine with the real meters."), file=sys.stderr)
+    print(f"{bold('joules proxy --calibrate')} {a.upstream} · model {a.model} · {a.concurrency} at a time", file=sys.stderr)
+    try:
+        r = calibrate(a.upstream, a.model, d.meters, interval=a.interval, long_tokens=a.long_prompt,
+                      output_tokens=a.output_tokens, requests=a.requests, concurrency=a.concurrency,
+                      log=lambda s: print(dim(s), file=sys.stderr))
+    except (OSError, RuntimeError, ValueError, KeyError) as e:
+        print(f"joules proxy --calibrate: {e}", file=sys.stderr)
+        return 1
+    finally:
+        d.close()
+    if a.json or a.out:
+        text = json.dumps(r, indent=2)
+        if a.out:
+            with open(a.out, "w", encoding="utf-8") as f:
+                f.write(text)
+        if a.json:
+            print(text)
+    w = r["prefill_weight"]
+    if w is None:
+        print("joules proxy --calibrate: no clear result (output energy not above the noise); try more --requests", file=sys.stderr)
+        return 1
+    lo, hi = r["spread"]
+    print(f"\nprefill weight {bold(f'{w:.3g}')} (rounds: {lo:.3g} to {hi:.3g}) on {', '.join(x['name'] for x in r['devices'])}, "
+          f"{a.model}, {a.concurrency} at a time.\nUse: joules proxy --upstream {a.upstream} --split tokens --prefill-weight {w:.3g}",
+          file=sys.stderr)
     return 0
 
 
@@ -1715,6 +1760,19 @@ def build_parser() -> argparse.ArgumentParser:
     px.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1; 0.0.0.0 exposes it to your network)")
     px.add_argument("--port", type=int, default=8787, help="port to listen on (default 8787)")
     px.add_argument("--quiet", action="store_true", help="do not print a line per request")
+    px.add_argument("--split", choices=["equal", "tokens"], default="equal",
+                    help="how each interval's energy is shared between requests running at the same time: equally "
+                         "(default), or by each request's tokens in it (see --prefill-weight)")
+    px.add_argument("--prefill-weight", type=float, default=None, metavar="W",
+                    help="with --split tokens: the energy of one prompt token relative to one output token "
+                         "(default 1.0, not calibrated; measure yours with --calibrate)")
+    cal = px.add_argument_group("calibration (--calibrate measures --prefill-weight on this machine, then exits)")
+    cal.add_argument("--calibrate", action="store_true", help="measure the prefill weight against --upstream and print it")
+    cal.add_argument("--model", help="the model name the server serves (needed for --calibrate)")
+    cal.add_argument("--concurrency", type=int, default=1, help="requests at a time while calibrating (use your usual load; default 1)")
+    cal.add_argument("--requests", type=int, default=8, help="requests per calibration phase (default 8)")
+    cal.add_argument("--long-prompt", type=int, default=2048, help="prompt length of the long-prompt phase, tokens (default 2048)")
+    cal.add_argument("--output-tokens", type=int, default=256, help="output length of the long-output phase (default 256)")
     px.add_argument("--track-every", type=float, default=300, metavar="SECONDS", help="with --track, send a summary this often (default 300)")
     common(px)
     sharing_args(px)

@@ -219,8 +219,9 @@ estimate when a machine has no counters.
 runs. Point your client at the proxy instead of the server; nothing else changes.
 
 **A receipt is each request's share of the device's measured energy.** The meters measure whole devices (a GPU, a CPU
-package), not single requests, so in each sampling interval joules splits the device's energy equally between the
-requests running at that moment. With `--subtract-idle` receipts also carry the energy above idle.
+package), not single requests, so in each sampling interval joules shares the device's energy between the requests
+running at that moment: equally by default, or by their tokens with `--split tokens` (see
+[How energy is split](#how-energy-is-split)). With `--subtract-idle` receipts also carry the energy above idle.
 
 ```bash
 joules proxy --upstream http://localhost:8000 --subtract-idle 5   # vLLM, measured above idle
@@ -248,6 +249,65 @@ X-Energy-Receipt: /joules/receipts/r-000017
   prompts or outputs.
 - It listens on 127.0.0.1 by default. `--host 0.0.0.0` exposes it, and your model server, to your
   network.
+
+### How energy is split
+
+With continuous batching, many requests share the GPU in the same moment, and the meter reads the whole GPU. So each
+sampling interval's energy (0.1 s by default) is shared between the requests running in it. In both modes:
+- the shares of an interval add up to exactly what was measured;
+- one request running alone gets all of it.
+
+**`--split equal` (the default).** Every request running in the interval gets the same share. This is simple and
+needs nothing from the engine. However, a 150,000-token prompt and a 20-token prompt running side by side get the same
+bill.
+
+**`--split tokens`.** Each request's share follows its work in the interval:
+- **Output:** the output pieces it streamed in that interval.
+- **Prompt:** its prompt tokens x `--prefill-weight`, spread evenly from the request's start to its first output
+  piece (its prefill).
+  - The proxy asks the engine's `/tokenize` endpoint for the prompt length (vLLM and SGLang serve one). Otherwise it
+    estimates the length from the request (about 4 characters a token).
+  - When the response arrives, it corrects that with the engine's `usage.prompt_tokens`, minus cached prompt tokens
+    if the engine reports them.
+- **Non-streamed responses** show no progress until they arrive, so their work (prompt x weight + output) is spread
+  evenly over their time.
+
+Receipts say which split was used (`split`), the weights and where the prompt count came from (`weights`, `work`), and
+the method in words (`basis`).
+
+```bash
+joules proxy --upstream http://localhost:8000 --split tokens --prefill-weight 0.05 --subtract-idle 5
+```
+
+**Calibrating `--prefill-weight` on your own GPU.** The weight is the energy of one prompt token relative to one output
+token. It depends on the GPU, model, engine and load: prefill is compute-bound, and decode is memory-bound and gets
+cheaper per token as more requests share a batch. So measure it where you serve:
+
+```bash
+joules proxy --upstream http://localhost:8000 --calibrate --model Qwen/Qwen3-8B --concurrency 16
+```
+
+This sends three sets of requests straight to the engine and measures each above idle:
+- short prompt, 1 output token;
+- long prompt, 1 output token;
+- short prompt, 256 output tokens.
+
+The weight is the energy per extra prompt token divided by the energy per extra output token. Prompts are random
+text, so no prefix cache helps, and output length is fixed with `ignore_eos`. Use the `--concurrency` you usually run
+at.
+
+The default is 1.0 (a prompt token costs as much as an output token). It is not a measurement, and receipts say
+`"prefill_token_from": "default, not calibrated"`. As a reference, one CPU measurement:
+- SGLang on 4 CPU cores, Qwen3-0.6B, one request at a time: about 0.01.
+- That was with a simulated meter, so it is a time ratio, not energy.
+
+**Limits.**
+- The proxy sees tokens, not GPU kernels. Attention cost grows with context length, cached prefixes cost little to
+  prefill, and the engine may batch work differently from how the proxy sees it.
+- So a token split is a better estimate than an equal one when requests differ a lot in length. It is not a per-kernel
+  measurement.
+- A streamed request still in prefill has an unknown prefill length. Intervals it shares wait until its first output
+  piece, until another request in them ends, or 30 s at most; then they are shared on what is known at that point.
 
 ## Connect a machine in one step
 

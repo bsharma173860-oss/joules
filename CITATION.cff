@@ -6,8 +6,8 @@ authors:
   - family-names: Sharma
     given-names: Bharat
     affiliation: "PHENEX TECHNOLOGIES INC. (WattOps)"
-version: 0.8.3
-date-released: "2026-11-24"
+version: 0.8.4
+date-released: "2026-12-01"
 license: MIT
 url: "https://wattops.dev/joules"
 repository-artifact: "https://pypi.org/project/landauer-gap/"
